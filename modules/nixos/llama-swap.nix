@@ -30,17 +30,6 @@
   };
   llama-server = getExe' llama-cpp "llama-server";
 
-  commonArgs = [
-    "--n-gpu-layers 99"
-    "--flash-attn on"
-    "--cache-type-k q8_0"
-    "--cache-type-v q4_0"
-    "--threads -1"
-    "--jinja"
-    "--no-context-shift"
-    "--no-webui"
-  ];
-
   mkModelCmd = _name: model: let
     draftArgs =
       optional (model.draft != null) "-md ${cfg.modelsDir}/${model.draft.file}"
@@ -57,7 +46,7 @@
       ++ [
         "--ctx-size ${toString model.ctxSize}"
       ]
-      ++ commonArgs
+      ++ cfg.commonArgs
       ++ model.extraArgs);
 
   # Collect all files that need downloading (main models + draft models)
@@ -177,6 +166,28 @@ in {
       type = types.int;
       default = 120;
       description = "Health check timeout in seconds.";
+    };
+
+    commonArgs = mkOption {
+      type = types.listOf types.str;
+      default = [];
+      example = [
+        "--n-gpu-layers 99"
+        "--flash-attn on"
+        "--cache-type-k q8_0"
+        "--cache-type-v q4_0"
+        "--jinja"
+        "--no-context-shift"
+        "--no-webui"
+      ];
+      description = ''
+        Flags appended to every llama-server model command, after
+        --ctx-size and before per-model extraArgs. Use this for
+        deployment-wide tuning (GPU offload, KV-cache quantisation,
+        flash attention, etc). Left empty by default — infernis is
+        vendor- and hardware-agnostic, so the downstream deployment
+        picks the flags appropriate to its hosts.
+      '';
     };
 
     llamaCpp = {

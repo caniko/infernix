@@ -1,26 +1,34 @@
-# Auto-generates yeeHaw steeds from infernis endpoints.
+# Computes yeeHaw steeds from infernis endpoints as a read-only option.
 #
-# Opt-in: set `services.infernis.yeehaw.enable = true` on users who have
-# yeeHaw's HM module imported (programs.yh option available).
+# Because home-manager sharedModules apply to all users — but yeeHaw may
+# only be imported for some of them — this module does NOT write to
+# `programs.yh.steeds` itself (that would fail type-checking for users
+# without yeeHaw's HM module, since mkIf still registers the option path).
 #
-# When disabled, this module does not reference `programs.yh.*` at all,
-# so it is safe to include in shared modules for users who don't use yeeHaw.
+# Instead, it exposes `services.infernis.yeehaw.generatedSteeds`. Users who
+# actually use yeeHaw wire it in with one line in their own config:
+#
+#   programs.yh.steeds = config.services.infernis.yeehaw.generatedSteeds;
+#
+# Set `services.infernis.yeehaw.enable = true` to populate it; when
+# disabled (default), generatedSteeds is {}.
 {
   config,
   lib,
   ...
 }: let
-  inherit (lib) mkEnableOption mkOption mkIf types filterAttrs foldlAttrs;
+  inherit (lib) mkEnableOption mkOption types filterAttrs foldlAttrs;
   cfg = config.services.infernis.yeehaw;
   epCfg = config.services.infernis.endpoints;
 
-  # Derive containerUrl from url if not explicitly set
   containerUrlOf = ep:
     if ep.containerUrl != null
     then ep.containerUrl
     else if ep.url != null
     then builtins.replaceStrings ["://localhost:" "://127.0.0.1:"] ["://host.docker.internal:" "://host.docker.internal:"] ep.url
     else null;
+
+  safe = s: builtins.replaceStrings ["-" ":" "."] ["_" "_" "_"] s;
 
   mkOllamaSteed = _epName: ep: model: {
     provider = "goose";
@@ -30,15 +38,12 @@
     ctxSize = model.ctxSize;
   };
 
-  mkLlamaSwapSteed = epName: ep: model: let
-    cUrl = containerUrlOf ep;
-    safe = s: builtins.replaceStrings ["-" ":" "."] ["_" "_" "_"] s;
-  in {
+  mkLlamaSwapSteed = epName: ep: model: {
     provider = "goose";
     backend = "custom";
     engine = "openai";
     host = ep.url;
-    baseUrl = cUrl;
+    baseUrl = containerUrlOf ep;
     model = model.name;
     providerName = "llama_swap_${safe epName}_${safe model.name}";
     blockingGroup = model.blockingGroup;
@@ -67,22 +72,27 @@
   allSteeds = foldlAttrs (acc: epName: ep: acc // mkSteeds epName ep) {} epCfg;
 in {
   options.services.infernis.yeehaw = {
-    enable = mkEnableOption "auto-generate yeeHaw steeds from infernis endpoints";
+    enable = mkEnableOption "auto-generation of yeeHaw steeds from infernis endpoints";
 
     extraSteeds = mkOption {
       type = types.attrs;
       default = {};
       description = "Additional steeds merged into the generated set.";
     };
+
+    generatedSteeds = mkOption {
+      type = types.attrs;
+      readOnly = true;
+      description = ''
+        Steeds auto-generated from services.infernis.endpoints.
+        Wire this into programs.yh.steeds in your own config:
+          programs.yh.steeds = config.services.infernis.yeehaw.generatedSteeds;
+      '';
+    };
   };
 
-  # Plain `if-then-else` (not mkIf) so that when disabled, the attribute
-  # path `programs.yh.steeds` is truly absent — avoiding type-check errors
-  # for users who don't have yeeHaw's HM module imported.
-  config =
+  config.services.infernis.yeehaw.generatedSteeds =
     if cfg.enable
-    then {
-      programs.yh.steeds = allSteeds // cfg.extraSteeds;
-    }
+    then allSteeds // cfg.extraSteeds
     else {};
 }

@@ -17,8 +17,8 @@ in {
       type = types.unspecified;
       description = ''
         Package set with GPU support enabled.
-        Pass pkgsPrimaryGpu from canix or any nixpkgs instantiation with
-        rocmSupport/cudaSupport set appropriately.
+        Pass a nixpkgs instantiation with rocmSupport/cudaSupport set
+        appropriately for the configured vendor.
       '';
     };
 

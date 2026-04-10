@@ -2,17 +2,6 @@
 # No module system — importable by any module that needs GPU-aware decisions.
 {lib}: let
   inherit (lib) mkForce optional mapAttrsToList concatStringsSep;
-in {
-  # Select the correct ollama package based on GPU vendor.
-  ollamaPackage = {
-    vendor,
-    pkgs,
-  }:
-    if vendor == "amd"
-    then pkgs.ollama-rocm
-    else if vendor == "nvidia"
-    then pkgs.ollama-cuda
-    else pkgs.ollama;
 
   # Environment variables for device visibility.
   deviceEnvVars = {
@@ -26,6 +15,19 @@ in {
     else if vendor == "nvidia"
     then {CUDA_VISIBLE_DEVICES = devStr;}
     else {};
+in {
+  inherit deviceEnvVars;
+
+  # Select the correct ollama package based on GPU vendor.
+  ollamaPackage = {
+    vendor,
+    pkgs,
+  }:
+    if vendor == "amd"
+    then pkgs.ollama-rocm
+    else if vendor == "nvidia"
+    then pkgs.ollama-cuda
+    else pkgs.ollama;
 
   # Systemd service overrides needed for GPU inference workloads.
   systemdGpuOverrides = {

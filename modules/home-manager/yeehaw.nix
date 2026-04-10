@@ -1,13 +1,18 @@
 # Auto-generates yeeHaw steeds from infernis endpoints.
-# Requires yeeHaw's HM module to be imported separately by the consumer.
+#
+# Opt-in: set `services.infernis.yeehaw.enable = true` on users who have
+# yeeHaw's HM module imported (programs.yh option available).
+#
+# When disabled, this module does not reference `programs.yh.*` at all,
+# so it is safe to include in shared modules for users who don't use yeeHaw.
 {
   config,
   lib,
   ...
 }: let
-  inherit (lib) mkIf filterAttrs foldlAttrs mapAttrs';
+  inherit (lib) mkEnableOption mkOption mkIf types filterAttrs foldlAttrs;
+  cfg = config.services.infernis.yeehaw;
   epCfg = config.services.infernis.endpoints;
-  hasEndpoints = epCfg != {};
 
   # Derive containerUrl from url if not explicitly set
   containerUrlOf = ep:
@@ -20,14 +25,14 @@
   mkOllamaSteed = _epName: ep: model: {
     provider = "goose";
     backend = "ollama";
-    inherit (model) name;
     model = model.name;
     host = ep.url;
     ctxSize = model.ctxSize;
   };
 
-  mkLlamaSwapSteed = _epName: ep: model: let
+  mkLlamaSwapSteed = epName: ep: model: let
     cUrl = containerUrlOf ep;
+    safe = s: builtins.replaceStrings ["-" ":" "."] ["_" "_" "_"] s;
   in {
     provider = "goose";
     backend = "custom";
@@ -35,7 +40,7 @@
     host = ep.url;
     baseUrl = cUrl;
     model = model.name;
-    providerName = "llama_swap_${builtins.replaceStrings ["-"] ["_"] _epName}_${builtins.replaceStrings ["-"] ["_"] model.name}";
+    providerName = "llama_swap_${safe epName}_${safe model.name}";
     blockingGroup = model.blockingGroup;
   };
 
@@ -55,13 +60,29 @@
           then mkLlamaSwapSteed epName ep model
           else mkClaudeSteed epName ep model;
       in
-        acc // {${steedName} = lib.filterAttrs (_: v: v != null) steed;}
+        acc // {${steedName} = filterAttrs (_: v: v != null) steed;}
     ) {}
     ep.models;
 
   allSteeds = foldlAttrs (acc: epName: ep: acc // mkSteeds epName ep) {} epCfg;
 in {
-  config = mkIf (hasEndpoints && (config.programs ? yh) && config.programs.yh.enable) {
-    programs.yh.steeds = allSteeds;
+  options.services.infernis.yeehaw = {
+    enable = mkEnableOption "auto-generate yeeHaw steeds from infernis endpoints";
+
+    extraSteeds = mkOption {
+      type = types.attrs;
+      default = {};
+      description = "Additional steeds merged into the generated set.";
+    };
   };
+
+  # Plain `if-then-else` (not mkIf) so that when disabled, the attribute
+  # path `programs.yh.steeds` is truly absent — avoiding type-check errors
+  # for users who don't have yeeHaw's HM module imported.
+  config =
+    if cfg.enable
+    then {
+      programs.yh.steeds = allSteeds // cfg.extraSteeds;
+    }
+    else {};
 }

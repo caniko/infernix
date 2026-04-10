@@ -60,7 +60,7 @@
             blockingGroup = mkOption {
               type = types.nullOr types.str;
               default = null;
-              example = "atlas-gpu";
+              example = "local-gpu";
               description = "GPU contention group (steeds in the same group share a physical GPU).";
             };
           };
@@ -80,14 +80,14 @@ in {
       to auto-generate their configurations.
     '';
     example = {
-      atlas-ollama = {
+      local-ollama = {
         type = "ollama";
         url = "http://localhost:11434";
         models.gemma4 = {
           name = "gemma4:31b-it-q4_K_M";
         };
       };
-      atlas-llama-swap = {
+      local-llama-swap = {
         type = "llama-swap";
         url = "http://localhost:8013";
         containerUrl = "http://host.docker.internal:8013/v1";
@@ -95,13 +95,13 @@ in {
           name = "qwen3-coder-next";
           ctxSize = 65536;
           role = "deep";
-          blockingGroup = "atlas-gpu";
+          blockingGroup = "local-gpu";
         };
         models.cerebral = {
           name = "gemma4-31b";
           ctxSize = 32768;
           role = "cerebral";
-          blockingGroup = "atlas-gpu";
+          blockingGroup = "local-gpu";
         };
       };
       claude = {

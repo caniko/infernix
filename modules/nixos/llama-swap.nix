@@ -17,43 +17,14 @@
     optional
     flatten
     ;
-  gpuCfg = config.services.infernis.gpu;
   cfg = config.services.infernis.llama-swap;
-  gpuLib = import ../../lib/gpu.nix {inherit lib;};
 
-  llama-cpp = gpuLib.overrideLlamaCpp {
-    vendor = gpuCfg.vendor;
-    pkgs = gpuCfg.pkgs;
-    amd = gpuCfg.amd;
-    extraCmakeFlags = cfg.llamaCpp.extraCmakeFlags;
-    flashAttention = cfg.llamaCpp.flashAttention;
-  };
-  llama-server = getExe' llama-cpp "llama-server";
-
-  mkModelCmd = _name: model: let
-    draftArgs =
-      optional (model.draft != null) "-md ${cfg.modelsDir}/${model.draft.file}"
-      ++ optional (model.draft != null) "--draft-max ${toString model.draft.draftMax}"
-      ++ optional (model.draft != null) "--draft-min ${toString model.draft.draftMin}"
-      ++ optional (model.draft != null) "-ngld ${toString model.draft.nGpuLayers}";
-  in
-    concatStringsSep " " ([
-        llama-server
-        "--port \${PORT}"
-        "-m ${cfg.modelsDir}/${model.file}"
-      ]
-      ++ draftArgs
-      ++ [
-        "--ctx-size ${toString model.ctxSize}"
-      ]
-      ++ cfg.commonArgs
-      ++ model.extraArgs);
-
-  # Collect all files that need downloading (main models + draft models)
-  downloadFiles = flatten (mapAttrsToList (_name: model:
-    [{inherit (model) repo file;}]
-    ++ optional (model.draft != null) {inherit (model.draft) repo file;})
-  cfg.models);
+  # NB: gpuCfg, llama-cpp, llama-server, mkModelCmd, and downloadFiles all
+  # depend on services.infernis.gpu.* (which is null when nothing's enabled)
+  # or on per-model attrs. They are computed inside `config = mkIf cfg.enable`
+  # below, so a host that imports infernis without enabling llama-swap never
+  # forces those references — even when an option-tree walker (agenix-rekey,
+  # nix flake check) traverses this module.
 
   draftSubmodule = types.submodule {
     options = {
@@ -172,13 +143,15 @@ in {
       type = types.listOf types.str;
       default = [];
       example = [
-        "--n-gpu-layers 99"
+        "--n-gpu-layers all"
         "--flash-attn on"
         "--cache-type-k q8_0"
-        "--cache-type-v q4_0"
+        "--cache-type-v q8_0"
         "--jinja"
         "--no-context-shift"
         "--no-webui"
+        "--mlock"
+        "--metrics"
       ];
       description = ''
         Flags appended to every llama-server model command, after
@@ -219,7 +192,44 @@ in {
     };
   };
 
-  config = mkIf cfg.enable {
+  config = mkIf cfg.enable (let
+    gpuCfg = config.services.infernis.gpu;
+    gpuLib = import ../../lib/gpu.nix {inherit lib;};
+
+    llama-cpp = gpuLib.overrideLlamaCpp {
+      vendor = gpuCfg.vendor;
+      pkgs = gpuCfg.pkgs;
+      amd = gpuCfg.amd;
+      extraCmakeFlags = cfg.llamaCpp.extraCmakeFlags;
+      flashAttention = cfg.llamaCpp.flashAttention;
+    };
+    llama-server = getExe' llama-cpp "llama-server";
+
+    mkModelCmd = _name: model: let
+      draftArgs =
+        optional (model.draft != null) "-md ${cfg.modelsDir}/${model.draft.file}"
+        ++ optional (model.draft != null) "--draft-max ${toString model.draft.draftMax}"
+        ++ optional (model.draft != null) "--draft-min ${toString model.draft.draftMin}"
+        ++ optional (model.draft != null) "-ngld ${toString model.draft.nGpuLayers}";
+    in
+      concatStringsSep " " ([
+          llama-server
+          "--port \${PORT}"
+          "-m ${cfg.modelsDir}/${model.file}"
+        ]
+        ++ draftArgs
+        ++ [
+          "--ctx-size ${toString model.ctxSize}"
+        ]
+        ++ cfg.commonArgs
+        ++ model.extraArgs);
+
+    # Collect all files that need downloading (main models + draft models)
+    downloadFiles = flatten (mapAttrsToList (_name: model:
+      [{inherit (model) repo file;}]
+      ++ optional (model.draft != null) {inherit (model.draft) repo file;})
+    cfg.models);
+  in {
     services.llama-swap = {
       enable = true;
       listenAddress = cfg.host;
@@ -285,5 +295,5 @@ in {
     };
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [cfg.port];
-  };
+  });
 }

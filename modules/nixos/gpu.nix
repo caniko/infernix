@@ -1,10 +1,24 @@
-{lib, ...}: let
+{
+  config,
+  lib,
+  ...
+}: let
   inherit (lib) mkOption types;
+  cfg = config.services.infernis;
+  needsGpu =
+    (cfg.ollama.enable or false)
+    || (cfg.llama-swap.enable or false);
 in {
   options.services.infernis.gpu = {
     vendor = mkOption {
-      type = types.enum ["amd" "nvidia" "cpu"];
-      description = "GPU vendor for inference acceleration.";
+      type = types.nullOr (types.enum ["amd" "nvidia" "cpu"]);
+      default = null;
+      description = ''
+        GPU vendor for inference acceleration. Required when
+        `services.infernis.ollama.enable` or
+        `services.infernis.llama-swap.enable` is true. Left null on hosts
+        that import infernis but don't enable any GPU-consuming service.
+      '';
     };
 
     visibleDevices = mkOption {
@@ -14,11 +28,13 @@ in {
     };
 
     pkgs = mkOption {
-      type = types.unspecified;
+      type = types.nullOr types.unspecified;
+      default = null;
       description = ''
         Package set with GPU support enabled.
         Pass a nixpkgs instantiation with rocmSupport/cudaSupport set
-        appropriately for the configured vendor.
+        appropriately for the configured vendor. Required when an
+        infernis service that needs the GPU is enabled.
       '';
     };
 
@@ -37,5 +53,26 @@ in {
         description = "CPU microarchitecture for -march flag on llama-cpp.";
       };
     };
+  };
+
+  config = lib.mkIf needsGpu {
+    assertions = [
+      {
+        assertion = cfg.gpu.vendor != null;
+        message = ''
+          services.infernis.gpu.vendor must be set when
+          services.infernis.ollama.enable or
+          services.infernis.llama-swap.enable is true.
+        '';
+      }
+      {
+        assertion = cfg.gpu.pkgs != null;
+        message = ''
+          services.infernis.gpu.pkgs must be set when
+          services.infernis.ollama.enable or
+          services.infernis.llama-swap.enable is true.
+        '';
+      }
+    ];
   };
 }

@@ -32,15 +32,14 @@
     display_name = epName;
     base_url = "${ep.url}/v1/chat/completions";
     api_key_env = "INFERNIS_${lib.toUpper (builtins.replaceStrings ["-"] ["_"] epName)}_KEY";
-    models =
-      lib.mapAttrsToList (_modelKey: model:
-        {
-          name = model.name;
-        }
-        // lib.optionalAttrs (model.ctxSize != null) {
-          context_limit = model.ctxSize;
-        })
-      ep.models;
+    models = lib.mapAttrsToList (_modelKey: model:
+      {
+        name = model.name;
+      }
+      // lib.optionalAttrs (model.ctxSize != null) {
+        context_limit = model.ctxSize;
+      })
+    ep.models;
     supports_streaming = true;
     requires_auth = false;
   };

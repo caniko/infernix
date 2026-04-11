@@ -5,7 +5,13 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = {...}: {
+  outputs = {
+    self,
+    nixpkgs,
+  }: let
+    systems = ["x86_64-linux" "aarch64-linux"];
+    forAllSystems = nixpkgs.lib.genAttrs systems;
+  in {
     nixosModules = {
       default = import ./modules/nixos;
     };
@@ -17,5 +23,12 @@
       # import goose-hm's HM module.
       goose = import ./modules/home-manager/goose-programs.nix;
     };
+
+    packages = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      infernis-embedder = pkgs.callPackage ./packages/embedder.nix {};
+      default = self.packages.${system}.infernis-embedder;
+    });
   };
 }

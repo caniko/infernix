@@ -2,6 +2,7 @@
   config,
   lib,
   pkgs,
+  infernisBleedingNixpkgs,
   ...
 }: let
   inherit
@@ -196,9 +197,16 @@ in {
     gpuCfg = config.services.infernis.gpu;
     gpuLib = import ../../lib/gpu.nix {inherit lib;};
 
+    # Re-import nixpkgs master with the consumer's GPU config so llama-cpp
+    # picks up rocmSupport / cudaSupport and llama-swap comes from master.
+    bleedingPkgs = gpuLib.mkBleedingPkgs {
+      bleedingNixpkgs = infernisBleedingNixpkgs;
+      sourcePkgs = gpuCfg.pkgs;
+    };
+
     llama-cpp = gpuLib.overrideLlamaCpp {
       vendor = gpuCfg.vendor;
-      pkgs = gpuCfg.pkgs;
+      pkgs = bleedingPkgs;
       amd = gpuCfg.amd;
       extraCmakeFlags = cfg.llamaCpp.extraCmakeFlags;
       flashAttention = cfg.llamaCpp.flashAttention;
@@ -232,6 +240,7 @@ in {
   in {
     services.llama-swap = {
       enable = true;
+      package = bleedingPkgs.llama-swap;
       listenAddress = cfg.host;
       port = cfg.port;
 

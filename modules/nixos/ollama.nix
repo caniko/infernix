@@ -1,6 +1,7 @@
 {
   config,
   lib,
+  infernisBleedingNixpkgs,
   ...
 }: let
   inherit (lib) mkEnableOption mkOption mkIf types;
@@ -43,13 +44,20 @@ in {
     };
   };
 
-  config = mkIf cfg.enable {
+  config = mkIf cfg.enable (let
+    # Re-import nixpkgs master with the consumer's GPU config so
+    # ollama-rocm / ollama-cuda inherit rocmSupport / cudaSupport.
+    bleedingPkgs = gpuLib.mkBleedingPkgs {
+      bleedingNixpkgs = infernisBleedingNixpkgs;
+      sourcePkgs = gpuCfg.pkgs;
+    };
+  in {
     services.ollama =
       {
         enable = true;
         package = gpuLib.ollamaPackage {
           vendor = gpuCfg.vendor;
-          pkgs = gpuCfg.pkgs;
+          pkgs = bleedingPkgs;
         };
         host = cfg.host;
         port = cfg.port;
@@ -67,5 +75,5 @@ in {
       // cfg.extraConfig;
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [cfg.port];
-  };
+  });
 }

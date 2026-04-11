@@ -26,6 +26,23 @@ NixOS modules (`nixosModules.default`):
 - **`services.infernis.qdrant`** — vector database with HTTP/gRPC ports,
   storage and snapshot path options, and firewall handling.
 
+### Bleeding-edge inference packages
+
+infernis pulls `ollama`, `llama-cpp`, and `llama-swap` from `nixpkgs/master`
+automatically via a dedicated `nixpkgs-bleeding` flake input, so you get the
+newest inference features days-to-weeks ahead of `nixos-unstable`. This is
+wired through `nixosModules.default` — consumers do **not** need to add an
+overlay or a second input. `qdrant`, `curl`, and everything else still honor
+the consumer's own `nixos-unstable`-tracking pkgs passed into
+`services.infernis.gpu.pkgs`.
+
+Caveat: master revs are not channel snapshots, so `ollama-rocm` /
+`ollama-cuda` are **not** in `cache.nixos.org` or `cuda-maintainers.cachix.org`.
+Expect a local ollama rebuild on each `nix flake update nixpkgs-bleeding`
+(Go build, a few minutes). `llama-cpp` with `rocmSupport` / `cudaSupport` was
+already built locally on every channel regardless — master costs nothing
+extra there.
+
 Home-manager modules (`homeModules.default`):
 
 - **`services.infernis.endpoints`** — the central abstraction. You declare

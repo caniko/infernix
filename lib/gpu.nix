@@ -18,6 +18,20 @@
 in {
   inherit deviceEnvVars;
 
+  # Re-instantiate a bleeding-edge nixpkgs flake with the same system and
+  # config as the consumer's reference pkgs. This is how ollama / llama-cpp
+  # / llama-swap pull from nixpkgs master while still inheriting
+  # rocmSupport, cudaSupport, allowUnfree, etc. from the consumer's
+  # nixos-unstable pkgs.
+  mkBleedingPkgs = {
+    bleedingNixpkgs,
+    sourcePkgs,
+  }:
+    import bleedingNixpkgs {
+      inherit (sourcePkgs.stdenv.hostPlatform) system;
+      inherit (sourcePkgs) config;
+    };
+
   # Select the correct ollama package based on GPU vendor.
   ollamaPackage = {
     vendor,

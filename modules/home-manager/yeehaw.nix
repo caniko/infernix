@@ -34,7 +34,9 @@
     provider = "goose";
     backend = "ollama";
     model = model.name;
-    host = ep.url;
+    # Container-reachable URL; preflight rewrites host.docker.internal → localhost
+    # host-side. Mirrors the mkLlamaSwapSteed pattern.
+    host = containerUrlOf ep;
     ctxSize = model.ctxSize;
   };
 

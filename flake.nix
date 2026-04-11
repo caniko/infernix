@@ -8,23 +8,45 @@
     # consumer's own pkgs) stays on nixos-unstable above. See README for
     # the cache-cost rationale behind this split.
     nixpkgs-bleeding.url = "github:NixOS/nixpkgs/master";
+
+    # embr: code embedding indexer (replaces the old nushell indexer).
+    # Lives in its own repo so it can be used standalone.
+    embr = {
+      url = "git+ssh://git@codeberg.org/caniko/rs-embr.git";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
     self,
     nixpkgs,
     nixpkgs-bleeding,
+    embr,
   }: let
     systems = ["x86_64-linux" "aarch64-linux"];
     forAllSystems = nixpkgs.lib.genAttrs systems;
   in {
     nixosModules = {
       default = {
-        imports = [./modules/nixos];
+        lib,
+        pkgs,
+        ...
+      }: {
+        imports = [
+          ./modules/nixos
+          # Re-export embr's NixOS module under the same default import
+          # path so consumers get `services.embr.*` for free.
+          embr.nixosModules.default
+        ];
         # Thread the bleeding-edge nixpkgs flake into the module tree so
         # ollama / llama-cpp / llama-swap can re-instantiate it with the
         # consumer's own system + config (GPU flags, allowUnfree, etc.).
         _module.args.infernisBleedingNixpkgs = nixpkgs-bleeding;
+        # Default `services.embr.package` to the one locked by infernis,
+        # picking the binary for the active host system. mkDefault keeps
+        # it overridable downstream.
+        services.embr.package =
+          lib.mkDefault embr.packages.${pkgs.stdenv.hostPlatform.system}.embr;
       };
     };
 
@@ -36,11 +58,9 @@
       goose = import ./modules/home-manager/goose-programs.nix;
     };
 
-    packages = forAllSystems (system: let
-      pkgs = nixpkgs.legacyPackages.${system};
-    in {
-      infernis-embedder = pkgs.callPackage ./packages/embedder.nix {};
-      default = self.packages.${system}.infernis-embedder;
+    packages = forAllSystems (system: {
+      embr = embr.packages.${system}.embr;
+      default = embr.packages.${system}.embr;
     });
   };
 }

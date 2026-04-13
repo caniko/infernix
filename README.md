@@ -3,7 +3,7 @@
 Declarative NixOS and home-manager modules for self-hosted AI/ML inference.
 
 `infernis` wraps the moving parts of a local model-serving stack — Ollama,
-llama-swap (llama.cpp), Qdrant, and [yeeHaw](https://codeberg.org/caniko/yeehaw)
+llama-swap (llama.cpp), Qdrant, SurrealDB, and [yeeHaw](https://codeberg.org/caniko/yeehaw)
 — behind a single `services.infernis.*` namespace with a shared GPU vendor
 abstraction so switching between AMD/ROCm, NVIDIA/CUDA, and CPU is a one-line
 change.
@@ -25,6 +25,9 @@ NixOS modules (`nixosModules.default`):
   CPU microarchitecture tuning.
 - **`services.infernis.qdrant`** — vector database with HTTP/gRPC ports,
   storage and snapshot path options, and firewall handling.
+- **`services.infernis.surrealdb`** — SurrealDB multi-model database with
+  storage backend selection (rocksdb, surrealkv, memory), extra CLI flags
+  for auth and permissions, and firewall handling.
 
 ### Bleeding-edge inference packages
 
@@ -98,6 +101,7 @@ Home-manager modules (`homeModules.default`):
           };
 
           services.infernis.qdrant.enable = true;
+          services.infernis.surrealdb.enable = true;
         })
       ];
     };
@@ -162,6 +166,10 @@ speculative-decoding draft models are downloaded the same way.
 ## Status
 
 Early. The module API may still change without deprecation warnings.
+
+## CI
+
+Woodpecker CI on Codeberg runs `nix flake check` on every push and pull request to verify that all module definitions evaluate correctly.
 
 ## License
 

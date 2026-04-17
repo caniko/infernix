@@ -10,6 +10,9 @@
 #
 #   programs.yh.steeds = config.services.infernis.yeehaw.generatedSteeds;
 #
+# Or import `infernis.homeModules.yeehaw` alongside yeeHaw's HM module to wire
+# that assignment automatically.
+#
 # Set `services.infernis.yeehaw.enable = true` to populate it; when
 # disabled (default), generatedSteeds is {}.
 {
@@ -31,8 +34,8 @@
   safe = s: builtins.replaceStrings ["-" ":" "."] ["_" "_" "_"] s;
 
   mkOllamaSteed = _epName: ep: model: {
-    provider = "goose";
-    backend = "ollama";
+    framework = "goose";
+    gooseProvider = "ollama";
     model = model.name;
     # Container-reachable URL; preflight rewrites host.docker.internal → localhost
     # host-side. Mirrors the mkLlamaSwapSteed pattern.
@@ -41,8 +44,8 @@
   };
 
   mkLlamaSwapSteed = epName: ep: model: {
-    provider = "goose";
-    backend = "custom";
+    framework = "goose";
+    gooseProvider = "custom";
     engine = "openai";
     host = ep.url;
     baseUrl = containerUrlOf ep;
@@ -52,8 +55,15 @@
   };
 
   mkClaudeSteed = _epName: _ep: model: {
-    provider = "claude";
+    framework = "claude_code";
     model = model.name;
+  };
+
+  mkCodexSteed = _epName: _ep: model: {
+    framework = "codex";
+    model = model.name;
+    ctxSize = model.ctxSize;
+    blockingGroup = model.blockingGroup;
   };
 
   mkSteeds = epName: ep:
@@ -65,6 +75,8 @@
           then mkOllamaSteed epName ep model
           else if ep.type == "llama-swap"
           then mkLlamaSwapSteed epName ep model
+          else if ep.type == "codex"
+          then mkCodexSteed epName ep model
           else mkClaudeSteed epName ep model;
       in
         acc // {${steedName} = filterAttrs (_: v: v != null) steed;}

@@ -64,8 +64,7 @@
                 name = "llama-swap-local";
                 engine = "openai";
                 display_name = "Local llama-swap";
-                api_key_env = "LLAMA_SWAP_API_KEY";
-                base_url = "http://localhost:8013/v1/chat/completions";
+                base_url = "http://localhost:8013/v1";
                 models = [
                   {
                     name = "qwen3-coder-next";

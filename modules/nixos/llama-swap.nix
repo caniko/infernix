@@ -16,6 +16,7 @@
     getExe'
     getExe
     optional
+    optionalString
     flatten
     ;
   cfg = config.services.infernis.llama-swap;
@@ -120,6 +121,12 @@ in {
     modelsDir = mkOption {
       type = types.path;
       description = "Directory where GGUF model files are stored.";
+    };
+
+    autoCleanup = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Remove GGUF files from modelsDir not referenced by the current configuration.";
     };
 
     hfTokenPath = mkOption {
@@ -237,6 +244,8 @@ in {
       [{inherit (model) repo file;}]
       ++ optional (model.draft != null) {inherit (model.draft) repo file;})
     cfg.models);
+
+    expectedFiles = map (f: f.file) downloadFiles;
   in {
     services.llama-swap = {
       enable = true;
@@ -299,6 +308,19 @@ in {
       };
       script = ''
         mkdir -p "${cfg.modelsDir}"
+        ${optionalString cfg.autoCleanup ''
+          # Remove GGUF files no longer declared in the flake
+          declare -A expected_files
+          ${concatStringsSep "\n" (map (f: ''expected_files["${f}"]=1'') expectedFiles)}
+          for f in "${cfg.modelsDir}"/*.gguf; do
+            [ -e "$f" ] || continue
+            basename="$(basename "$f")"
+            if [[ -z "''${expected_files[$basename]+x}" ]]; then
+              echo "Removing stale model: $basename"
+              rm -f "$f"
+            fi
+          done
+        ''}
         ${concatStringsSep "\n" (map hfDownload downloadFiles)}
       '';
     };

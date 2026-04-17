@@ -2,16 +2,17 @@
 # as read-only options.
 #
 # This module declares options and exposes read-only outputs. It does NOT
-# write to `programs.goose.*` itself — that would require goose-hm to be
-# loaded for every user (which canix's home-manager sharedModules setup
-# cannot guarantee). To get the auto-wiring without boilerplate, import
-# `infernis.homeModules.goose` in users that also import goose-hm; that
-# module reads the outputs here and writes `programs.goose` directly.
+# write to `programs.goose.*` itself — that would require a `programs.goose`
+# module to be loaded for every user (which canix's home-manager
+# sharedModules setup cannot guarantee). To get the auto-wiring without
+# boilerplate, import `infernis.homeModules.goose` in users that also import
+# a module declaring `programs.goose`; that module reads the outputs here and
+# writes `programs.goose` directly.
 #
 # Per-endpoint translation:
 #   - llama-swap → OpenAI-compatible customProvider
 #   - ollama     → native goose ollama provider (no customProvider emitted)
-#   - claude     → skipped entirely
+#   - other endpoint types are not valid goose defaults here
 {
   config,
   lib,
@@ -30,8 +31,7 @@
     name = epName;
     engine = "openai";
     display_name = epName;
-    base_url = "${ep.url}/v1/chat/completions";
-    api_key_env = "INFERNIS_${lib.toUpper (builtins.replaceStrings ["-"] ["_"] epName)}_KEY";
+    base_url = "${ep.url}/v1";
     models = lib.mapAttrsToList (_modelKey: model:
       {
         name = model.name;
@@ -92,8 +92,8 @@ in {
         goose's default provider. Determines GOOSE_PROVIDER (and, for
         ollama endpoints, OLLAMA_HOST) in generatedSettings.
 
-        Must not reference a `claude`-type endpoint — those are skipped
-        by this module entirely.
+        Must reference a self-hosted endpoint type handled by goose through
+        infernis, currently `ollama` or `llama-swap`.
       '';
     };
 
@@ -118,7 +118,7 @@ in {
 
         ollama endpoints are not emitted here — they are represented
         through the native goose ollama provider in generatedSettings.
-        claude endpoints are skipped.
+        Other endpoint types are skipped.
       '';
     };
 
@@ -146,8 +146,8 @@ in {
         assertion =
           cfg.defaultEndpoint
           == null
-          || ((epCfg.${cfg.defaultEndpoint} or {}).type or null) != "claude";
-        message = "services.infernis.goose.defaultEndpoint = '${toString cfg.defaultEndpoint}' is a claude endpoint — this module only handles ollama and llama-swap.";
+          || builtins.elem ((epCfg.${cfg.defaultEndpoint} or {}).type or null) ["ollama" "llama-swap"];
+        message = "services.infernis.goose.defaultEndpoint = '${toString cfg.defaultEndpoint}' is not a self-hosted goose endpoint — this module only handles ollama and llama-swap.";
       }
       {
         assertion =

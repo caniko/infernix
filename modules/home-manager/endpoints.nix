@@ -1,12 +1,12 @@
 # Endpoint declarations — the central abstraction that other HM modules consume.
-# An endpoint is a reachable model backend (ollama, llama-swap, or claude).
+# An endpoint is a reachable model backend (ollama, llama-swap, claude, or codex).
 {lib, ...}: let
   inherit (lib) mkOption types;
 
   endpointSubmodule = types.submodule {
     options = {
       type = mkOption {
-        type = types.enum ["ollama" "llama-swap" "claude"];
+        type = types.enum ["ollama" "llama-swap" "claude" "codex"];
         description = "Backend type.";
       };
 
@@ -16,7 +16,7 @@
         example = "http://localhost:11434";
         description = ''
           Base URL to reach this endpoint.
-          Not needed for claude endpoints (they use the Anthropic API).
+          Not needed for claude or codex endpoints (they use external APIs/CLI auth).
         '';
       };
 
@@ -27,6 +27,7 @@
         description = ''
           URL reachable from inside Docker containers (for yeeHaw).
           If null, derived from url by replacing localhost with host.docker.internal.
+          Not used for claude or codex endpoints.
         '';
       };
 
@@ -50,7 +51,8 @@
               type = types.nullOr (types.enum ["fast" "deep" "cerebral"]);
               default = null;
               description = ''
-                Semantic role hint used for automatic chariot/barn wiring.
+                Semantic role hint for consumer-side routing helpers.
+                infernis does not auto-generate yeeHaw barns from this yet.
                 - fast: quick completions, code execution
                 - deep: complex coding, reasoning
                 - cerebral: planning, analysis, sentinel
@@ -112,6 +114,17 @@ in {
         };
         models.sonnet = {
           name = "sonnet";
+          role = "fast";
+        };
+      };
+      codex = {
+        type = "codex";
+        models.gpt-5-4 = {
+          name = "gpt-5.4";
+          role = "deep";
+        };
+        models.gpt-5-4-mini = {
+          name = "gpt-5.4-mini";
           role = "fast";
         };
       };

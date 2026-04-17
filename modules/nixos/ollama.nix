@@ -31,6 +31,12 @@ in {
       description = "Models to preload on service start.";
     };
 
+    autoCleanup = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Remove Ollama models not declared in loadModels.";
+    };
+
     openFirewall = mkOption {
       type = types.bool;
       default = true;
@@ -62,6 +68,7 @@ in {
         host = cfg.host;
         port = cfg.port;
         loadModels = cfg.loadModels;
+        syncModels = cfg.autoCleanup;
         environmentVariables = gpuLib.deviceEnvVars {
           vendor = gpuCfg.vendor;
           inherit (gpuCfg) visibleDevices;

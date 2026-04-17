@@ -26,8 +26,12 @@ NixOS modules (`nixosModules.default`):
 - **`services.infernis.qdrant`** — vector database with HTTP/gRPC ports,
   storage and snapshot path options, and firewall handling.
 - **`services.infernis.surrealdb`** — SurrealDB multi-model database with
-  storage backend selection (rocksdb, surrealkv, memory), extra CLI flags
-  for auth and permissions, and firewall handling.
+  backend selection via `backend = "surrealkv" | "rocksdb" | "memory"` with
+  SurrealKV as the default, optional raw `dbPath` override, structured root
+  auth options, extra CLI flags, and firewall handling.
+- **`services.infernis.mnemo`** — installs the Mnemo CLI/MCP/hooks bundle,
+  writes `/etc/mnemo/config.toml`, and can follow infernis-managed SurrealDB
+  and Qdrant automatically.
 
 ### Bleeding-edge inference packages
 
@@ -50,7 +54,7 @@ Home-manager modules (`homeModules.default`):
 
 - **`services.infernis.endpoints`** — the central abstraction. You declare
   each reachable model backend once (type, URL, models with context size and
-  role hints) and every other HM module consumes it.
+  optional role hints) and every other HM module consumes it.
 - **`services.infernis.ollama` aliases** — auto-generated `ollama-load-<model>`
   and `ollama-unload-<model>` shell aliases derived from your ollama
   endpoints.
@@ -61,6 +65,15 @@ Home-manager modules (`homeModules.default`):
   user, writing to `programs.yh.steeds` under `mkIf` still triggers
   type-checking for users who don't import yeeHaw's HM module. Wire it in
   yourself with one line per user — see the snippet below.
+
+Additional opt-in Home Manager modules:
+
+- **`homeModules.goose`** — writes `programs.goose.*` from the generated
+  `services.infernis.goose.*` outputs for users that also import the Goose
+  Home Manager module.
+- **`homeModules.yeehaw`** — writes `programs.yh.steeds` from
+  `services.infernis.yeehaw.generatedSteeds` for users that also import the
+  yeeHaw Home Manager module.
 
 ## Quick start
 
@@ -101,7 +114,20 @@ Home-manager modules (`homeModules.default`):
           };
 
           services.infernis.qdrant.enable = true;
-          services.infernis.surrealdb.enable = true;
+          services.infernis.surrealdb = {
+            enable = true;
+            # Optional: defaults to "surrealkv".
+            backend = "surrealkv";
+            auth = {
+              enable = true;
+              password = "replace-me";
+            };
+          };
+
+          services.infernis.mnemo = {
+            enable = true;
+            settings.storage.cache_size_mb = 256;
+          };
         })
       ];
     };
@@ -139,6 +165,19 @@ Home-manager modules (`homeModules.default`):
   };
 }
 ```
+
+If you already import yeeHaw's Home Manager module, you can replace the final
+manual wiring line with `nix-infernis.homeModules.yeehaw` in the module list.
+
+When `services.infernis.mnemo.enable = true`, infernis writes
+`/etc/mnemo/config.toml` and defaults to the host's
+`services.infernis.surrealdb` and `services.infernis.qdrant` endpoints.
+SurrealDB integration requires
+`services.infernis.surrealdb.auth.enable = true` because Mnemo always
+authenticates over WebSocket. To point Mnemo somewhere else, set
+`services.infernis.mnemo.surrealdb.useInfernisService = false` and/or
+`services.infernis.mnemo.qdrant.useInfernisService = false`, then override the
+connection fields explicitly.
 
 ## GPU configuration
 

@@ -1,26 +1,26 @@
-# Computes goose customProviders and default settings from infernis endpoints
+# Computes goose customProviders and default settings from infernix endpoints
 # as read-only options.
 #
 # This module declares options and exposes read-only outputs. It does NOT
 # write to `programs.goose.*` itself — that would require a `programs.goose`
-# module to be loaded for every user (which canix's home-manager
+# module to be loaded for every user (which a consumer's home-manager
 # sharedModules setup cannot guarantee). To get the auto-wiring without
-# boilerplate, import `infernis.homeModules.goose` in users that also import
+# boilerplate, import `infernix.homeModules.goose` in users that also import
 # a module declaring `programs.goose`; that module reads the outputs here and
 # writes `programs.goose` directly.
 #
 # Per-endpoint translation:
 #   - llama-swap → OpenAI-compatible customProvider
 #   - ollama     → native goose ollama provider (no customProvider emitted)
-#   - other endpoint types are not valid goose defaults here
+#   - only local self-hosted Infernix endpoint types are handled here
 {
   config,
   lib,
   ...
 }: let
   inherit (lib) mkEnableOption mkOption types filterAttrs foldlAttrs;
-  cfg = config.services.infernis.goose;
-  epCfg = config.services.infernis.endpoints;
+  cfg = config.services.infernix.goose;
+  epCfg = config.services.infernix.endpoints;
 
   stripScheme = url:
     builtins.replaceStrings ["http://" "https://"] ["" ""] url;
@@ -80,20 +80,20 @@
     }
     else {};
 in {
-  options.services.infernis.goose = {
-    enable = mkEnableOption "auto-generation of goose customProviders and default settings from infernis endpoints";
+  options.services.infernix.goose = {
+    enable = mkEnableOption "auto-generation of goose customProviders and default settings from infernix endpoints";
 
     defaultEndpoint = mkOption {
       type = types.nullOr types.str;
       default = null;
       example = "local-llama-swap";
       description = ''
-        Name of the endpoint (from services.infernis.endpoints) to use as
+        Name of the endpoint (from services.infernix.endpoints) to use as
         goose's default provider. Determines GOOSE_PROVIDER (and, for
         ollama endpoints, OLLAMA_HOST) in generatedSettings.
 
         Must reference a self-hosted endpoint type handled by goose through
-        infernis, currently `ollama` or `llama-swap`.
+        infernix, currently `ollama` or `llama-swap`.
       '';
     };
 
@@ -112,8 +112,8 @@ in {
       readOnly = true;
       description = ''
         goose customProvider definitions auto-generated from every
-        `llama-swap`-type entry in services.infernis.endpoints. Consumed
-        by `infernis.homeModules.goose`; can also be wired manually into
+        `llama-swap`-type entry in services.infernix.endpoints. Consumed
+        by `infernix.homeModules.goose`; can also be wired manually into
         programs.goose.customProviders.
 
         ollama endpoints are not emitted here — they are represented
@@ -134,20 +134,20 @@ in {
   };
 
   config = {
-    services.infernis.goose.generatedProviders = generatedProviders;
-    services.infernis.goose.generatedSettings = generatedSettings;
+    services.infernix.goose.generatedProviders = generatedProviders;
+    services.infernix.goose.generatedSettings = generatedSettings;
 
     assertions = lib.optionals cfg.enable [
       {
         assertion = cfg.defaultEndpoint == null || epCfg ? ${cfg.defaultEndpoint};
-        message = "services.infernis.goose.defaultEndpoint refers to '${toString cfg.defaultEndpoint}' which is not declared in services.infernis.endpoints.";
+        message = "services.infernix.goose.defaultEndpoint refers to '${toString cfg.defaultEndpoint}' which is not declared in services.infernix.endpoints.";
       }
       {
         assertion =
           cfg.defaultEndpoint
           == null
           || builtins.elem ((epCfg.${cfg.defaultEndpoint} or {}).type or null) ["ollama" "llama-swap"];
-        message = "services.infernis.goose.defaultEndpoint = '${toString cfg.defaultEndpoint}' is not a self-hosted goose endpoint — this module only handles ollama and llama-swap.";
+        message = "services.infernix.goose.defaultEndpoint = '${toString cfg.defaultEndpoint}' is not a self-hosted goose endpoint — this module only handles ollama and llama-swap.";
       }
       {
         assertion =
@@ -156,7 +156,7 @@ in {
           || cfg.defaultEndpoint
           == null
           || (epCfg.${cfg.defaultEndpoint}.models or {}) ? ${cfg.defaultModel};
-        message = "services.infernis.goose.defaultModel = '${toString cfg.defaultModel}' is not defined in endpoint '${toString cfg.defaultEndpoint}'.";
+        message = "services.infernix.goose.defaultModel = '${toString cfg.defaultModel}' is not defined in endpoint '${toString cfg.defaultEndpoint}'.";
       }
     ];
   };

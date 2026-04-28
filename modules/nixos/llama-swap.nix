@@ -2,7 +2,7 @@
   config,
   lib,
   pkgs,
-  infernisBleedingNixpkgs,
+  infernixBleedingNixpkgs,
   ...
 }: let
   inherit
@@ -19,12 +19,12 @@
     optionalString
     flatten
     ;
-  cfg = config.services.infernis.llama-swap;
+  cfg = config.services.infernix.llama-swap;
 
   # NB: gpuCfg, llama-cpp, llama-server, mkModelCmd, and downloadFiles all
-  # depend on services.infernis.gpu.* (which is null when nothing's enabled)
+  # depend on services.infernix.gpu.* (which is null when nothing's enabled)
   # or on per-model attrs. They are computed inside `config = mkIf cfg.enable`
-  # below, so a host that imports infernis without enabling llama-swap never
+  # below, so a host that imports infernix without enabling llama-swap never
   # forces those references — even when an option-tree walker (agenix-rekey,
   # nix flake check) traverses this module.
 
@@ -103,7 +103,7 @@
     };
   };
 in {
-  options.services.infernis.llama-swap = {
+  options.services.infernix.llama-swap = {
     enable = mkEnableOption "llama-swap model orchestrator";
 
     host = mkOption {
@@ -165,7 +165,7 @@ in {
         Flags appended to every llama-server model command, after
         --ctx-size and before per-model extraArgs. Use this for
         deployment-wide tuning (GPU offload, KV-cache quantisation,
-        flash attention, etc). Left empty by default — infernis is
+        flash attention, etc). Left empty by default — infernix is
         vendor- and hardware-agnostic, so the downstream deployment
         picks the flags appropriate to its hosts.
       '';
@@ -201,13 +201,13 @@ in {
   };
 
   config = mkIf cfg.enable (let
-    gpuCfg = config.services.infernis.gpu;
+    gpuCfg = config.services.infernix.gpu;
     gpuLib = import ../../lib/gpu.nix {inherit lib;};
 
-    # Re-import nixpkgs master with the consumer's GPU config so llama-cpp
-    # picks up rocmSupport / cudaSupport and llama-swap comes from master.
+    # Re-import the locked nixos-unstable nixpkgs with the consumer's GPU config
+    # so llama-cpp picks up rocmSupport / cudaSupport.
     bleedingPkgs = gpuLib.mkBleedingPkgs {
-      bleedingNixpkgs = infernisBleedingNixpkgs;
+      bleedingNixpkgs = infernixBleedingNixpkgs;
       sourcePkgs = gpuCfg.pkgs;
     };
 
@@ -278,7 +278,7 @@ in {
       };
 
     # Model download service
-    systemd.services.infernis-download = let
+    systemd.services.infernix-download = let
       curl = getExe pkgs.curl;
       authHeader =
         if cfg.hfTokenPath != null
@@ -297,7 +297,7 @@ in {
         fi
       '';
     in {
-      description = "Download GGUF models for infernis llama-swap";
+      description = "Download GGUF models for infernix llama-swap";
       wants = ["network-online.target"];
       after = ["network-online.target"];
       wantedBy = ["llama-swap.service"];

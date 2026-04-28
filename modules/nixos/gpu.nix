@@ -4,20 +4,20 @@
   ...
 }: let
   inherit (lib) mkOption types;
-  cfg = config.services.infernis;
+  cfg = config.services.infernix;
   needsGpu =
     (cfg.ollama.enable or false)
     || (cfg.llama-swap.enable or false);
 in {
-  options.services.infernis.gpu = {
+  options.services.infernix.gpu = {
     vendor = mkOption {
       type = types.nullOr (types.enum ["amd" "nvidia" "cpu"]);
       default = null;
       description = ''
         GPU vendor for inference acceleration. Required when
-        `services.infernis.ollama.enable` or
-        `services.infernis.llama-swap.enable` is true. Left null on hosts
-        that import infernis but don't enable any GPU-consuming service.
+        `services.infernix.ollama.enable` or
+        `services.infernix.llama-swap.enable` is true. Left null on hosts
+        that import infernix but don't enable any GPU-consuming service.
       '';
     };
 
@@ -34,7 +34,7 @@ in {
         Package set with GPU support enabled.
         Pass a nixpkgs instantiation with rocmSupport/cudaSupport set
         appropriately for the configured vendor. Required when an
-        infernis service that needs the GPU is enabled.
+        infernix service that needs the GPU is enabled.
       '';
     };
 
@@ -60,17 +60,17 @@ in {
       {
         assertion = cfg.gpu.vendor != null;
         message = ''
-          services.infernis.gpu.vendor must be set when
-          services.infernis.ollama.enable or
-          services.infernis.llama-swap.enable is true.
+          services.infernix.gpu.vendor must be set when
+          services.infernix.ollama.enable or
+          services.infernix.llama-swap.enable is true.
         '';
       }
       {
         assertion = cfg.gpu.pkgs != null;
         message = ''
-          services.infernis.gpu.pkgs must be set when
-          services.infernis.ollama.enable or
-          services.infernis.llama-swap.enable is true.
+          services.infernix.gpu.pkgs must be set when
+          services.infernix.ollama.enable or
+          services.infernix.llama-swap.enable is true.
         '';
       }
     ];

@@ -14,7 +14,7 @@ let
     optionals
     types
     ;
-  cfg = config.services.infernis.surrealdb;
+  cfg = config.services.infernix.surrealdb;
 
   backendToDbPath =
     backend:
@@ -52,7 +52,7 @@ let
   effectiveDbPath = if cfg.dbPath != null then cfg.dbPath else backendToDbPath cfg.backend;
 in
 {
-  options.services.infernis.surrealdb = {
+  options.services.infernix.surrealdb = {
     enable = mkEnableOption "SurrealDB multi-model database";
 
     package = lib.mkPackageOption pkgs "surrealdb" { };
@@ -65,7 +65,7 @@ in
       ];
       default = "surrealkv";
       description = ''
-        Storage backend infernis should target when `dbPath` is not set.
+        Storage backend infernix should target when `dbPath` is not set.
         `surrealkv` is the default, `rocksdb` uses the upstream package as-is,
         and `memory` runs without on-disk persistence.
       '';
@@ -87,15 +87,15 @@ in
       type = types.nullOr types.str;
       default = null;
       defaultText = literalExpression ''
-        if config.services.infernis.surrealdb.backend == "rocksdb"
+        if config.services.infernix.surrealdb.backend == "rocksdb"
         then "rocksdb:///var/lib/surrealdb/"
-        else if config.services.infernis.surrealdb.backend == "memory"
+        else if config.services.infernix.surrealdb.backend == "memory"
         then "memory"
         else "surrealkv:///var/lib/surrealdb/"
       '';
       example = "memory";
       description = ''
-        Raw storage backend URI passed to `surreal start`. If unset, infernis
+        Raw storage backend URI passed to `surreal start`. If unset, infernix
         derives it from `backend`. The packaged defaults cover
         `surrealkv:///...`, `rocksdb:///...`, and `memory`; other URI schemes
         require a custom `package` that enables the corresponding backend.
@@ -114,7 +114,7 @@ in
         "root"
       ];
       description = ''
-        Additional CLI flags appended to `surreal start` after infernis-managed
+        Additional CLI flags appended to `surreal start` after infernix-managed
         auth flags.
       '';
     };
@@ -147,7 +147,7 @@ in
   };
 
   config = mkIf cfg.enable {
-    services.infernis.surrealdb.package = mkDefault defaultPackage;
+    services.infernix.surrealdb.package = mkDefault defaultPackage;
 
     services.surrealdb = {
       enable = true;

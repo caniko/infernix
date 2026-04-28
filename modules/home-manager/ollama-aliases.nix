@@ -5,7 +5,7 @@
   ...
 }: let
   inherit (lib) mkIf filterAttrs foldlAttrs nameValuePair;
-  epCfg = config.services.infernis.endpoints;
+  epCfg = config.services.infernix.endpoints;
 
   ollamaEndpoints = filterAttrs (_: ep: ep.type == "ollama") epCfg;
 

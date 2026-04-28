@@ -4,9 +4,9 @@
   ...
 }: let
   inherit (lib) mkEnableOption mkOption mkIf types;
-  cfg = config.services.infernis.qdrant;
+  cfg = config.services.infernix.qdrant;
 in {
-  options.services.infernis.qdrant = {
+  options.services.infernix.qdrant = {
     enable = mkEnableOption "Qdrant vector database";
 
     host = mkOption {

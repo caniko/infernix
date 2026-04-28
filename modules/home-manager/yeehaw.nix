@@ -1,19 +1,19 @@
-# Computes yeeHaw steeds from infernis endpoints as a read-only option.
+# Computes yeeHaw steeds from infernix endpoints as a read-only option.
 #
 # Because home-manager sharedModules apply to all users — but yeeHaw may
 # only be imported for some of them — this module does NOT write to
 # `programs.yh.steeds` itself (that would fail type-checking for users
 # without yeeHaw's HM module, since mkIf still registers the option path).
 #
-# Instead, it exposes `services.infernis.yeehaw.generatedSteeds`. Users who
+# Instead, it exposes `services.infernix.yeehaw.generatedSteeds`. Users who
 # actually use yeeHaw wire it in with one line in their own config:
 #
-#   programs.yh.steeds = config.services.infernis.yeehaw.generatedSteeds;
+#   programs.yh.steeds = config.services.infernix.yeehaw.generatedSteeds;
 #
-# Or import `infernis.homeModules.yeehaw` alongside yeeHaw's HM module to wire
+# Or import `infernix.homeModules.yeehaw` alongside yeeHaw's HM module to wire
 # that assignment automatically.
 #
-# Set `services.infernis.yeehaw.enable = true` to populate it; when
+# Set `services.infernix.yeehaw.enable = true` to populate it; when
 # disabled (default), generatedSteeds is {}.
 {
   config,
@@ -21,8 +21,8 @@
   ...
 }: let
   inherit (lib) mkEnableOption mkOption types filterAttrs foldlAttrs;
-  cfg = config.services.infernis.yeehaw;
-  epCfg = config.services.infernis.endpoints;
+  cfg = config.services.infernix.yeehaw;
+  epCfg = config.services.infernix.endpoints;
 
   containerUrlOf = ep:
     if ep.containerUrl != null
@@ -54,18 +54,6 @@
     blockingGroup = model.blockingGroup;
   };
 
-  mkClaudeSteed = _epName: _ep: model: {
-    framework = "claude_code";
-    model = model.name;
-  };
-
-  mkCodexSteed = _epName: _ep: model: {
-    framework = "codex";
-    model = model.name;
-    ctxSize = model.ctxSize;
-    blockingGroup = model.blockingGroup;
-  };
-
   mkSteeds = epName: ep:
     foldlAttrs (
       acc: modelKey: model: let
@@ -73,11 +61,7 @@
         steed =
           if ep.type == "ollama"
           then mkOllamaSteed epName ep model
-          else if ep.type == "llama-swap"
-          then mkLlamaSwapSteed epName ep model
-          else if ep.type == "codex"
-          then mkCodexSteed epName ep model
-          else mkClaudeSteed epName ep model;
+          else mkLlamaSwapSteed epName ep model;
       in
         acc // {${steedName} = filterAttrs (_: v: v != null) steed;}
     ) {}
@@ -85,8 +69,8 @@
 
   allSteeds = foldlAttrs (acc: epName: ep: acc // mkSteeds epName ep) {} epCfg;
 in {
-  options.services.infernis.yeehaw = {
-    enable = mkEnableOption "auto-generation of yeeHaw steeds from infernis endpoints";
+  options.services.infernix.yeehaw = {
+    enable = mkEnableOption "auto-generation of yeeHaw steeds from infernix endpoints";
 
     extraSteeds = mkOption {
       type = types.attrs;
@@ -98,14 +82,15 @@ in {
       type = types.attrs;
       readOnly = true;
       description = ''
-        Steeds auto-generated from services.infernis.endpoints.
+        Steeds auto-generated from local self-hosted
+        services.infernix.endpoints.
         Wire this into programs.yh.steeds in your own config:
-          programs.yh.steeds = config.services.infernis.yeehaw.generatedSteeds;
+          programs.yh.steeds = config.services.infernix.yeehaw.generatedSteeds;
       '';
     };
   };
 
-  config.services.infernis.yeehaw.generatedSteeds =
+  config.services.infernix.yeehaw.generatedSteeds =
     if cfg.enable
     then allSteeds // cfg.extraSteeds
     else {};

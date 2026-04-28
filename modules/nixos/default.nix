@@ -1,5 +1,6 @@
 {
   imports = [
+    ./embr.nix
     ./gpu.nix
     ./mnemo.nix
     ./ollama.nix

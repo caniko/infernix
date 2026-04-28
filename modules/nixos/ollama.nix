@@ -1,15 +1,15 @@
 {
   config,
   lib,
-  infernisBleedingNixpkgs,
+  infernixBleedingNixpkgs,
   ...
 }: let
   inherit (lib) mkEnableOption mkOption mkIf types;
-  gpuCfg = config.services.infernis.gpu;
-  cfg = config.services.infernis.ollama;
+  gpuCfg = config.services.infernix.gpu;
+  cfg = config.services.infernix.ollama;
   gpuLib = import ../../lib/gpu.nix {inherit lib;};
 in {
-  options.services.infernis.ollama = {
+  options.services.infernix.ollama = {
     enable = mkEnableOption "Ollama model serving";
 
     host = mkOption {
@@ -51,10 +51,10 @@ in {
   };
 
   config = mkIf cfg.enable (let
-    # Re-import nixpkgs master with the consumer's GPU config so
+    # Re-import the locked nixos-unstable nixpkgs with the consumer's GPU config so
     # ollama-rocm / ollama-cuda inherit rocmSupport / cudaSupport.
     bleedingPkgs = gpuLib.mkBleedingPkgs {
-      bleedingNixpkgs = infernisBleedingNixpkgs;
+      bleedingNixpkgs = infernixBleedingNixpkgs;
       sourcePkgs = gpuCfg.pkgs;
     };
   in {

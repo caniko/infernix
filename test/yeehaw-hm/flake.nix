@@ -1,5 +1,5 @@
 {
-  description = "Evaluate infernis yeeHaw Home Manager wiring against a sample config";
+  description = "Evaluate infernix yeeHaw Home Manager wiring against a sample config";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -7,14 +7,17 @@
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    infernis.url = "path:../..";
-    yeehaw.url = "path:/data/nvme0/can/Projects/ai-yolo-nix";
+    infernix.url = "path:../..";
+    yeehaw = {
+      url = "path:/data/nvme0/can/Projects/ai-yolo-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
     nixpkgs,
     home-manager,
-    infernis,
+    infernix,
     yeehaw,
     ...
   }: let
@@ -28,8 +31,8 @@
       inherit pkgs;
       modules = [
         yeehaw.homeManagerModules.default
-        infernis.homeModules.default
-        infernis.homeModules.yeehaw
+        infernix.homeModules.default
+        infernix.homeModules.yeehaw
         {
           home.username = "tester";
           home.homeDirectory = "/home/tester";
@@ -64,7 +67,16 @@
             };
           };
 
-          services.infernis.endpoints = {
+          services.infernix.endpoints = {
+            local-ollama = {
+              type = "ollama";
+              url = "http://localhost:11434";
+              models.fast = {
+                name = "qwen2.5-coder:14b-instruct-q6_K";
+                ctxSize = 32000;
+              };
+            };
+
             local-llama-swap = {
               type = "llama-swap";
               url = "http://localhost:8013";
@@ -72,13 +84,12 @@
               models.coder = {
                 name = "qwen3-coder-next";
                 ctxSize = 65536;
-                role = "deep";
                 blockingGroup = "local-gpu";
               };
             };
           };
 
-          services.infernis.yeehaw.enable = true;
+          services.infernix.yeehaw.enable = true;
         }
       ];
     };
@@ -89,8 +100,9 @@
 
     checks.${system} = {
       home-manager = sample.activationPackage;
-      generated-steeds = pkgs.runCommand "infernis-yeehaw-generated-steeds" {} ''
+      generated-steeds = pkgs.runCommand "infernix-yeehaw-generated-steeds" {} ''
         test -e ${configToml}
+        grep -Fq "local-ollama-fast" ${configToml}
         grep -Fq "local-llama-swap-coder" ${configToml}
         touch "$out"
       '';

@@ -2,15 +2,15 @@
   config,
   lib,
   pkgs,
-  infernisMnemo,
+  infernixMnemo,
   ...
 }: let
   inherit (lib) literalExpression mkEnableOption mkIf mkOption optionals types;
-  cfg = config.services.infernis.mnemo;
+  cfg = config.services.infernix.mnemo;
   system = pkgs.stdenv.hostPlatform.system;
   tomlFormat = pkgs.formats.toml {};
-  surrealCfg = config.services.infernis.surrealdb;
-  qdrantCfg = config.services.infernis.qdrant;
+  surrealCfg = config.services.infernix.surrealdb;
+  qdrantCfg = config.services.infernix.qdrant;
 
   localhostOf = host:
     if builtins.elem host [
@@ -35,13 +35,13 @@
     };
   });
 in {
-  options.services.infernis.mnemo = {
+  options.services.infernix.mnemo = {
     enable = mkEnableOption "Mnemo tooling and system configuration";
 
     package = mkOption {
       type = types.package;
-      default = infernisMnemo.packages.${system}.default;
-      defaultText = literalExpression "inputs.infernis.packages.<system>.mnemo";
+      default = infernixMnemo.packages.${system}.default;
+      defaultText = literalExpression "inputs.infernix.packages.<system>.mnemo";
       description = "Mnemo package bundle to install.";
     };
 
@@ -56,20 +56,20 @@ in {
     };
 
     surrealdb = {
-      useInfernisService = mkOption {
+      useInfernixService = mkOption {
         type = types.bool;
         default = surrealCfg.enable;
-        defaultText = literalExpression "config.services.infernis.surrealdb.enable";
+        defaultText = literalExpression "config.services.infernix.surrealdb.enable";
         description = ''
           Whether to derive the SurrealDB endpoint from the host's
-          `services.infernis.surrealdb` module.
+          `services.infernix.surrealdb` module.
         '';
       };
 
       url = mkOption {
         type = types.str;
         default =
-          if cfg.surrealdb.useInfernisService
+          if cfg.surrealdb.useInfernixService
           then "ws://${localhostOf surrealCfg.host}:${toString surrealCfg.port}"
           else "ws://127.0.0.1:8000";
         description = "WebSocket URL Mnemo should use to connect to SurrealDB.";
@@ -78,7 +78,7 @@ in {
       username = mkOption {
         type = types.str;
         default =
-          if cfg.surrealdb.useInfernisService && surrealCfg.auth.enable
+          if cfg.surrealdb.useInfernixService && surrealCfg.auth.enable
           then surrealCfg.auth.username
           else "root";
         description = "Username Mnemo should use when connecting to SurrealDB.";
@@ -87,7 +87,7 @@ in {
       password = mkOption {
         type = types.str;
         default =
-          if cfg.surrealdb.useInfernisService && surrealCfg.auth.enable
+          if cfg.surrealdb.useInfernixService && surrealCfg.auth.enable
           then surrealCfg.auth.password
           else "root";
         description = "Password Mnemo should use when connecting to SurrealDB.";
@@ -107,20 +107,20 @@ in {
     };
 
     qdrant = {
-      useInfernisService = mkOption {
+      useInfernixService = mkOption {
         type = types.bool;
         default = qdrantCfg.enable;
-        defaultText = literalExpression "config.services.infernis.qdrant.enable";
+        defaultText = literalExpression "config.services.infernix.qdrant.enable";
         description = ''
           Whether to derive the Qdrant endpoint from the host's
-          `services.infernis.qdrant` module.
+          `services.infernix.qdrant` module.
         '';
       };
 
       url = mkOption {
         type = types.str;
         default =
-          if cfg.qdrant.useInfernisService
+          if cfg.qdrant.useInfernixService
           then "http://${localhostOf qdrantCfg.host}:${toString qdrantCfg.grpcPort}"
           else "http://127.0.0.1:6334";
         description = "Qdrant endpoint Mnemo should use.";
@@ -136,29 +136,29 @@ in {
 
   config = mkIf cfg.enable {
     assertions =
-      optionals cfg.surrealdb.useInfernisService [
+      optionals cfg.surrealdb.useInfernixService [
         {
           assertion = surrealCfg.enable;
           message = ''
-            services.infernis.mnemo.surrealdb.useInfernisService = true requires
-            services.infernis.surrealdb.enable = true.
+            services.infernix.mnemo.surrealdb.useInfernixService = true requires
+            services.infernix.surrealdb.enable = true.
           '';
         }
         {
           assertion = surrealCfg.auth.enable;
           message = ''
-            services.infernis.mnemo.surrealdb.useInfernisService = true requires
-            services.infernis.surrealdb.auth.enable = true because Mnemo always
+            services.infernix.mnemo.surrealdb.useInfernixService = true requires
+            services.infernix.surrealdb.auth.enable = true because Mnemo always
             authenticates when connecting to SurrealDB.
           '';
         }
       ]
-      ++ optionals cfg.qdrant.useInfernisService [
+      ++ optionals cfg.qdrant.useInfernixService [
         {
           assertion = qdrantCfg.enable;
           message = ''
-            services.infernis.mnemo.qdrant.useInfernisService = true requires
-            services.infernis.qdrant.enable = true.
+            services.infernix.mnemo.qdrant.useInfernixService = true requires
+            services.infernix.qdrant.enable = true.
           '';
         }
       ];

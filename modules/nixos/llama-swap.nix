@@ -178,11 +178,31 @@ in {
         description = "Additional CMake flags for the llama-cpp build.";
       };
 
+      hardwareOptimization = mkOption {
+        type = types.nullOr types.attrs;
+        default = null;
+        example = lib.literalExpression "crossbow.lib.hardwareProfiles.znver4";
+        description = ''
+          Crossbow-shaped hardware profile (or any attrset exposing
+          `.platform.gcc.arch` / `.platform.gcc.tune`) injected into
+          llama-cpp's CMake C/C++ flags as `-march`/`-mtune`. Null leaves
+          the upstream llama-cpp binary untouched so it can be substituted
+          from the nix binary cache; setting it forces a from-source
+          rebuild. Pass `inputs.crossbow.lib.hardwareProfiles.<name>`
+          from the consuming flake — infernix intentionally doesn't take
+          crossbow as a hard dep.
+        '';
+      };
+
       flashAttention = {
         allQuants = mkOption {
           type = types.bool;
           default = false;
-          description = "Enable GGML_HIP_FA_ALL_QUANTS for flash attention on all KV cache quant types (AMD only).";
+          description = ''
+            Enable GGML_HIP_FA_ALL_QUANTS for flash attention on all KV
+            cache quant types (AMD only). Forces a from-source llama-cpp
+            rebuild during nixos-rebuild.
+          '';
         };
       };
     };
@@ -214,7 +234,7 @@ in {
     llama-cpp = gpuLib.overrideLlamaCpp {
       vendor = gpuCfg.vendor;
       pkgs = bleedingPkgs;
-      amd = gpuCfg.amd;
+      hardwareOptimization = cfg.llamaCpp.hardwareOptimization;
       extraCmakeFlags = cfg.llamaCpp.extraCmakeFlags;
       flashAttention = cfg.llamaCpp.flashAttention;
     };

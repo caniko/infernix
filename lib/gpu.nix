@@ -72,23 +72,48 @@ in {
     }
     else {};
 
-  # Override llama-cpp with CPU arch and GPU-specific cmake flags.
+  # Override llama-cpp with GPU-specific cmake flags and an optional
+  # CPU-microarch hardware profile.
+  #
+  # `hardwareOptimization` accepts a crossbow-shaped profile attrset with
+  # `.platform.gcc.arch` (and optionally `.platform.gcc.tune`), or `null`
+  # to keep the cached upstream binary untouched. The flake input that
+  # provides the profile (e.g. nix-crossbow) is the consumer's concern —
+  # infernix only consumes the resolved attrset to avoid a hard dep.
   overrideLlamaCpp = {
     vendor,
     pkgs,
-    amd ? {},
+    hardwareOptimization ? null,
     extraCmakeFlags ? [],
     flashAttention ? {},
   }: let
-    cpuArch = amd.cpuArch or null;
     allQuants = flashAttention.allQuants or false;
+    gcc =
+      if hardwareOptimization == null
+      then null
+      else hardwareOptimization.platform.gcc or null;
+    archFlags =
+      if gcc == null
+      then []
+      else
+        optional (gcc ? arch) "-march=${gcc.arch}"
+        ++ optional (gcc ? tune) "-mtune=${gcc.tune}";
+    # Skip the override entirely when nothing would change — preserves the
+    # binary cache hit for hosts that don't opt into a rebuild.
+    needsOverride =
+      archFlags != []
+      || extraCmakeFlags != []
+      || (vendor == "amd" && allQuants);
   in
-    pkgs.llama-cpp.overrideAttrs (old: {
-      cmakeFlags =
-        old.cmakeFlags
-        ++ (optional (cpuArch != null) (lib.cmakeFeature "CMAKE_C_FLAGS" "-march=${cpuArch}"))
-        ++ (optional (cpuArch != null) (lib.cmakeFeature "CMAKE_CXX_FLAGS" "-march=${cpuArch}"))
-        ++ (optional (vendor == "amd" && allQuants) (lib.cmakeBool "GGML_HIP_FA_ALL_QUANTS" true))
-        ++ extraCmakeFlags;
-    });
+    if !needsOverride
+    then pkgs.llama-cpp
+    else
+      pkgs.llama-cpp.overrideAttrs (old: {
+        cmakeFlags =
+          old.cmakeFlags
+          ++ (optional (archFlags != []) (lib.cmakeFeature "CMAKE_C_FLAGS" (concatStringsSep " " archFlags)))
+          ++ (optional (archFlags != []) (lib.cmakeFeature "CMAKE_CXX_FLAGS" (concatStringsSep " " archFlags)))
+          ++ (optional (vendor == "amd" && allQuants) (lib.cmakeBool "GGML_HIP_FA_ALL_QUANTS" true))
+          ++ extraCmakeFlags;
+      });
 }

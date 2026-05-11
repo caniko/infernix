@@ -45,13 +45,6 @@ in {
         example = "11.0.0";
         description = "HSA_OVERRIDE_GFX_VERSION value (e.g. 11.0.0 for gfx1100).";
       };
-
-      cpuArch = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        example = "znver4";
-        description = "CPU microarchitecture for -march flag on llama-cpp.";
-      };
     };
   };
 

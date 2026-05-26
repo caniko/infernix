@@ -1,9 +1,10 @@
 # infernix
 
-Declarative NixOS and home-manager modules for self-hosted AI/ML inference.
+Declarative NixOS and home-manager modules for self-hosted AI/ML inference
+including LLMs, diffusion, and vector DBs.
 
 `infernix` wraps the moving parts of a local model-serving stack — Ollama,
-llama-swap (llama.cpp), Qdrant, and SurrealDB — behind a single
+llama-swap (llama.cpp), ComfyUI, Qdrant, and SurrealDB — behind a single
 `services.infernix.*` namespace with a shared GPU vendor abstraction so
 switching between AMD/ROCm, NVIDIA/CUDA, and CPU is a one-line change. Its
 Home Manager modules can also translate local Infernix-backed endpoints into
@@ -25,6 +26,9 @@ NixOS modules (`nixosModules.default`):
   download of GGUF files from HuggingFace via a `infernix-download` systemd
   oneshot, per-model TTL and extra CLI args, flash-attention all-quants, and
   CPU microarchitecture tuning.
+- **`services.infernix.comfyui`** — ComfyUI diffusion interface with
+  GPU-aware package defaults, visible-device masking, state/model directory
+  management, extra model paths, and per-interface firewall rules.
 - **`services.infernix.qdrant`** — vector database with HTTP/gRPC ports,
   storage and snapshot path options, and firewall handling.
 - **`services.infernix.surrealdb`** — SurrealDB multi-model database with
@@ -107,6 +111,12 @@ Additional opt-in Home Manager modules:
               file = "Qwen3-Coder-Next-Q4_K_M.gguf";
               ctxSize = 65536;
             };
+          };
+
+          services.infernix.comfyui = {
+            enable = true;
+            host = "0.0.0.0";
+            modelsDir = "/var/lib/comfyui/models";
           };
 
           services.infernix.qdrant.enable = true;

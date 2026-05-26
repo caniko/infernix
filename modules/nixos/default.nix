@@ -1,5 +1,6 @@
 {
   imports = [
+    ./comfyui.nix
     ./embr.nix
     ./gpu.nix
     ./mnemo.nix

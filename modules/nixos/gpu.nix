@@ -7,6 +7,7 @@
   cfg = config.services.infernix;
   needsGpu =
     (cfg.ollama.enable or false)
+    || (cfg.comfyui.enable or false)
     || (cfg.llama-swap.enable or false);
 in {
   options.services.infernix.gpu = {
@@ -15,7 +16,8 @@ in {
       default = null;
       description = ''
         GPU vendor for inference acceleration. Required when
-        `services.infernix.ollama.enable` or
+        `services.infernix.ollama.enable`,
+        `services.infernix.comfyui.enable`, or
         `services.infernix.llama-swap.enable` is true. Left null on hosts
         that import infernix but don't enable any GPU-consuming service.
       '';
@@ -54,7 +56,8 @@ in {
         assertion = cfg.gpu.vendor != null;
         message = ''
           services.infernix.gpu.vendor must be set when
-          services.infernix.ollama.enable or
+          services.infernix.ollama.enable,
+          services.infernix.comfyui.enable, or
           services.infernix.llama-swap.enable is true.
         '';
       }
@@ -62,7 +65,8 @@ in {
         assertion = cfg.gpu.pkgs != null;
         message = ''
           services.infernix.gpu.pkgs must be set when
-          services.infernix.ollama.enable or
+          services.infernix.ollama.enable,
+          services.infernix.comfyui.enable, or
           services.infernix.llama-swap.enable is true.
         '';
       }

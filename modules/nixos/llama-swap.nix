@@ -172,6 +172,20 @@ in {
     };
 
     llamaCpp = {
+      package = mkOption {
+        type = types.nullOr types.package;
+        default = null;
+        example = lib.literalExpression "pkgs.llama-cpp-vulkan";
+        description = ''
+          Explicit llama-cpp package to use. When set, bypasses the
+          vendor-driven `bleedingPkgs.llama-cpp` selection and the
+          `hardwareOptimization` / `flashAttention` / `extraCmakeFlags`
+          override path entirely. Useful for swapping in a Hydra-cached
+          backend variant (e.g. `llama-cpp-vulkan` on hosts whose
+          GPU-vendor variant isn't published to a binary cache).
+        '';
+      };
+
       extraCmakeFlags = mkOption {
         type = types.listOf types.str;
         default = [];
@@ -231,13 +245,17 @@ in {
       sourcePkgs = gpuCfg.pkgs;
     };
 
-    llama-cpp = gpuLib.overrideLlamaCpp {
-      vendor = gpuCfg.vendor;
-      pkgs = bleedingPkgs;
-      hardwareOptimization = cfg.llamaCpp.hardwareOptimization;
-      extraCmakeFlags = cfg.llamaCpp.extraCmakeFlags;
-      flashAttention = cfg.llamaCpp.flashAttention;
-    };
+    llama-cpp =
+      if cfg.llamaCpp.package != null
+      then cfg.llamaCpp.package
+      else
+        gpuLib.overrideLlamaCpp {
+          vendor = gpuCfg.vendor;
+          pkgs = bleedingPkgs;
+          hardwareOptimization = cfg.llamaCpp.hardwareOptimization;
+          extraCmakeFlags = cfg.llamaCpp.extraCmakeFlags;
+          flashAttention = cfg.llamaCpp.flashAttention;
+        };
     llama-server = getExe' llama-cpp "llama-server";
 
     mkModelCmd = _name: model: let

@@ -18,6 +18,10 @@
       url = "git+ssh://git@codeberg.org/caniko/rs-embr.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    plinth = {
+      url = "git+https://codeberg.org/caniko/plinth.git?ref=refs/heads/trunk";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
@@ -25,8 +29,14 @@
     nixpkgs,
     mnemo,
     embr,
+    plinth,
   }: let
-    systems = ["x86_64-linux" "aarch64-linux"];
+    # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
+    # NVIDIA, ROCm on AMD) and llama.cpp/ollama builds whose upstreams
+    # only ship x86_64 in practice. No aarch64-linux consumer exists,
+    # so evaluating aarch64 outputs is dead weight that doubles
+    # `nix flake check` heap for nothing.
+    systems = ["x86_64-linux"];
     forAllSystems = nixpkgs.lib.genAttrs systems;
   in {
     nixosModules = {
@@ -81,14 +91,27 @@
         && builtins.hasAttr "default" mnemo.packages.${system}
         then mnemo.packages.${system}.default
         else null;
+      website = plinth.lib.${system}.mkProjectSite {
+        pname = "infernix-website";
+        domain = "infernix.tartanoglu.com";
+        configPath = ./website/plinth-project.toml;
+      };
     in
       {
         embr = embr.packages.${system}.embr;
         default = embr.packages.${system}.embr;
+        website = website;
+        site = website;
       }
       // nixpkgs.lib.optionalAttrs (mnemoPackage != null) {
         mnemo = mnemoPackage;
       });
+
+    apps = forAllSystems (system: {
+      deploy-pages = plinth.lib.${system}.mkDeployPagesApp {
+        domain = "infernix.tartanoglu.com";
+      };
+    });
 
     checks = forAllSystems (system: let
       pkgs = import nixpkgs {inherit system;};

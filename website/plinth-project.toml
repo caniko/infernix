@@ -1,0 +1,41 @@
+[site]
+title = "infernix"
+description = "Declarative NixOS and home-manager modules for self-hosted AI/ML inference"
+base_url = "/"
+footer_note = "Generated from repository metadata by the plinth-project FOSS sweep."
+
+[[nav]]
+label = "Overview"
+href = "#overview"
+
+[[nav]]
+label = "Source"
+href = "ssh://git@codeberg.org/caniko/infernix.git"
+
+[[footer_links]]
+label = "Source"
+href = "ssh://git@codeberg.org/caniko/infernix.git"
+
+[[pages]]
+slug = "index"
+title = "infernix"
+description = "Declarative NixOS and home-manager modules for self-hosted AI/ML inference"
+
+[[pages.sections]]
+type = "hero"
+title = "infernix"
+tagline = "Declarative NixOS and home-manager modules for self-hosted AI/ML inference"
+subtitle = "Declarative NixOS and home-manager modules for self-hosted AI/ML inference"
+
+[[pages.sections.ctas]]
+label = "View source"
+href = "ssh://git@codeberg.org/caniko/infernix.git"
+primary = true
+
+[[pages.sections]]
+type = "feature_grid"
+id = "overview"
+
+[[pages.sections.features]]
+title = "Nix"
+description = "Project technology detected from repository manifests."

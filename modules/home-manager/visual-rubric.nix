@@ -1,5 +1,5 @@
 # Computes visual-rubric configuration from infernix endpoints as read-only
-# options and writes home.sessionVariables for the `configured` subcommand.
+# options and writes a TOML config file for the `configured` subcommand.
 #
 # Auto-discovery priority:
 #   1. Explicit `vision.endpoint` / `vision.model` (highest priority).
@@ -9,14 +9,10 @@
 #   3. Fallback: scan services.infernix.endpoints for llama-swap endpoints
 #      (standalone HM mode).
 #   4. Gives up with a clear eval error if nothing is found and enable = true.
-#
-# Unlike goose.nix and yeehaw.nix, this module writes home.sessionVariables
-# directly rather than requiring an opt-in *-programs.nix module. That's
-# safe because home.sessionVariables is a universally available HM option
-# that causes no type errors for users who don't import it.
 {
   config,
   lib,
+  pkgs,
   osConfig ? null,
   ...
 }: let
@@ -233,13 +229,19 @@ in {
   config = mkIf cfg.enable {
     services.infernix.visual-rubric.generatedConfig = generatedConfig;
 
-    home.sessionVariables =
+    xdg.configFile."visual-rubric/config.toml" =
       if generatedConfig != {}
       then {
-        VISUAL_RUBRIC_VISION_URL = generatedConfig.vision_url;
-        VISUAL_RUBRIC_VISION_MODEL = generatedConfig.vision_model;
-        VISUAL_RUBRIC_ACP_BINARY = generatedConfig.rubric_binary;
-        VISUAL_RUBRIC_ACP_ARGS = generatedConfig.rubric_acp_args_str;
+        source = (pkgs.formats.toml {}).generate "visual-rubric-config" {
+          vision = {
+            url = generatedConfig.vision_url;
+            model = generatedConfig.vision_model;
+          };
+          rubric = {
+            backend = generatedConfig.rubric_backend;
+            args = generatedConfig.rubric_acp_args;
+          };
+        };
       }
       else {};
 

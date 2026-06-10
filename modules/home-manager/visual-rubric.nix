@@ -74,7 +74,10 @@
   llamaSwapEndpoints = filterAttrs (_: ep: ep.type == "llama-swap") epCfg;
 
   autoDiscoveredEndpointVision =
-    if cfg.vision.autoDiscover && autoDiscoveredLlamaSwapVision == null then
+    if cfg.vision.autoDiscover
+    && autoDiscoveredLlamaSwapVision == null
+    && llamaSwapEndpoints != {}
+    then
       let
         # Find the first llama-swap endpoint with at least one model
         firstEp = builtins.head (builtins.attrNames llamaSwapEndpoints);
@@ -90,8 +93,9 @@
   # --- Resolved vision config ---
 
   resolvedVision =
-    explicitVision
-    // (if explicitVision == null then (autoDiscoveredLlamaSwapVision // autoDiscoveredEndpointVision) else {});
+    if explicitVision != null then explicitVision
+    else if autoDiscoveredLlamaSwapVision != null then autoDiscoveredLlamaSwapVision
+    else autoDiscoveredEndpointVision;
 
   # --- ACP backend config ---
 

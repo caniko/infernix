@@ -90,6 +90,9 @@
       # services.infernix.yeehaw outputs. Only import for users that also
       # import yeeHaw's HM module.
       yeehaw = import ./modules/home-manager/yeehaw-programs.nix;
+      # Opt-in sub-module that writes programs.visual-rubric.* from the
+      # services.infernix.visual-rubric outputs.
+      visualRubric = import ./modules/home-manager/visual-rubric-programs.nix;
     };
 
     packages = forAllSystems (system: let

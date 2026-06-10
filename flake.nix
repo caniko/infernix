@@ -18,6 +18,12 @@
       url = "git+ssh://git@codeberg.org/caniko/rs-embr.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    visual-rubric = {
+      url = "git+ssh://git@codeberg.org/caniko/visual-rubric.git";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     plinth = {
       url = "git+https://codeberg.org/caniko/plinth.git?ref=refs/heads/trunk";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -29,6 +35,7 @@
     nixpkgs,
     mnemo,
     embr,
+    visual-rubric,
     plinth,
   }: let
     # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
@@ -57,6 +64,7 @@
         _module.args.infernixBleedingNixpkgs = nixpkgs;
         _module.args.infernixMnemo = mnemo;
         _module.args.infernixEmbr = embr;
+        _module.args.infernixVisualRubric = visual-rubric;
         # Default `services.embr.package` to the one locked by infernix,
         # picking the binary for the active host system. mkDefault keeps
         # it overridable downstream.
@@ -91,6 +99,12 @@
         && builtins.hasAttr "default" mnemo.packages.${system}
         then mnemo.packages.${system}.default
         else null;
+      visualRubricPackage =
+        if builtins.hasAttr "packages" visual-rubric
+        && builtins.hasAttr system visual-rubric.packages
+        && builtins.hasAttr "default" visual-rubric.packages.${system}
+        then visual-rubric.packages.${system}.default
+        else null;
       website = plinth.lib.${system}.mkProjectSite {
         pname = "infernix-website";
         domain = "infernix.tartanoglu.com";
@@ -105,6 +119,9 @@
       }
       // nixpkgs.lib.optionalAttrs (mnemoPackage != null) {
         mnemo = mnemoPackage;
+      }
+      // nixpkgs.lib.optionalAttrs (visualRubricPackage != null) {
+        visual-rubric = visualRubricPackage;
       });
 
     apps = forAllSystems (system: {

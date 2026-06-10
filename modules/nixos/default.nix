@@ -8,5 +8,6 @@
     ./llama-swap.nix
     ./qdrant.nix
     ./surrealdb.nix
+    ./visual-rubric.nix
   ];
 }

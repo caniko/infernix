@@ -28,6 +28,13 @@
       url = "git+https://codeberg.org/caniko/plinth.git?ref=refs/heads/trunk";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    rs-harbor = {
+      url = "git+https://codeberg.org/caniko/rs-harbor.git";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    rust-overlay.follows = "rs-harbor/rust-overlay";
   };
 
   outputs = {
@@ -37,6 +44,8 @@
     embr,
     visual-rubric,
     plinth,
+    rs-harbor,
+    rust-overlay,
   }: let
     # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
     # NVIDIA, ROCm on AMD) and llama.cpp/ollama builds whose upstreams
@@ -44,7 +53,37 @@
     # so evaluating aarch64 outputs is dead weight that doubles
     # `nix flake check` heap for nothing.
     systems = ["x86_64-linux"];
+    packageSystems = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
     forAllSystems = nixpkgs.lib.genAttrs systems;
+    forAllPackageSystems = nixpkgs.lib.genAttrs packageSystems;
+
+    mkLbPackage = system: let
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      };
+      toolchain = rs-harbor.lib.mkToolchain {inherit pkgs;};
+      inherit (toolchain) craneLib;
+      src = craneLib.cleanCargoSource (builtins.path {
+        path = ./.;
+        name = "infernix-source";
+      });
+      commonArgs = {
+        inherit src;
+        pname = "infernix-lb";
+        version = "0.1.0";
+        strictDeps = true;
+        cargoExtraArgs = "-p infernix-lb";
+      };
+      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+    in
+      craneLib.buildPackage (commonArgs
+        // {
+          inherit cargoArtifacts;
+        });
   in {
     nixosModules = {
       default = {
@@ -65,6 +104,7 @@
         _module.args.infernixMnemo = mnemo;
         _module.args.infernixEmbr = embr;
         _module.args.infernixVisualRubric = visual-rubric;
+        _module.args.infernixSelf = self;
         # Default `services.embr.package` to the one locked by infernix,
         # picking the binary for the active host system. mkDefault keeps
         # it overridable downstream.
@@ -95,7 +135,8 @@
       visualRubric = import ./modules/home-manager/visual-rubric-programs.nix;
     };
 
-    packages = forAllSystems (system: let
+    packages = forAllPackageSystems (system: let
+      infernix-lb = mkLbPackage system;
       mnemoPackage =
         if builtins.hasAttr "packages" mnemo
         && builtins.hasAttr system mnemo.packages
@@ -108,22 +149,32 @@
         && builtins.hasAttr "default" visual-rubric.packages.${system}
         then visual-rubric.packages.${system}.default
         else null;
-      website = plinth.lib.${system}.mkProjectSite {
-        pname = "infernix-website";
-        domain = "infernix.tartanoglu.com";
-        configPath = ./website/plinth-project.toml;
-      };
+      website =
+        if system == "x86_64-linux"
+        then
+          plinth.lib.${system}.mkProjectSite {
+            pname = "infernix-website";
+            domain = "infernix.tartanoglu.com";
+            configPath = ./website/plinth-project.toml;
+          }
+        else null;
     in
       {
+        inherit infernix-lb;
+        default =
+          if system == "x86_64-linux"
+          then embr.packages.${system}.embr
+          else infernix-lb;
+      }
+      // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
         embr = embr.packages.${system}.embr;
-        default = embr.packages.${system}.embr;
         website = website;
         site = website;
       }
-      // nixpkgs.lib.optionalAttrs (mnemoPackage != null) {
+      // nixpkgs.lib.optionalAttrs (system == "x86_64-linux" && mnemoPackage != null) {
         mnemo = mnemoPackage;
       }
-      // nixpkgs.lib.optionalAttrs (visualRubricPackage != null) {
+      // nixpkgs.lib.optionalAttrs (system == "x86_64-linux" && visualRubricPackage != null) {
         visual-rubric = visualRubricPackage;
       });
 

@@ -12,7 +12,7 @@
 in {
   options.services.infernix.gpu = {
     vendor = mkOption {
-      type = types.nullOr (types.enum ["amd" "nvidia" "cpu"]);
+      type = types.nullOr (types.enum ["amd" "nvidia" "intel" "cpu"]);
       default = null;
       description = ''
         GPU vendor for inference acceleration. Required when
@@ -68,6 +68,14 @@ in {
           services.infernix.ollama.enable,
           services.infernix.comfyui.enable, or
           services.infernix.llama-swap.enable is true.
+        '';
+      }
+      {
+        assertion = cfg.gpu.vendor != "intel" || cfg.gpu.visibleDevices == ["0"];
+        message = ''
+          services.infernix.gpu.visibleDevices must remain ["0"] for
+          services.infernix.gpu.vendor = "intel" until Intel device masking is
+          explicitly implemented and validated.
         '';
       }
     ];

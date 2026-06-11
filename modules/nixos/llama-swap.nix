@@ -248,6 +248,8 @@ in {
     llama-cpp =
       if cfg.llamaCpp.package != null
       then cfg.llamaCpp.package
+      else if gpuCfg.vendor == "intel"
+      then bleedingPkgs.llama-cpp-vulkan
       else
         gpuLib.overrideLlamaCpp {
           vendor = gpuCfg.vendor;

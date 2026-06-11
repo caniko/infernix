@@ -39,6 +39,8 @@ in {
     then pkgs.ollama-rocm
     else if vendor == "nvidia"
     then pkgs.ollama-cuda
+    else if vendor == "intel"
+    then pkgs.ollama-vulkan
     else pkgs.ollama;
 
   # Systemd service overrides needed for GPU inference workloads.
@@ -68,6 +70,13 @@ in {
     else if vendor == "nvidia"
     then {
       DevicePolicy = mkForce "auto";
+      Environment = envVars;
+    }
+    else if vendor == "intel"
+    then {
+      DevicePolicy = mkForce "auto";
+      ProcSubset = mkForce "all";
+      SupplementaryGroups = ["video" "render"];
       Environment = envVars;
     }
     else {};

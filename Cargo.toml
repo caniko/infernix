@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/infernix-lb"]
+resolver = "2"
+
+[workspace.package]
+authors = ["caniko"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://codeberg.org/caniko/infernix"
+version = "0.1.0"
+
+[workspace.metadata.crane]
+name = "infernix"
+

@@ -22,7 +22,7 @@
       };
 
       capabilities = mkOption {
-        type = types.listOf (types.enum ["chat" "embeddings"]);
+        type = types.listOf (types.enum ["chat" "embeddings" "rerank"]);
         default = [];
         description = "OpenAI API capabilities this backend model can serve.";
       };
@@ -156,4 +156,3 @@ in {
     });
   };
 }
-

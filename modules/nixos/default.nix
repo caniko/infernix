@@ -2,6 +2,7 @@
   imports = [
     ./comfyui.nix
     ./embr.nix
+    ./fleet.nix
     ./gpu.nix
     ./load-balancer.nix
     ./mnemo.nix

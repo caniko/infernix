@@ -116,10 +116,17 @@ in {
       default = [];
       description = "Network interfaces where the node health TCP port is opened.";
     };
+
+    nodectlPackage = mkOption {
+      type = types.package;
+      readOnly = true;
+      default = nodectl;
+      description = "Generated infernix-nodectl package for local control hooks.";
+    };
   };
 
   config = mkIf cfg.enable {
-    environment.systemPackages = [nodectl];
+    environment.systemPackages = [cfg.nodectlPackage];
 
     systemd.services.infernix-node = {
       description = "Infernix backend node health endpoint";

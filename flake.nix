@@ -60,11 +60,9 @@
     forAllSystems = nixpkgs.lib.genAttrs systems;
     forAllPackageSystems = nixpkgs.lib.genAttrs packageSystems;
 
-    mkLbPackage = system: let
-      pkgs = import nixpkgs {
-        inherit system;
-        overlays = [rust-overlay.overlays.default];
-      };
+    mkLbPackageForPkgs = pkgs: pkgs.callPackage ./packages/infernix-lb.nix {};
+
+    mkLbPackageWithCrane = pkgs: let
       toolchain = rs-harbor.lib.mkToolchain {inherit pkgs;};
       inherit (toolchain) craneLib;
       src = craneLib.cleanCargoSource (builtins.path {
@@ -84,7 +82,17 @@
         // {
           inherit cargoArtifacts;
         });
+
+    mkLbPackage = system:
+      mkLbPackageWithCrane (import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      });
   in {
+    lib = {
+      inherit mkLbPackageForPkgs;
+    };
+
     nixosModules = {
       default = {
         lib,
@@ -105,6 +113,7 @@
         _module.args.infernixEmbr = embr;
         _module.args.infernixVisualRubric = visual-rubric;
         _module.args.infernixSelf = self;
+        _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
         # Default `services.embr.package` to the one locked by infernix,
         # picking the binary for the active host system. mkDefault keeps
         # it overridable downstream.
@@ -118,6 +127,8 @@
         imports = [./modules/nixos/mnemo.nix];
         _module.args.infernixMnemo = mnemo;
       };
+
+      pink-raven-workload = ./modules/nixos/pink-raven-workload.nix;
     };
 
     homeModules = {

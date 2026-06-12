@@ -228,11 +228,36 @@
           }
         ];
       };
+      pinkRavenWorkloadSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.pink-raven-workload
+          ({lib, ...}: {
+            options.services.pink-raven = lib.mkOption {
+              type = lib.types.attrs;
+              default = {};
+              description = "Dummy Pink Raven option tree for workload module checks.";
+            };
+
+            config = {
+              system.stateVersion = "24.11";
+              services.infernix.workloads.pinkRaven.enable = true;
+            };
+          })
+        ];
+      };
     in {
       embr-wrapper = pkgs.runCommand "infernix-embr-wrapper-check" {} ''
         test "${sample.config.services.embr.qdrant.url}" = "http://127.0.0.1:6333"
         test "${sample.config.services.embr.embedding.url}" = "http://127.0.0.1:11434"
         test "${sample.config.services.embr.package}" = "${embr.packages.${system}.embr}"
+        touch "$out"
+      '';
+
+      pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" {} ''
+        test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
+        test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-embedding-8b"
+        test "${pinkRavenWorkloadSample.config.services.pink-raven.settings.PINK_RAVEN_EMBEDDING_TIMEOUT_MS}" = "180000"
         touch "$out"
       '';
     });

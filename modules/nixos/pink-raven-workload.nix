@@ -27,6 +27,16 @@ in {
       description = "Expected Pink Raven embedding vector dimension.";
     };
 
+    embeddingTimeoutMs = mkOption {
+      type = types.ints.positive;
+      default = 180000;
+      description = ''
+        Pink Raven HTTP embedding request timeout in milliseconds. This should
+        be long enough for a cold llama-swap backend to load the embedding
+        model on first use.
+      '';
+    };
+
     rerankerModel = mkOption {
       type = types.str;
       default = "jina-reranker-v3";
@@ -64,6 +74,7 @@ in {
       embeddingLbStrategy = "least-in-flight";
       embeddingModel = cfg.embeddingModel;
       embeddingDim = cfg.embeddingDim;
+      settings.PINK_RAVEN_EMBEDDING_TIMEOUT_MS = toString cfg.embeddingTimeoutMs;
 
       rerankerEnabled = true;
       rerankerUrl = "${cfg.lbUrl}/v1/rerank";

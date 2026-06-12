@@ -39,8 +39,12 @@ in {
 
     rerankerModel = mkOption {
       type = types.str;
-      default = "jina-reranker-v3";
-      description = "Reranker model name sent by Pink Raven.";
+      default = "bge-reranker-v2-m3";
+      description = ''
+        Reranker model name sent by Pink Raven. The default is Apache-2.0
+        licensed; jina-reranker-v3 is CC-BY-NC-4.0 and must not be used for
+        commercial self-hosting.
+      '';
     };
 
     rerankerBatchSize = mkOption {

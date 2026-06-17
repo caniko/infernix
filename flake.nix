@@ -35,6 +35,11 @@
     };
 
     rust-overlay.follows = "rs-harbor/rust-overlay";
+
+    hermes-agent = {
+      url = "github:NousResearch/hermes-agent";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
@@ -46,6 +51,7 @@
     plinth,
     rs-harbor,
     rust-overlay,
+    hermes-agent,
   }: let
     # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
     # NVIDIA, ROCm on AMD) and llama.cpp/ollama builds whose upstreams
@@ -104,11 +110,15 @@
           # Re-export embr's NixOS module under the same default import
           # path so consumers get `services.embr.*` for free.
           embr.nixosModules.default
+          # Re-export hermes-agent's NixOS module under the same default
+          # import so consumers get `services.hermes-agent.*` for free.
+          hermes-agent.nixosModules.default
         ];
         # Thread the locked nixos-unstable nixpkgs flake into the module tree
         # so ollama / llama-cpp / llama-swap can re-instantiate it with the
         # consumer's own system + config (GPU flags, allowUnfree, etc.).
         _module.args.infernixBleedingNixpkgs = nixpkgs;
+        _module.args.infernixHermesAgent = hermes-agent;
         _module.args.infernixMnemo = mnemo;
         _module.args.infernixEmbr = embr;
         _module.args.infernixVisualRubric = visual-rubric;
@@ -144,6 +154,10 @@
       # Opt-in sub-module that writes programs.visual-rubric.* from the
       # services.infernix.visual-rubric outputs.
       visualRubric = import ./modules/home-manager/visual-rubric-programs.nix;
+      # Opt-in sub-module that wires hermes CLI providers from
+      # services.infernix.endpoints. Only import for users that also
+      # configure services.infernix.hermes-agent.
+      hermes-agent = import ./modules/home-manager/hermes-agent-programs.nix;
     };
 
     packages = forAllPackageSystems (system: let
@@ -246,6 +260,43 @@
           }
         ];
       };
+      hermesAgentSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+
+            services.infernix.fleet = {
+              nodes = {
+                atlas = {
+                  lanIp = "192.168.178.88";
+                  priority = 30;
+                  models.qwen3-vl-8b = {
+                    name = "qwen3-vl-8b";
+                    capabilities = ["chat"];
+                  };
+                };
+              };
+              loadBalancer = {
+                enable = true;
+                host = "192.168.178.31";
+                port = 8014;
+              };
+            };
+
+            services.infernix.hermes-agent = {
+              enable = true;
+              useFleetModels = true;
+              environmentFiles = ["/run/secrets/hermes-env"];
+              settings = {
+                model.default = "qwen3-vl-8b";
+                toolsets = ["all"];
+              };
+            };
+          }
+        ];
+      };
       pinkRavenWorkloadSample = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -276,6 +327,14 @@
         test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
         test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-embedding-8b"
         test "${pinkRavenWorkloadSample.config.services.pink-raven.settings.PINK_RAVEN_EMBEDDING_TIMEOUT_MS}" = "180000"
+        touch "$out"
+      '';
+
+      hermes-agent = pkgs.runCommand "infernix-hermes-agent-check" {} ''
+        test "${hermesAgentSample.config.services.hermes-agent.settings.model.default}" = "qwen3-vl-8b"
+        test "${hermesAgentSample.config.services.hermes-agent.settings.model.base_url}" = "http://192.168.178.31:8014/v1"
+        test "${hermesAgentSample.config.services.hermes-agent.user}" = "hermes"
+        test "${hermesAgentSample.config.services.hermes-agent.group}" = "hermes"
         touch "$out"
       '';
     });

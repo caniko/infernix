@@ -3,6 +3,7 @@
     ./comfyui.nix
     ./embr.nix
     ./fleet.nix
+    ./hermes-agent.nix
     ./gpu.nix
     ./load-balancer.nix
     ./mnemo.nix

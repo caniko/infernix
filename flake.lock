@@ -401,11 +401,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1781983177,
-        "narHash": "sha256-Ga7aAX3RWbk5FP9hCipQBxzlaLaUDEdMZAwOT6ru+Xs=",
+        "lastModified": 1781986443,
+        "narHash": "sha256-pid3JHmb5PvVTvb7tEG/HbC0YyFCkKhgq8Vlgf7zNV4=",
         "owner": "caniko",
         "repo": "hermes-webui",
-        "rev": "47a801f20b31a665843c349149b2f6bdcc3b8baf",
+        "rev": "d69012f142e4183ac659c143299254eaf80b949a",
         "type": "github"
       },
       "original": {

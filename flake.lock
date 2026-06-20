@@ -391,6 +391,29 @@
         "type": "github"
       }
     },
+    "hermes-webui": {
+      "inputs": {
+        "hermes-agent": [
+          "hermes-agent"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1781983177,
+        "narHash": "sha256-Ga7aAX3RWbk5FP9hCipQBxzlaLaUDEdMZAwOT6ru+Xs=",
+        "owner": "caniko",
+        "repo": "hermes-webui",
+        "rev": "47a801f20b31a665843c349149b2f6bdcc3b8baf",
+        "type": "github"
+      },
+      "original": {
+        "owner": "caniko",
+        "repo": "hermes-webui",
+        "type": "github"
+      }
+    },
     "mnemo": {
       "inputs": {
         "crane": [
@@ -800,6 +823,7 @@
       "inputs": {
         "embr": "embr",
         "hermes-agent": "hermes-agent",
+        "hermes-webui": "hermes-webui",
         "mnemo": "mnemo",
         "nixpkgs": "nixpkgs",
         "plinth": "plinth",

@@ -4,6 +4,7 @@
     ./embr.nix
     ./fleet.nix
     ./hermes-agent.nix
+    ./hermes-webui.nix
     ./gpu.nix
     ./load-balancer.nix
     ./mnemo.nix

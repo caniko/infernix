@@ -40,6 +40,12 @@
       url = "github:NousResearch/hermes-agent";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    hermes-webui = {
+      url = "github:caniko/hermes-webui";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.hermes-agent.follows = "hermes-agent";
+    };
   };
 
   outputs = {
@@ -52,6 +58,7 @@
     rs-harbor,
     rust-overlay,
     hermes-agent,
+    hermes-webui,
   }: let
     # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
     # NVIDIA, ROCm on AMD) and llama.cpp/ollama builds whose upstreams
@@ -113,12 +120,16 @@
           # Re-export hermes-agent's NixOS module under the same default
           # import so consumers get `services.hermes-agent.*` for free.
           hermes-agent.nixosModules.default
+          # Re-export hermes-webui's NixOS module under the same default
+          # import so consumers get `services.hermes-webui.*` for free.
+          hermes-webui.nixosModules.default
         ];
         # Thread the locked nixos-unstable nixpkgs flake into the module tree
         # so ollama / llama-cpp / llama-swap can re-instantiate it with the
         # consumer's own system + config (GPU flags, allowUnfree, etc.).
         _module.args.infernixBleedingNixpkgs = nixpkgs;
         _module.args.infernixHermesAgent = hermes-agent;
+        _module.args.infernixHermesWebui = hermes-webui;
         _module.args.infernixMnemo = mnemo;
         _module.args.infernixEmbr = embr;
         _module.args.infernixVisualRubric = visual-rubric;

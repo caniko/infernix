@@ -126,15 +126,13 @@
       }: {
         imports = [
           ./modules/nixos
-          # Re-export embr's NixOS module under the same default import
-          # path so consumers get `services.embr.*` for free.
+          # Re-export upstream NixOS modules under the same default import
+          # path so consumers get their options for free.
+          brainrouter.nixosModules.default
           embr.nixosModules.default
-          # Re-export hermes-agent's NixOS module under the same default
-          # import so consumers get `services.hermes-agent.*` for free.
           hermes-agent.nixosModules.default
-          # Re-export hermes-webui's NixOS module under the same default
-          # import so consumers get `services.hermes-webui.*` for free.
           hermes-webui.nixosModules.default
+          manifest.nixosModules.default
         ];
         # Thread the locked nixos-unstable nixpkgs flake into the module tree
         # so ollama / llama-cpp / llama-swap can re-instantiate it with the

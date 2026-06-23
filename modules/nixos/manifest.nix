@@ -8,10 +8,7 @@
   inherit (lib) mkEnableOption mkIf mkOption types;
 
   cfg = config.services.infernix.manifest;
-  manifestModule = infernixManifest.nixosModules.default;
 in {
-  imports = [manifestModule];
-
   options.services.infernix.manifest = {
     enable = mkEnableOption "Manifest AI model router via infernix";
 

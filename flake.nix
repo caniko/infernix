@@ -46,6 +46,16 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.hermes-agent.follows = "hermes-agent";
     };
+
+    brainrouter = {
+      url = "github:caniko/brainrouter";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    manifest = {
+      url = "github:caniko/manifest";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
@@ -59,6 +69,8 @@
     rust-overlay,
     hermes-agent,
     hermes-webui,
+    brainrouter,
+    manifest,
   }: let
     # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
     # NVIDIA, ROCm on AMD) and llama.cpp/ollama builds whose upstreams
@@ -135,6 +147,8 @@
         _module.args.infernixVisualRubric = visual-rubric;
         _module.args.infernixSelf = self;
         _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
+        _module.args.infernixBrainrouter = brainrouter;
+        _module.args.infernixManifest = manifest;
         # Default `services.embr.package` to the one locked by infernix,
         # picking the binary for the active host system. mkDefault keeps
         # it overridable downstream.

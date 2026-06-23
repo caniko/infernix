@@ -21,11 +21,11 @@
     then "127.0.0.1"
     else host;
 
-  mnemoConfig = tomlFormat.generate "mnemo-config.toml" (lib.recursiveUpdate cfg.settings {
+  mkToml = password: tomlFormat.generate "mnemo-config.toml" (lib.recursiveUpdate cfg.settings {
     storage = {
       surreal_url = cfg.surrealdb.url;
       surreal_username = cfg.surrealdb.username;
-      surreal_password = cfg.surrealdb.password;
+      inherit password;
       surreal_namespace = cfg.surrealdb.namespace;
       surreal_database = cfg.surrealdb.database;
     };
@@ -34,6 +34,13 @@
       collection_name = cfg.qdrant.collectionName;
     };
   });
+
+  mnemoConfig = mkToml cfg.surrealdb.password;
+
+  # Template with placeholder used when passwordFile is set;
+  # the placeholder is substituted at activation time so the
+  # actual password never enters the Nix store.
+  mnemoConfigTemplate = mkToml "@SURREALDB_PASSWORD@";
 in {
   options.services.infernix.mnemo = {
     enable = mkEnableOption "Mnemo tooling and system configuration";
@@ -90,7 +97,27 @@ in {
           if cfg.surrealdb.useInfernixService && surrealCfg.auth.enable
           then surrealCfg.auth.password
           else "root";
-        description = "Password Mnemo should use when connecting to SurrealDB.";
+        description = ''
+          Password Mnemo should use when connecting to SurrealDB.
+
+          This value is stored in the Nix store when set here. For production
+          use, prefer `passwordFile` instead — it loads the password from a
+          file at runtime and keeps it out of the Nix store.
+        '';
+      };
+
+      passwordFile = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = ''
+          File containing the SurrealDB password. Takes precedence over
+          `password` when set. When configured, the Mnemo config file is
+          generated at activation time by substituting the placeholder with
+          the file contents, keeping the password out of the Nix store.
+
+          The default for `password` is still evaluated for option display,
+          but is ignored at runtime when `passwordFile` is set.
+        '';
       };
 
       namespace = mkOption {
@@ -164,6 +191,19 @@ in {
       ];
 
     environment.systemPackages = [cfg.package];
-    environment.etc."mnemo/config.toml".source = mnemoConfig;
+
+    # When passwordFile is set, substitute the placeholder at activation
+    # time so the actual password never enters the Nix store.
+    system.activationScripts.mnemoConfig = mkIf (cfg.surrealdb.passwordFile != null) ''
+      mkdir -p /etc/mnemo
+      sed "s|@SURREALDB_PASSWORD@|$(cat "${cfg.surrealdb.passwordFile}")|g" \
+        ${mnemoConfigTemplate} > /etc/mnemo/config.toml
+    '';
+
+    # Without passwordFile, use the build-time config (password stored in
+    # the Nix store — the documented tradeoff in the option description).
+    environment.etc."mnemo/config.toml" = mkIf (cfg.surrealdb.passwordFile == null) {
+      source = mnemoConfig;
+    };
   };
 }

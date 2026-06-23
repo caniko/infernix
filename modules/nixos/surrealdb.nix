@@ -50,8 +50,21 @@ let
   defaultPackage = if cfg.backend == "rocksdb" then pkgs.surrealdb else surrealdbSurrealKv;
 
   effectiveDbPath = if cfg.dbPath != null then cfg.dbPath else backendToDbPath cfg.backend;
-in
-{
+
+  surrealdbWrapper = pkgs.writeShellScriptBin "surrealdb" ''
+    password="''${SURREALDB_PASSWORD:-}"
+    if [ -n "$password" ]; then
+      exec ${cfg.package}/bin/surrealdb "$@" --pass "$password"
+    else
+      exec ${cfg.package}/bin/surrealdb "$@"
+    fi
+  '';
+
+  authFlags = optionals cfg.auth.enable (
+    ["--auth" "--user" cfg.auth.username]
+    ++ lib.optionals (cfg.auth.passwordFile == null) ["--pass" cfg.auth.password]
+  );
+in {
   options.services.infernix.surrealdb = {
     enable = mkEnableOption "SurrealDB multi-model database";
 
@@ -133,8 +146,21 @@ in
         default = "root";
         description = ''
           Root password passed to `surreal start` when auth is enabled.
-          This value is stored in the Nix store; prefer a localhost bind if you
-          keep the default and do not expose the port publicly.
+
+          This value is stored in the Nix store when set here. For production
+          use, prefer `passwordFile` instead — it loads the password from a
+          file at runtime and keeps it out of the Nix store.
+        '';
+      };
+
+      passwordFile = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = ''
+          File containing the SurrealDB root password. Takes precedence over
+          `password` when set. The file is loaded via systemd EnvironmentFile
+          and the password is passed to surrealdb through a wrapper script,
+          keeping it out of the Nix store.
         '';
       };
     };
@@ -151,19 +177,15 @@ in
 
     services.surrealdb = {
       enable = true;
-      package = cfg.package;
+      package = if cfg.auth.passwordFile != null then surrealdbWrapper else cfg.package;
       host = cfg.host;
       port = cfg.port;
       dbPath = effectiveDbPath;
-      extraFlags =
-        optionals cfg.auth.enable [
-          "--auth"
-          "--user"
-          cfg.auth.username
-          "--pass"
-          cfg.auth.password
-        ]
-        ++ cfg.extraFlags;
+      extraFlags = authFlags ++ cfg.extraFlags;
+    };
+
+    systemd.services.surrealdb = mkIf (cfg.auth.passwordFile != null) {
+      environmentFile = [cfg.auth.passwordFile];
     };
 
     networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [ cfg.port ];

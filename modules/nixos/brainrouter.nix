@@ -27,7 +27,7 @@ in {
     manifest = {
       baseUrl = mkOption {
         type = types.str;
-        default = "http://127.0.0.1:3001/v1";
+        default = "http://127.0.0.1:2099/v1";
         description = "Base URL of Manifest.";
       };
 

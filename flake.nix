@@ -128,7 +128,6 @@
           embr.nixosModules.default
           hermes-agent.nixosModules.default
           hermes-webui.nixosModules.default
-          manifest.nixosModules.default
         ];
         # Thread the locked nixos-unstable nixpkgs flake into the module tree
         # so ollama / llama-cpp / llama-swap can re-instantiate it with the

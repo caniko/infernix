@@ -66,7 +66,7 @@ in {
 
     bonsai.modelPath = mkOption {
       type = types.str;
-      description = "Path to Bonsai GGUF model file. Use ''${models_path}'' for the models path prefix.";
+      description = "Path to Bonsai GGUF model file. Use \${models_path} for the models path prefix.";
     };
 
     openFirewall = mkOption {

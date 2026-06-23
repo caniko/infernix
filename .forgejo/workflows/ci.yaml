@@ -36,3 +36,12 @@ jobs:
 
       - name: Package crate
         run: cargo package --allow-dirty
+
+  nix-check:
+    runs-on: atlas
+    steps:
+      - name: Checkout
+        uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Nix flake check
+        run: nix flake check --no-build --accept-flake-config

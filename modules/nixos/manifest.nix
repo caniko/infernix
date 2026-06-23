@@ -10,6 +10,8 @@
   cfg = config.services.infernix.manifest;
   manifestModule = infernixManifest.nixosModules.default;
 in {
+  imports = [manifestModule];
+
   options.services.infernix.manifest = {
     enable = mkEnableOption "Manifest AI model router via infernix";
 
@@ -33,8 +35,6 @@ in {
   };
 
   config = mkIf cfg.enable {
-    imports = [manifestModule];
-
     services.manifest = {
       enable = true;
       betterAuthSecretFile = cfg.betterAuthSecretFile;

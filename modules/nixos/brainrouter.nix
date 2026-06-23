@@ -10,6 +10,8 @@
   cfg = config.services.infernix.brainrouter;
   brainrouterModule = infernixBrainrouter.nixosModules.default;
 in {
+  imports = [brainrouterModule];
+
   options.services.infernix.brainrouter = {
     enable = mkEnableOption "brainrouter LLM routing proxy via infernix";
 
@@ -77,8 +79,6 @@ in {
   };
 
   config = mkIf cfg.enable {
-    imports = [brainrouterModule];
-
     services.brainrouter = {
       enable = true;
       inherit (cfg) port listenAddress;

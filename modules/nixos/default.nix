@@ -1,6 +1,7 @@
 {
   imports = [
     ./brainrouter.nix
+    ./cloud-router.nix
     ./comfyui.nix
     ./embr.nix
     ./fleet.nix
@@ -8,7 +9,6 @@
     ./hermes-webui.nix
     ./gpu.nix
     ./load-balancer.nix
-    ./manifest.nix
     ./mnemo.nix
     ./node.nix
     ./ollama.nix

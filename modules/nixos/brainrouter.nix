@@ -58,9 +58,15 @@ in {
       };
     };
 
+    modelsPath = mkOption {
+      type = types.str;
+      default = "/var/lib/models";
+      description = "Shared model storage directory.";
+    };
+
     bonsai.modelPath = mkOption {
       type = types.str;
-      description = "Path to Bonsai GGUF model.";
+      description = "Path to Bonsai GGUF model file. Use ''${models_path}'' for the models path prefix.";
     };
 
     openFirewall = mkOption {
@@ -76,6 +82,7 @@ in {
     services.brainrouter = {
       enable = true;
       inherit (cfg) port listenAddress;
+      inherit (cfg) modelsPath;
 
       manifest.baseUrl = cfg.manifest.baseUrl;
       manifest.apiKeyEnv = cfg.manifest.apiKeyEnv;

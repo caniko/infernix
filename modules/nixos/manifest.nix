@@ -19,12 +19,6 @@ in {
       description = "Path to BETTER_AUTH_SECRET file. Required on first boot.";
     };
 
-    apiKeyEnvVars = mkOption {
-      type = types.attrsOf types.path;
-      default = {};
-      description = "Env var names → file paths for cloud provider API keys. Written to Manifest environment.";
-    };
-
     imageTag = mkOption {
       type = types.str;
       default = "latest";

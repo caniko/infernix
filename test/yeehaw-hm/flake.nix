@@ -9,7 +9,7 @@
     };
     infernix.url = "path:../..";
     yeehaw = {
-      url = "path:/data/nvme0/can/Projects/ai-yolo-nix";
+      url = "path:../../ai-yolo-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

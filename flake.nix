@@ -6,6 +6,8 @@
 
     # Keep the default input remote; use `--override-input mnemo path:/...`
     # when developing against a local checkout.
+    # mnemo is a private repo; SSH is required for authentication.
+    # embr and visual-rubric below use HTTPS since they are public.
     mnemo = {
       url = "git+ssh://git@codeberg.org/caniko/mnemo.git";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -15,12 +17,12 @@
     # embr: code embedding indexer (replaces the old nushell indexer).
     # Lives in its own repo so it can be used standalone.
     embr = {
-      url = "git+ssh://git@codeberg.org/caniko/rs-embr.git";
+      url = "git+https://codeberg.org/caniko/rs-embr.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
     visual-rubric = {
-      url = "git+ssh://git@codeberg.org/caniko/visual-rubric.git";
+      url = "git+https://codeberg.org/caniko/visual-rubric.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -231,6 +233,8 @@
         domain = "infernix.tartanoglu.com";
       };
     });
+
+    formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
 
     devShells = forAllSystems (system: let
       pkgs = import nixpkgs {

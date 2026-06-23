@@ -1,51 +1,29 @@
 {
   "nodes": {
+    "brainrouter": {
+      "inputs": {
+        "crane": "crane",
+        "fenix": "fenix",
+        "flake-utils": "flake-utils",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1782240253,
+        "narHash": "sha256-qxTbneV6AgVUDqDluKrt29EXNg+SZCMBMfm4JQdtBt4=",
+        "owner": "caniko",
+        "repo": "brainrouter",
+        "rev": "285795c042277a380729f13326566f46cf105fb9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "caniko",
+        "repo": "brainrouter",
+        "type": "github"
+      }
+    },
     "crane": {
-      "locked": {
-        "lastModified": 1775839657,
-        "narHash": "sha256-SPm9ck7jh3Un9nwPuMGbRU04UroFmOHjLP56T10MOeM=",
-        "owner": "ipetkov",
-        "repo": "crane",
-        "rev": "7cf72d978629469c4bd4206b95c402514c1f6000",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ipetkov",
-        "repo": "crane",
-        "type": "github"
-      }
-    },
-    "crane_2": {
-      "locked": {
-        "lastModified": 1773857772,
-        "narHash": "sha256-5xsK26KRHf0WytBtsBnQYC/lTWDhQuT57HJ7SzuqZcM=",
-        "owner": "ipetkov",
-        "repo": "crane",
-        "rev": "b556d7bbae5ff86e378451511873dfd07e4504cd",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ipetkov",
-        "repo": "crane",
-        "type": "github"
-      }
-    },
-    "crane_3": {
-      "locked": {
-        "lastModified": 1772080396,
-        "narHash": "sha256-84W9UNtSk9DNMh43WBkOjpkbfODlmg+RDi854PnNgLE=",
-        "owner": "ipetkov",
-        "repo": "crane",
-        "rev": "8525580bc0316c39dbfa18bd09a1331e98c9e463",
-        "type": "github"
-      },
-      "original": {
-        "owner": "ipetkov",
-        "repo": "crane",
-        "type": "github"
-      }
-    },
-    "crane_4": {
       "locked": {
         "lastModified": 1781825982,
         "narHash": "sha256-SlXKwIRIhrOSAcTjCB3ftPLzJWZStQIPS7J1FlZPnKk=",
@@ -60,13 +38,58 @@
         "type": "github"
       }
     },
-    "crane_5": {
+    "crane_2": {
+      "locked": {
+        "lastModified": 1775839657,
+        "narHash": "sha256-SPm9ck7jh3Un9nwPuMGbRU04UroFmOHjLP56T10MOeM=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "7cf72d978629469c4bd4206b95c402514c1f6000",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
+    "crane_3": {
+      "locked": {
+        "lastModified": 1773857772,
+        "narHash": "sha256-5xsK26KRHf0WytBtsBnQYC/lTWDhQuT57HJ7SzuqZcM=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "b556d7bbae5ff86e378451511873dfd07e4504cd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
+    "crane_4": {
       "locked": {
         "lastModified": 1772080396,
         "narHash": "sha256-84W9UNtSk9DNMh43WBkOjpkbfODlmg+RDi854PnNgLE=",
         "owner": "ipetkov",
         "repo": "crane",
         "rev": "8525580bc0316c39dbfa18bd09a1331e98c9e463",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
+    "crane_5": {
+      "locked": {
+        "lastModified": 1781825982,
+        "narHash": "sha256-SlXKwIRIhrOSAcTjCB3ftPLzJWZStQIPS7J1FlZPnKk=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "469fd08d0bcf6926321fa973c6777fbc87785dd7",
         "type": "github"
       },
       "original": {
@@ -92,6 +115,21 @@
     },
     "crane_7": {
       "locked": {
+        "lastModified": 1772080396,
+        "narHash": "sha256-84W9UNtSk9DNMh43WBkOjpkbfODlmg+RDi854PnNgLE=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "8525580bc0316c39dbfa18bd09a1331e98c9e463",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
+    "crane_8": {
+      "locked": {
         "lastModified": 1781825982,
         "narHash": "sha256-SlXKwIRIhrOSAcTjCB3ftPLzJWZStQIPS7J1FlZPnKk=",
         "owner": "ipetkov",
@@ -105,7 +143,7 @@
         "type": "github"
       }
     },
-    "crane_8": {
+    "crane_9": {
       "locked": {
         "lastModified": 1772080396,
         "narHash": "sha256-84W9UNtSk9DNMh43WBkOjpkbfODlmg+RDi854PnNgLE=",
@@ -122,7 +160,7 @@
     },
     "embr": {
       "inputs": {
-        "crane": "crane",
+        "crane": "crane_2",
         "flake-parts": "flake-parts",
         "nixpkgs": [
           "nixpkgs"
@@ -136,11 +174,33 @@
         "rev": "45ca536cf9f4e5545ab94c34a668cf188e7ec88e",
         "revCount": 1,
         "type": "git",
-        "url": "ssh://git@codeberg.org/caniko/rs-embr.git"
+        "url": "https://codeberg.org/caniko/rs-embr.git"
       },
       "original": {
         "type": "git",
-        "url": "ssh://git@codeberg.org/caniko/rs-embr.git"
+        "url": "https://codeberg.org/caniko/rs-embr.git"
+      }
+    },
+    "fenix": {
+      "inputs": {
+        "nixpkgs": [
+          "brainrouter",
+          "nixpkgs"
+        ],
+        "rust-analyzer-src": "rust-analyzer-src"
+      },
+      "locked": {
+        "lastModified": 1782208688,
+        "narHash": "sha256-oEax2Unvaq0wD8tZs+Kk3zzeUduOegVYW8R9nM5S3Os=",
+        "owner": "nix-community",
+        "repo": "fenix",
+        "rev": "5d0542f6ba83f9366095b0e9966b0377c4c1cb31",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "fenix",
+        "type": "github"
       }
     },
     "flake-compat": {
@@ -324,6 +384,42 @@
         "type": "github"
       }
     },
+    "flake-utils_8": {
+      "inputs": {
+        "systems": "systems_8"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
+    "flake-utils_9": {
+      "inputs": {
+        "systems": "systems_9"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
     "git-hooks": {
       "inputs": {
         "flake-compat": "flake-compat",
@@ -411,6 +507,27 @@
       "original": {
         "owner": "caniko",
         "repo": "hermes-webui",
+        "type": "github"
+      }
+    },
+    "manifest": {
+      "inputs": {
+        "flake-utils": "flake-utils_2",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1782241522,
+        "narHash": "sha256-sltRsruROsUbK+iB9knqvi6j8N101u3lMGnHKJpaCgQ=",
+        "owner": "caniko",
+        "repo": "manifest",
+        "rev": "4eecddf4dd3c2656a6048f68f85eb5b839feecb4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "caniko",
+        "repo": "manifest",
         "type": "github"
       }
     },
@@ -552,7 +669,7 @@
     },
     "osxcross": {
       "inputs": {
-        "flake-utils": "flake-utils_2",
+        "flake-utils": "flake-utils_4",
         "nixpkgs": [
           "mnemo",
           "rs-harbor",
@@ -576,7 +693,7 @@
     },
     "osxcross_2": {
       "inputs": {
-        "flake-utils": "flake-utils_5",
+        "flake-utils": "flake-utils_7",
         "nixpkgs": [
           "rs-harbor",
           "nixpkgs"
@@ -599,7 +716,7 @@
     },
     "osxcross_3": {
       "inputs": {
-        "flake-utils": "flake-utils_7",
+        "flake-utils": "flake-utils_9",
         "nixpkgs": [
           "visual-rubric",
           "rs-harbor",
@@ -623,8 +740,8 @@
     },
     "plinth": {
       "inputs": {
-        "crane": "crane_3",
-        "flake-utils": "flake-utils_3",
+        "crane": "crane_4",
+        "flake-utils": "flake-utils_5",
         "nixpkgs": [
           "nixpkgs"
         ],
@@ -647,7 +764,7 @@
     },
     "plinth_2": {
       "inputs": {
-        "crane": "crane_5",
+        "crane": "crane_6",
         "flake-utils": [
           "rs-harbor",
           "flake-utils"
@@ -675,7 +792,7 @@
     },
     "plinth_3": {
       "inputs": {
-        "crane": "crane_6",
+        "crane": "crane_7",
         "flake-utils": [
           "visual-rubric",
           "flake-utils"
@@ -703,7 +820,7 @@
     },
     "plinth_4": {
       "inputs": {
-        "crane": "crane_8",
+        "crane": "crane_9",
         "flake-utils": [
           "visual-rubric",
           "rs-harbor",
@@ -821,9 +938,11 @@
     },
     "root": {
       "inputs": {
+        "brainrouter": "brainrouter",
         "embr": "embr",
         "hermes-agent": "hermes-agent",
         "hermes-webui": "hermes-webui",
+        "manifest": "manifest",
         "mnemo": "mnemo",
         "nixpkgs": "nixpkgs",
         "plinth": "plinth",
@@ -837,8 +956,8 @@
     },
     "rs-harbor": {
       "inputs": {
-        "crane": "crane_2",
-        "flake-utils": "flake-utils",
+        "crane": "crane_3",
+        "flake-utils": "flake-utils_3",
         "nixpkgs": [
           "nixpkgs"
         ],
@@ -861,8 +980,8 @@
     },
     "rs-harbor_2": {
       "inputs": {
-        "crane": "crane_4",
-        "flake-utils": "flake-utils_4",
+        "crane": "crane_5",
+        "flake-utils": "flake-utils_6",
         "nixpkgs": [
           "nixpkgs"
         ],
@@ -886,8 +1005,8 @@
     },
     "rs-harbor_3": {
       "inputs": {
-        "crane": "crane_7",
-        "flake-utils": "flake-utils_6",
+        "crane": "crane_8",
+        "flake-utils": "flake-utils_8",
         "nixpkgs": "nixpkgs_3",
         "osxcross": "osxcross_3",
         "plinth": "plinth_4",
@@ -905,6 +1024,23 @@
       "original": {
         "type": "git",
         "url": "https://codeberg.org/caniko/rs-harbor.git"
+      }
+    },
+    "rust-analyzer-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1782126558,
+        "narHash": "sha256-HLXplzCGoc5mBVXdJriEsfX0gLDNXZ+O5urcdTmLP+E=",
+        "owner": "rust-lang",
+        "repo": "rust-analyzer",
+        "rev": "ff5fcc70d9bcdc54db365114e2f7b1c18056ed4f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rust-lang",
+        "ref": "nightly",
+        "repo": "rust-analyzer",
+        "type": "github"
       }
     },
     "rust-overlay": {
@@ -1186,6 +1322,36 @@
         "type": "github"
       }
     },
+    "systems_8": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    },
+    "systems_9": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    },
     "treefmt-nix": {
       "inputs": {
         "nixpkgs": "nixpkgs_4"
@@ -1285,11 +1451,11 @@
         "rev": "a3a631a47e66e5881e11967826bea12f75c7c488",
         "revCount": 40,
         "type": "git",
-        "url": "ssh://git@codeberg.org/caniko/visual-rubric.git"
+        "url": "https://codeberg.org/caniko/visual-rubric.git"
       },
       "original": {
         "type": "git",
-        "url": "ssh://git@codeberg.org/caniko/visual-rubric.git"
+        "url": "https://codeberg.org/caniko/visual-rubric.git"
       }
     }
   },

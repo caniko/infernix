@@ -27,7 +27,7 @@
 
   routerPkg = pkgs.writers.writePython3 "infernix-cloud-router" {
     libraries = [pkgs.python3Packages.requests];
-    flakeIgnore = ["E501" "E402"];
+    flakeIgnore = ["E501" "E402" "E231"];
   } ''
     import http.server
     import json
@@ -38,6 +38,7 @@
     PORT = ${toString port}
     PROVIDERS = ${builtins.toJSON providerMap}
 
+
     def route_model(model):
         if model.startswith("deepseek-"):
             return PROVIDERS["deepseek"]
@@ -46,6 +47,7 @@
         elif model.startswith("zai-org/"):
             return PROVIDERS["gmi"]
         return PROVIDERS["deepseek"]
+
 
     class Proxy(http.server.BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -139,6 +141,7 @@
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
 
     with socketserver.TCPServer(("127.0.0.1", PORT), Proxy) as httpd:
         httpd.serve_forever()

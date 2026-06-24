@@ -176,7 +176,9 @@ in {
   };
 
   config = mkIf cfg.enable {
-    environment.systemPackages = [routerPkg];
+    # Not added to systemPackages — routerPkg is a single file, not a
+    # directory, so buildEnv cannot merge it. Only the systemd unit
+    # needs it via ExecStart.
 
     # Oneshot that reads agenix-decrypted API keys and writes them as
     # an environment file for the cloud-router service.

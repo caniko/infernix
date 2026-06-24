@@ -1,9 +1,9 @@
-{
-  config,
-  lib,
-  pkgs,
-  ...
-}: let
+{ config
+, lib
+, pkgs
+, ...
+}:
+let
   inherit (lib) mkEnableOption mkIf mkOption types;
 
   cfg = config.services.infernix.cloud-router;
@@ -25,127 +25,137 @@
     };
   };
 
-  routerPkg = pkgs.writers.writePython3 "infernix-cloud-router" {
-    libraries = [pkgs.python3Packages.requests];
-    flakeIgnore = ["E501" "E402" "E231"];
-  } ''
-    import http.server
-    import json
-    import os
-    import socketserver
-    import requests as http_requests
+  routerPkg =
+    let
+      routerScript = pkgs.writers.writePython3 "infernix-cloud-router"
+        {
+          libraries = [ pkgs.python3Packages.requests ];
+          flakeIgnore = [ "E501" "E402" "E231" ];
+        } ''
+        mkdir -p $out/bin
+        ln -s ${routerScript} $out/bin/infernix-cloud-router
+      '';
+      import http.server
+      import json
+      import os
+      import socketserver
+      import requests as http_requests
 
-    PORT = ${toString port}
-    PROVIDERS = ${builtins.toJSON providerMap}
-
-
-    def route_model(model):
-        if model.startswith("deepseek-"):
-            return PROVIDERS["deepseek"]
-        elif model.startswith("mimo-"):
-            return PROVIDERS["xiaomi"]
-        elif model.startswith("zai-org/"):
-            return PROVIDERS["gmi"]
-        return PROVIDERS["deepseek"]
+      PORT = ${toString port}
+        PROVIDERS = ${builtins.toJSON providerMap}
 
 
-    class Proxy(http.server.BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):
-            pass
-
-        def do_GET(self):
-            if self.path == "/v1/models":
-                models = {
-                    "object": "list",
-                    "data": [
-                        {"id": "deepseek-v4-flash", "object": "model"},
-                        {"id": "deepseek-v4-pro", "object": "model"},
-                        {"id": "mimo-v2-pro", "object": "model"},
-                        {"id": "mimo-v2.5-pro", "object": "model"},
-                        {"id": "mimo-v2-flash", "object": "model"},
-                        {"id": "mimo-v2-omni", "object": "model"},
-                        {"id": "zai-org/GLM-5.2-FP8", "object": "model"},
-                    ],
-                }
-                self._json_response(200, models)
-            elif self.path == "/api/v1/health":
-                self._json_response(200, {"status": "ok"})
-            elif self.path == "/health":
-                self._json_response(200, {"status": "ok"})
-            else:
-                self._json_response(404, {"error": "not found"})
-
-        def do_POST(self):
-            if self.path not in ("/v1/chat/completions", "/v1/messages"):
-                self._json_response(404, {"error": "not found"})
-                return
-
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(length)) if length > 0 else {}
-                model = body.get("model", "deepseek-v4-flash")
-                provider = route_model(model)
-
-                api_key = os.environ.get(provider["envVar"], "")
-                if not api_key:
-                    self._json_response(500, {"error": f"{provider['envVar']} not set"})
-                    return
-
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                }
-                stream = body.get("stream", True)
-
-                if stream:
-                    resp = http_requests.post(
-                        provider["url"],
-                        json=body,
-                        headers=headers,
-                        stream=True,
-                        timeout=300,
-                    )
-                    self.send_response(resp.status_code)
-                    for k, v in resp.headers.items():
-                        if k.lower() in ("content-type", "transfer-encoding", "cache-control"):
-                            self.send_header(k, v)
-                    self.end_headers()
-                    for chunk in resp.iter_content(chunk_size=None):
-                        if chunk:
-                            try:
-                                self.wfile.write(chunk)
-                                self.wfile.flush()
-                            except BrokenPipeError:
-                                break
-                    resp.close()
-                else:
-                    resp = http_requests.post(
-                        provider["url"],
-                        json=body,
-                        headers=headers,
-                        timeout=300,
-                    )
-                    self.send_response(resp.status_code)
-                    for k, v in resp.headers.items():
-                        if k.lower() not in ("transfer-encoding",):
-                            self.send_header(k, v)
-                    self.end_headers()
-                    self.wfile.write(resp.content)
-            except Exception as e:
-                self._json_response(500, {"error": str(e)})
-
-        def _json_response(self, status, data):
-            body = json.dumps(data).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+      def route_model(model):
+      if model.startswith("deepseek-"):
+      return PROVIDERS["deepseek"]
+      elif model.startswith("mimo-"):
+      return PROVIDERS["xiaomi"]
+      elif model.startswith("zai-org/"):
+      return PROVIDERS["gmi"]
+      return PROVIDERS["deepseek"]
 
 
-    with socketserver.TCPServer(("127.0.0.1", PORT), Proxy) as httpd:
-        httpd.serve_forever()
-  '';
+      class Proxy(http.server.BaseHTTPRequestHandler):
+      def log_message(self, fmt, *args):
+      pass
+
+      def do_GET(self):
+      if self.path == "/v1/models":
+      models = {
+      "object": "list",
+      "data": [
+      {"id": "deepseek-v4-flash", "object": "model"},
+      {"id": "deepseek-v4-pro", "object": "model"},
+      {"id": "mimo-v2-pro", "object": "model"},
+      {"id": "mimo-v2.5-pro", "object": "model"},
+      {"id": "mimo-v2-flash", "object": "model"},
+      {"id": "mimo-v2-omni", "object": "model"},
+      {"id": "zai-org/GLM-5.2-FP8", "object": "model"},
+      ],
+      }
+      self._json_response(200, models)
+      elif self.path == "/api/v1/health":
+      self._json_response(200, {"status": "ok"})
+      elif self.path == "/health":
+      self._json_response(200, {"status": "ok"})
+      else:
+      self._json_response(404, {"error": "not found"})
+
+      def do_POST(self):
+      if self.path not in ("/v1/chat/completions", "/v1/messages"):
+      self._json_response(404, {"error": "not found"})
+      return
+
+      try:
+      length = int(self.headers.get("Content-Length", 0))
+      body = json.loads(self.rfile.read(length)) if length > 0 else {}
+      model = body.get("model", "deepseek-v4-flash")
+      provider = route_model(model)
+
+      api_key = os.environ.get(provider["envVar"], "")
+      if not api_key:
+      self._json_response(500, {"error": f"{provider['envVar']} not set"})
+      return
+
+      headers = {
+      "Authorization": f"Bearer {api_key}",
+      "Content-Type": "application/json",
+      }
+      stream = body.get("stream", True)
+
+      if stream:
+      resp = http_requests.post(
+      provider["url"],
+      json=body,
+      headers=headers,
+      stream=True,
+      timeout=300,
+      )
+      self.send_response(resp.status_code)
+      for k, v in resp.headers.items():
+      if k.lower() in ("content-type", "transfer-encoding", "cache-control"):
+      self.send_header(k, v)
+      self.end_headers()
+      for chunk in resp.iter_content(chunk_size=None):
+      if chunk:
+      try:
+      self.wfile.write(chunk)
+      self.wfile.flush()
+      except BrokenPipeError:
+      break
+      resp.close()
+      else:
+      resp = http_requests.post(
+      provider["url"],
+      json=body,
+      headers=headers,
+      timeout=300,
+      )
+      self.send_response(resp.status_code)
+      for k, v in resp.headers.items():
+      if k.lower() not in ("transfer-encoding",):
+      self.send_header(k, v)
+      self.end_headers()
+      self.wfile.write(resp.content)
+      except Exception as e:
+      self._json_response(500, {"error": str(e)})
+
+      def _json_response(self, status, data):
+      body = json.dumps(data).encode()
+      self.send_response(status)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", str(len(body)))
+      self.end_headers()
+      self.wfile.write(body)
+
+
+      with socketserver.TCPServer(("127.0.0.1", PORT), Proxy) as httpd:
+      httpd.serve_forever()
+      '';
+in pkgs.runCommand "infernix-cloud-router" {} ''
+      mkdir -p $out/bin
+      ln -s ${routerScript} $out/bin/infernix-cloud-router
+      '';
 
   # Systemd service that renders the env file from agenix secrets
   envFileDir = "/run/infernix-cloud-router";
@@ -188,14 +198,14 @@ in {
       script = let
         entries = lib.mapAttrsToList (name: path: "export ${name}=$(cat ${path})") cfg.apiKeyFiles;
       in ''
-        set -eu
-        umask 077
-        tmp="${envFilePath}.tmp"
-        {
-          ${lib.concatStringsSep "\n" entries}
-        } > "$tmp"
-        chmod 0400 "$tmp"
-        mv "$tmp" "${envFilePath}"
+      set -eu
+      umask 077
+      tmp="${envFilePath}.tmp"
+      {
+      ${lib.concatStringsSep "\n" entries}
+      } > "$tmp"
+      chmod 0400 "$tmp"
+      mv "$tmp" "${envFilePath}"
       '';
     };
 
@@ -207,7 +217,7 @@ in {
       wantedBy = ["multi-user.target"];
 
       serviceConfig = {
-        ExecStart = "${routerPkg}";
+        ExecStart = "${routerPkg} ";
         Restart = "on-failure";
         RestartSec = 5;
         DynamicUser = true;
@@ -222,3 +232,4 @@ in {
     };
   };
 }
+

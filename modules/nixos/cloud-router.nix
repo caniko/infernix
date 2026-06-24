@@ -25,7 +25,7 @@
     };
   };
 
-  routerPkg = pkgs.writers.writePython3 "infernix-cloud-router" {
+  routerScript = pkgs.writers.writePython3 "infernix-cloud-router" {
     libraries = [pkgs.python3Packages.requests];
     flakeIgnore = ["E501" "E402" "E231"];
   } ''
@@ -145,6 +145,14 @@
 
     with socketserver.TCPServer(("127.0.0.1", PORT), Proxy) as httpd:
         httpd.serve_forever()
+  '';
+
+  # WritePython3 produces a single script file — the store path is a
+  # symlink directly to the file, not a directory. NixOS buildEnv
+  # requires directories in systemPackages, so wrap in runCommand.
+  routerPkg = pkgs.runCommand "infernix-cloud-router-pkg" {} ''
+    mkdir -p $out/bin
+    ln -s ${routerScript} $out/bin/infernix-cloud-router
   '';
 
   # Systemd service that renders the env file from agenix secrets

@@ -217,7 +217,7 @@ in {
       wantedBy = ["multi-user.target"];
 
       serviceConfig = {
-        ExecStart = "${routerPkg}";
+        ExecStart = "${routerPkg}/bin/infernix-cloud-router";
         Restart = "on-failure";
         RestartSec = 5;
         DynamicUser = true;

@@ -122,6 +122,7 @@
     {
       lib = {
         inherit mkLbPackageForPkgs;
+        modelCatalog = import ./lib/model-catalog.nix { lib = nixpkgs.lib; };
       };
 
       nixosModules = {
@@ -475,6 +476,51 @@
             pkgs.writeText
               "infernix-download-extra-files-script"
               llamaSwapExtraFilesSample.config.systemd.services.infernix-download.script;
+          modelCatalogSample = {
+            models = {
+              qwen3-vl-8b = {
+                host = "atlas";
+                repo = "Qwen/Qwen3-VL-8B-Instruct-GGUF";
+                file = "Qwen3VL-8B-Instruct-Q8_0.gguf";
+                ctxSize = 4096;
+                ttl = 300;
+                aliases = [ "qwen3-vl" "vlm" ];
+                capabilities = [ "chat" ];
+                extraFiles = [
+                  {
+                    repo = "Qwen/Qwen3-VL-8B-Instruct-GGUF";
+                    file = "mmproj.gguf";
+                  }
+                ];
+                extraArgs = [
+                  "--mmproj {modelsDir}/mmproj.gguf"
+                  "--jinja"
+                ];
+              };
+            };
+            homeManager.endpoints.atlas-lb.models.vlm.model = "qwen3-vl-8b";
+            probes.atlas.chat = [
+              {
+                name = "qwen3-vl-8b";
+                model = "qwen3-vl-8b";
+                maxTokens = 10;
+              }
+            ];
+          };
+          modelCatalogLib = self.lib.modelCatalog;
+          renderedLlamaSwapModels = modelCatalogLib.mkLlamaSwapModels {
+            catalog = modelCatalogSample;
+            host = "atlas";
+            modelsDir = "/models";
+          };
+          renderedFleetModels = modelCatalogLib.mkFleetModels {
+            catalog = modelCatalogSample;
+            host = "atlas";
+          };
+          renderedHmModels = modelCatalogLib.mkHmEndpointModels {
+            catalog = modelCatalogSample;
+            endpoint = "atlas-lb";
+          };
         in
         {
           embr-wrapper = pkgs.runCommand "infernix-embr-wrapper-check" { } ''
@@ -535,6 +581,16 @@
             grep -Fq 'Downloading main.gguf from example/main-model' ${llamaSwapDownloadScript}
             grep -Fq 'Downloading mmproj-main.gguf from example/main-model' ${llamaSwapDownloadScript}
             test "${toString (builtins.length llamaSwapExtraFilesSample.config.systemd.services.infernix-download.restartTriggers)}" = "1"
+            touch "$out"
+          '';
+
+          model-catalog = pkgs.runCommand "infernix-model-catalog-check" { } ''
+            test "${renderedLlamaSwapModels.qwen3-vl-8b.repo}" = "Qwen/Qwen3-VL-8B-Instruct-GGUF"
+            test "${builtins.elemAt renderedLlamaSwapModels.qwen3-vl-8b.extraArgs 0}" = "--mmproj /models/mmproj.gguf"
+            test "${renderedFleetModels.qwen3-vl-8b.name}" = "qwen3-vl-8b"
+            test "${builtins.elemAt renderedFleetModels.qwen3-vl-8b.capabilities 0}" = "chat"
+            test "${renderedHmModels.vlm.name}" = "qwen3-vl-8b"
+            test "${toString renderedHmModels.vlm.ctxSize}" = "4096"
             touch "$out"
           '';
         });

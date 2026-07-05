@@ -60,6 +60,20 @@
     };
   };
 
+  artifactSubmodule = types.submodule {
+    options = {
+      file = mkOption {
+        type = types.str;
+        description = "GGUF artifact filename.";
+      };
+
+      repo = mkOption {
+        type = types.str;
+        description = "HuggingFace repo for this artifact.";
+      };
+    };
+  };
+
   modelSubmodule = types.submodule {
     options = {
       file = mkOption {
@@ -93,6 +107,16 @@
         type = types.listOf types.str;
         default = [];
         description = "Additional CLI args appended to the llama-server command.";
+      };
+
+      extraFiles = mkOption {
+        type = types.listOf artifactSubmodule;
+        default = [];
+        description = ''
+          Additional GGUF artifacts required by this model, such as VLM
+          mmproj files. These are downloaded with the model and protected
+          from autoCleanup.
+        '';
       };
 
       draft = mkOption {
@@ -279,13 +303,16 @@ in {
         ++ cfg.commonArgs
         ++ model.extraArgs);
 
-    # Collect all files that need downloading (main models + draft models)
+    # Collect all files that need downloading (main models + auxiliary artifacts + draft models)
     downloadFiles = flatten (mapAttrsToList (_name: model:
       [{inherit (model) repo file;}]
+      ++ model.extraFiles
       ++ optional (model.draft != null) {inherit (model.draft) repo file;})
     cfg.models);
 
     expectedFiles = map (f: f.file) downloadFiles;
+    expectedFilesManifest =
+      pkgs.writeText "infernix-expected-model-files" "${concatStringsSep "\n" expectedFiles}\n";
   in {
     services.llama-swap = {
       enable = true;
@@ -342,6 +369,7 @@ in {
       after = ["network-online.target"];
       wantedBy = ["llama-swap.service"];
       before = ["llama-swap.service"];
+      restartTriggers = [expectedFilesManifest];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;

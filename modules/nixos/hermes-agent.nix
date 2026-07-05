@@ -1,28 +1,45 @@
-{
-  config,
-  infernixHermesAgent,
-  lib,
-  pkgs,
-  ...
-}: let
-      inherit (lib) mkEnableOption mkIf mkOption recursiveUpdate types;
+{ config
+, infernixHermesAgent
+, lib
+, pkgs
+, ...
+}:
+let
+  inherit (lib) mkEnableOption mkIf mkOption recursiveUpdate types;
   cfg = config.services.infernix.hermes-agent;
   fleetCfg = config.services.infernix.fleet;
   system = pkgs.stdenv.hostPlatform.system;
+  renderHermesModelRouting = import ../../lib/hermes-model-routing.nix { inherit lib; };
 
   hermesAgentPackage =
     if builtins.hasAttr "packages" infernixHermesAgent
-    && builtins.hasAttr system infernixHermesAgent.packages
+      && builtins.hasAttr system infernixHermesAgent.packages
     then infernixHermesAgent.packages.${system}.default
     else null;
 
   # When useFleetModels is enabled, generate a base_url pointing at the
   # fleet load balancer so hermes uses local GPU-backed models.
   fleetBaseUrl =
-    if cfg.useFleetModels && fleetCfg.loadBalancer.enable
+    if fleetCfg.loadBalancer.enable
     then "http://${fleetCfg.loadBalancer.host}:${toString fleetCfg.loadBalancer.port}/v1"
     else null;
-in {
+
+  legacyFleetSettings = lib.optionalAttrs (cfg.useFleetModels && fleetBaseUrl != null) {
+    model.base_url = fleetBaseUrl;
+  };
+
+  modelRoutingSettings =
+    if cfg.modelRouting.enable
+    then
+      renderHermesModelRouting
+        {
+          inherit fleetBaseUrl;
+          cloudRouterBaseUrl = config.services.infernix.cloud-router.baseUrl;
+          profile = cfg.modelRouting.profile;
+        }
+    else { };
+in
+{
   options.services.infernix.hermes-agent = {
     enable = mkEnableOption "Hermes Agent gateway service via Infernix";
 
@@ -39,8 +56,23 @@ in {
       description = ''
         Auto-configure hermes model endpoints from the Infernix fleet
         load balancer when it is enabled. Sets model.base_url to the LB
-        URL and exposes fleet-declared models.
+        URL and exposes fleet-declared models. Prefer modelRouting for
+        mixed cloud/local Hermes configurations.
       '';
+    };
+
+    modelRouting = {
+      enable = mkEnableOption "generated Hermes provider, alias, fallback, and auxiliary model routing";
+
+      profile = mkOption {
+        type = types.attrs;
+        default = { };
+        description = ''
+          Pkl-generated Hermes model-routing profile. The renderer turns this
+          into settings.model, custom_providers, model_aliases, fallback_model,
+          and auxiliary.
+        '';
+      };
     };
 
     # Pass-through options that map 1:1 to the upstream service.hermes-agent.
@@ -70,55 +102,55 @@ in {
 
     settings = mkOption {
       type = types.attrs;
-      default = {};
+      default = { };
       description = "Declarative hermes config rendered as config.yaml. Deep-merged across module definitions.";
     };
 
     environmentFiles = mkOption {
       type = types.listOf types.str;
-      default = [];
+      default = [ ];
       description = "Paths to env files with secrets, merged into HERMES_HOME/.env.";
     };
 
     environment = mkOption {
       type = types.attrsOf types.str;
-      default = {};
+      default = { };
       description = "Non-secret env vars. Do NOT put secrets here.";
     };
 
     documents = mkOption {
       type = types.attrsOf (types.either types.str types.path);
-      default = {};
+      default = { };
       description = "Workspace files (SOUL.md, USER.md, etc.) installed into workingDirectory.";
     };
 
     mcpServers = mkOption {
       type = types.attrs;
-      default = {};
+      default = { };
       description = "MCP server definitions merged into settings.mcp_servers.";
     };
 
     extraPackages = mkOption {
       type = types.listOf types.package;
-      default = [];
+      default = [ ];
       description = "Extra packages available to the agent.";
     };
 
     extraPlugins = mkOption {
       type = types.listOf types.package;
-      default = [];
+      default = [ ];
       description = "Directory-based plugin packages symlinked into the hermes plugins dir.";
     };
 
     extraPythonPackages = mkOption {
       type = types.listOf types.package;
-      default = [];
+      default = [ ];
       description = "Python packages added to PYTHONPATH for entry-point plugin discovery.";
     };
 
     extraDependencyGroups = mkOption {
       type = types.listOf types.str;
-      default = [];
+      default = [ ];
       description = "pyproject.toml optional extras included in the sealed venv.";
     };
 
@@ -142,7 +174,7 @@ in {
 
     extraArgs = mkOption {
       type = types.listOf types.str;
-      default = [];
+      default = [ ];
       description = "Extra command-line arguments for hermes gateway.";
     };
 
@@ -162,20 +194,20 @@ in {
       enable = mkEnableOption "OCI container mode for hermes-agent";
 
       backend = mkOption {
-        type = types.enum ["docker" "podman"];
+        type = types.enum [ "docker" "podman" ];
         default = "docker";
         description = "Container runtime.";
       };
 
       extraVolumes = mkOption {
         type = types.listOf types.str;
-        default = [];
+        default = [ ];
         description = "Extra volume mounts (host:container:mode).";
       };
 
       extraOptions = mkOption {
         type = types.listOf types.str;
-        default = [];
+        default = [ ];
         description = "Extra arguments passed to docker/podman create.";
       };
 
@@ -187,7 +219,7 @@ in {
 
       hostUsers = mkOption {
         type = types.listOf types.str;
-        default = [];
+        default = [ ];
         description = "Interactive users who get a ~/.hermes symlink to the service stateDir.";
       };
     };
@@ -214,11 +246,7 @@ in {
         extraPlugins extraPythonPackages extraDependencyGroups
         configFile authFile authFileForceOverwrite extraArgs restart restartSec;
 
-      settings = recursiveUpdate cfg.settings (
-        lib.optionalAttrs (fleetBaseUrl != null) {
-          model.base_url = fleetBaseUrl;
-        }
-      );
+      settings = recursiveUpdate (recursiveUpdate legacyFleetSettings modelRoutingSettings) cfg.settings;
 
       mcpServers = cfg.mcpServers;
 

@@ -1,9 +1,9 @@
-{
-  config,
-  lib,
-  pkgs,
-  ...
-}: let
+{ config
+, lib
+, pkgs
+, ...
+}:
+let
   inherit (lib) mkEnableOption mkIf mkOption types;
 
   cfg = config.services.infernix.cloud-router;
@@ -25,10 +25,11 @@
     };
   };
 
-  routerScript = pkgs.writers.writePython3 "infernix-cloud-router" {
-    libraries = [pkgs.python3Packages.requests];
-    flakeIgnore = ["E501" "E402" "E231"];
-  } ''
+  routerScript = pkgs.writers.writePython3 "infernix-cloud-router"
+    {
+      libraries = [ pkgs.python3Packages.requests ];
+      flakeIgnore = [ "E501" "E402" "E231" ];
+    } ''
     import http.server
     import json
     import os
@@ -150,7 +151,7 @@
   # WritePython3 produces a single script file — the store path is a
   # symlink directly to the file, not a directory. NixOS buildEnv
   # requires directories in systemPackages, so wrap in runCommand.
-  routerPkg = pkgs.runCommand "infernix-cloud-router-pkg" {} ''
+  routerPkg = pkgs.runCommand "infernix-cloud-router-pkg" { } ''
     mkdir -p $out/bin
     ln -s ${routerScript} $out/bin/infernix-cloud-router
   '';
@@ -158,13 +159,21 @@
   # Systemd service that renders the env file from agenix secrets
   envFileDir = "/run/infernix-cloud-router";
   envFilePath = "${envFileDir}/env";
-in {
+in
+{
   options.services.infernix.cloud-router = {
-    enable = mkEnableOption "Minimal cloud LLM router for brainrouter";
+    enable = mkEnableOption "Minimal cloud LLM router";
+
+    baseUrl = mkOption {
+      type = types.str;
+      readOnly = true;
+      default = "http://127.0.0.1:${toString port}/v1";
+      description = "OpenAI-compatible local base URL exposed by the cloud router.";
+    };
 
     apiKeyFiles = mkOption {
       type = types.attrsOf types.path;
-      default = {};
+      default = { };
       description = "Attrset of env-var-name → file-path for provider API keys.";
     };
 
@@ -184,9 +193,9 @@ in {
     # an environment file for the cloud-router service.
     systemd.services.infernix-cloud-router-env = {
       description = "Render cloud-router API key environment";
-      before = ["infernix-cloud-router.service"];
-      wantedBy = ["infernix-cloud-router.service"];
-      path = [pkgs.coreutils];
+      before = [ "infernix-cloud-router.service" ];
+      wantedBy = [ "infernix-cloud-router.service" ];
+      path = [ pkgs.coreutils ];
 
       serviceConfig = {
         Type = "oneshot";
@@ -195,26 +204,28 @@ in {
         RuntimeDirectoryMode = "0700";
       };
 
-      script = let
-        entries = lib.mapAttrsToList (name: path: "export ${name}=$(cat ${path})") cfg.apiKeyFiles;
-      in ''
-        set -eu
-        umask 077
-        tmp="${envFilePath}.tmp"
-        {
-          ${lib.concatStringsSep "\n" entries}
-        } > "$tmp"
-        chmod 0400 "$tmp"
-        mv "$tmp" "${envFilePath}"
-      '';
+      script =
+        let
+          entries = lib.mapAttrsToList (name: path: "export ${name}=$(cat ${path})") cfg.apiKeyFiles;
+        in
+        ''
+          set -eu
+          umask 077
+          tmp="${envFilePath}.tmp"
+          {
+            ${lib.concatStringsSep "\n" entries}
+          } > "$tmp"
+          chmod 0400 "$tmp"
+          mv "$tmp" "${envFilePath}"
+        '';
     };
 
     systemd.services.infernix-cloud-router = {
-      description = "Minimal cloud LLM router for brainrouter";
-      after = ["network-online.target" "infernix-cloud-router-env.service"];
-      wants = ["network-online.target"];
-      requires = ["infernix-cloud-router-env.service"];
-      wantedBy = ["multi-user.target"];
+      description = "Minimal cloud LLM router";
+      after = [ "network-online.target" "infernix-cloud-router-env.service" ];
+      wants = [ "network-online.target" ];
+      requires = [ "infernix-cloud-router-env.service" ];
+      wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
         ExecStart = "${routerPkg}/bin/infernix-cloud-router";
@@ -223,12 +234,12 @@ in {
         DynamicUser = true;
         NoNewPrivileges = true;
         PrivateTmp = true;
-        EnvironmentFile = [envFilePath];
+        EnvironmentFile = [ envFilePath ];
       };
     };
 
     networking.firewall = mkIf cfg.openFirewall {
-      allowedTCPPorts = [port];
+      allowedTCPPorts = [ port ];
     };
   };
 }

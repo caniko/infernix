@@ -1,11 +1,11 @@
 {
   imports = [
-    ./brainrouter.nix
     ./cloud-router.nix
     ./comfyui.nix
     ./embr.nix
     ./fleet.nix
     ./hermes-agent.nix
+    ./hermes-dashboard.nix
     ./hermes-webui.nix
     ./gpu.nix
     ./load-balancer.nix

@@ -1,0 +1,35 @@
+/// Generic Hermes model-routing profile consumed by the Infernix NixOS module.
+/// Concrete deployments may override this profile in their own repository and
+/// regenerate a Nix sidecar with `hermes-models-export`.
+
+class Provider {
+  /// One of: fleetLoadBalancer, cloudRouter, literal.
+  urlSource: String
+  baseUrl: String? = null
+  apiKey: String = "no-key-required"
+  defaultModel: String? = null
+  models: Mapping<String, Dynamic> = new {}
+}
+
+class ModelRef {
+  provider: String
+  model: String
+}
+
+class Profile {
+  providers: Mapping<String, Provider> = new {}
+  model: Dynamic = new {}
+  modelAliases: Mapping<String, Dynamic> = new {}
+  fallbackModel: Listing<ModelRef> = new Listing {}
+  auxiliary: Mapping<String, ModelRef> = new {}
+}
+
+profile = new Profile {
+  providers = new {
+    ["local-fleet"] = new Provider {
+      urlSource = "fleetLoadBalancer"
+      apiKey = "no-key-required"
+      models = new {}
+    }
+  }
+}

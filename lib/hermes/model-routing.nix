@@ -1,0 +1,1 @@
+{ profile = { __pkl_class = "Profile"; providers = { local-fleet = { __pkl_class = "Provider"; urlSource = "fleetLoadBalancer"; baseUrl = null; apiKey = "no-key-required"; defaultModel = null; models = { }; }; }; model = { }; modelAliases = { }; fallbackModel = [ ]; auxiliary = { }; }; }

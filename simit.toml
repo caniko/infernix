@@ -1,2 +1,6 @@
 [ci]
 runner = "atlas"
+
+[ci.pages]
+repo = "caniko/infernix"
+canonical_domain = "infernix.tartanoglu.com"

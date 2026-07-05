@@ -29,8 +29,15 @@
 
   nodeSubmodule = types.submodule {
     options = {
+      address = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Address for the GPU backend host. Prefer this over the legacy lanIp field so direct-link and VPN addresses are not mislabeled as LAN.";
+      };
+
       lanIp = mkOption {
-        type = types.str;
+        type = types.nullOr types.str;
+        default = null;
         description = "LAN IP address for the GPU backend host.";
       };
 
@@ -78,10 +85,15 @@
     };
   };
 
+  nodeAddress = _name: node:
+    if node.address != null
+    then node.address
+    else node.lanIp;
+
   lbBackends =
-    lib.mapAttrs (_name: node: {
-      baseUrl = "http://${node.lanIp}:${toString node.modelPort}";
-      healthUrl = "http://${node.lanIp}:${toString node.nodePort}/healthz";
+    lib.mapAttrs (name: node: {
+      baseUrl = "http://${nodeAddress name node}:${toString node.modelPort}";
+      healthUrl = "http://${nodeAddress name node}:${toString node.nodePort}/healthz";
       inherit (node) priority weight maxInFlight models;
     })
     cfg.nodes;
@@ -134,7 +146,11 @@ in {
           assertion = cfg.localNodeName == null || builtins.hasAttr cfg.localNodeName cfg.nodes;
           message = "services.infernix.fleet.localNodeName must refer to a key in services.infernix.fleet.nodes.";
         }
-      ];
+      ]
+      ++ lib.mapAttrsToList (name: node: {
+        assertion = nodeAddress name node != null;
+        message = "services.infernix.fleet.nodes.${name} must set address or legacy lanIp.";
+      }) cfg.nodes;
     }
 
     (mkIf cfg.loadBalancer.enable {
@@ -148,7 +164,7 @@ in {
     (mkIf (cfg.localNodeName != null) {
       services.infernix.node = {
         enable = true;
-        host = localNode.lanIp;
+        host = nodeAddress cfg.localNodeName localNode;
         port = localNode.nodePort;
         units = localNode.units;
       };

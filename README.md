@@ -42,6 +42,10 @@ NixOS modules (`nixosModules.default`):
 - **`services.infernix.mnemo`** — installs the Mnemo CLI/MCP/hooks bundle,
   writes `/etc/mnemo/config.toml`, and can follow infernix-managed SurrealDB
   and Qdrant automatically.
+- **`services.infernix.fleet`** — declares GPU backend nodes for the
+  generated load balancer and node control service. Set `address` for the
+  backend dial address; `lanIp` remains as a compatibility alias for older
+  configurations.
 
 ### Inference packages
 

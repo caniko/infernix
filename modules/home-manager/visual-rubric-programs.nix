@@ -12,14 +12,15 @@
 #
 # Reads the readOnly outputs declared in `./visual-rubric.nix` and writes them
 # to `programs.visual-rubric` when `services.infernix.visual-rubric.enable = true`.
-{
-  config,
-  lib,
-  ...
-}: let
+{ config
+, lib
+, ...
+}:
+let
   cfg = config.services.infernix.visual-rubric;
   gen = cfg.generatedConfig;
-in {
+in
+{
   config = lib.mkIf cfg.enable {
     programs.visual-rubric = lib.mkMerge [
       (lib.mkIf (gen ? vision_url) {
@@ -34,6 +35,12 @@ in {
       (lib.mkIf (gen ? rubric_acp_args && builtins.length gen.rubric_acp_args > 0) {
         settings.VISUAL_RUBRIC_ACP_ARGS =
           lib.mkDefault (builtins.concatStringsSep " " gen.rubric_acp_args);
+      })
+      (lib.mkIf (gen ? rubric_model) {
+        settings.VISUAL_RUBRIC_RUBRIC_MODEL = lib.mkDefault gen.rubric_model;
+      })
+      (lib.mkIf (gen ? rubric_effort) {
+        settings.VISUAL_RUBRIC_RUBRIC_EFFORT = lib.mkDefault gen.rubric_effort;
       })
     ];
   };

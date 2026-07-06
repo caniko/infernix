@@ -166,7 +166,10 @@
       };
 
       homeModules = {
-        default = import ./modules/home-manager;
+        default = { ... }: {
+          imports = [ (import ./modules/home-manager) ];
+          _module.args.infernixVisualRubric = visual-rubric;
+        };
         # Opt-in sub-module that writes programs.goose.* from the
         # services.infernix.goose outputs. Only import for users that also
         # import goose-hm's HM module.
@@ -476,6 +479,75 @@
             pkgs.writeText
               "infernix-download-extra-files-script"
               llamaSwapExtraFilesSample.config.systemd.services.infernix-download.script;
+          visualRubricModuleOptions = { lib, ... }: {
+            options = {
+              assertions = lib.mkOption {
+                type = lib.types.listOf lib.types.attrs;
+                default = [ ];
+                description = "Minimal assertions fixture option.";
+              };
+              home.shellAliases = lib.mkOption {
+                type = lib.types.attrsOf lib.types.str;
+                default = { };
+                description = "Minimal Home Manager shellAliases fixture option.";
+              };
+              home.packages = lib.mkOption {
+                type = lib.types.listOf lib.types.package;
+                default = [ ];
+                description = "Minimal Home Manager packages fixture option.";
+              };
+              xdg.configFile = lib.mkOption {
+                type = lib.types.attrsOf lib.types.attrs;
+                default = { };
+                description = "Minimal Home Manager xdg.configFile fixture option.";
+              };
+            };
+          };
+          visualRubricDirectSample = nixpkgs.lib.evalModules {
+            specialArgs = {
+              inherit pkgs;
+              osConfig = null;
+            };
+            modules = [
+              self.homeModules.default
+              visualRubricModuleOptions
+              {
+                services.infernix.visual-rubric.enable = true;
+              }
+            ];
+          };
+          visualRubricPipelineSample = nixpkgs.lib.evalModules {
+            specialArgs = {
+              inherit pkgs;
+              osConfig = null;
+            };
+            modules = [
+              self.homeModules.default
+              visualRubricModuleOptions
+              {
+                services.infernix.endpoints.local-lb = {
+                  type = "llama-swap";
+                  url = "http://127.0.0.1:8013";
+                  models.vlm = {
+                    name = "qwen3-vl-8b";
+                    ctxSize = 4096;
+                  };
+                };
+                services.infernix.visual-rubric = {
+                  enable = true;
+                  mode = "pipeline";
+                };
+              }
+            ];
+          };
+          visualRubricDirectConfig =
+            visualRubricDirectSample.config.xdg.configFile."visual-rubric/config.toml".source;
+          visualRubricPipelineConfig =
+            visualRubricPipelineSample.config.xdg.configFile."visual-rubric/config.toml".source;
+          visualRubricDirectPackage =
+            builtins.head visualRubricDirectSample.config.home.packages;
+          visualRubricPipelinePackage =
+            builtins.head visualRubricPipelineSample.config.home.packages;
           modelCatalogSample = {
             models = {
               qwen3-vl-8b = {
@@ -549,6 +621,23 @@
             test "${fleetLegacyLanIpSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"
             test "${hermesAgentSample.config.services.hermes-agent.user}" = "hermes"
             test "${hermesAgentSample.config.services.hermes-agent.group}" = "hermes"
+            touch "$out"
+          '';
+
+          visual-rubric-home = pkgs.runCommand "infernix-visual-rubric-home-check" { } ''
+            grep -Fq 'mode = "direct"' ${visualRubricDirectConfig}
+            grep -Fq 'backend = "codex-acp"' ${visualRubricDirectConfig}
+            grep -Fq 'model = "gpt-5.5"' ${visualRubricDirectConfig}
+            grep -Fq 'effort = "medium"' ${visualRubricDirectConfig}
+            ! grep -Fq '[vision]' ${visualRubricDirectConfig}
+            test "${visualRubricDirectPackage}" = "${visual-rubric.packages.${system}."codex-acp"}"
+
+            grep -Fq 'mode = "pipeline"' ${visualRubricPipelineConfig}
+            grep -Fq 'backend = "opencode"' ${visualRubricPipelineConfig}
+            grep -Fq 'args = [' ${visualRubricPipelineConfig}
+            grep -Fq 'url = "http://127.0.0.1:8013"' ${visualRubricPipelineConfig}
+            grep -Fq 'model = "qwen3-vl-8b"' ${visualRubricPipelineConfig}
+            test "${visualRubricPipelinePackage}" = "${visual-rubric.packages.${system}.default}"
             touch "$out"
           '';
 

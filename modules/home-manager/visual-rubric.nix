@@ -9,16 +9,19 @@
 #   3. Fallback: scan services.infernix.endpoints for llama-swap endpoints
 #      (standalone HM mode).
 #   4. Gives up with a clear eval error if nothing is found and enable = true.
-{
-  config,
-  lib,
-  pkgs,
-  osConfig ? null,
-  ...
-}: let
-  inherit (lib) mkEnableOption mkOption mkIf types filterAttrs;
+{ config
+, lib
+, pkgs
+, osConfig ? null
+, infernixVisualRubric ? null
+, ...
+}:
+let
+  inherit (lib) mkEnableOption mkOption mkIf types filterAttrs optionalAttrs;
   cfg = config.services.infernix.visual-rubric;
   epCfg = config.services.infernix.endpoints;
+  system = pkgs.stdenv.hostPlatform.system;
+  isPipeline = cfg.mode == "pipeline";
 
   # --- Explicit endpoint resolution ---
 
@@ -33,7 +36,7 @@
     else null;
 
   explicitVision =
-    if cfg.enable && explicitVisionEp != null && explicitVisionModelEntry != null
+    if cfg.enable && isPipeline && explicitVisionEp != null && explicitVisionModelEntry != null
     then {
       url = explicitVisionEp.url;
       model = explicitVisionModelEntry.name;
@@ -42,24 +45,25 @@
 
   # --- Auto-discovery from llama-swap (NixOS-integrated mode) ---
 
-  llamaSwapCfg = osConfig.services.infernix.llama-swap or {};
+  llamaSwapCfg = osConfig.services.infernix.llama-swap or { };
 
   isVisionModel = model:
-    builtins.elem "vlm" (model.aliases or [])
-    || builtins.elem "captioner" (model.aliases or []);
+    builtins.elem "vlm" (model.aliases or [ ])
+    || builtins.elem "captioner" (model.aliases or [ ]);
 
   autoDiscoveredLlamaSwapModels =
     if osConfig != null && llamaSwapCfg.enable or false
-    then filterAttrs (_: model: isVisionModel model) (llamaSwapCfg.models or {})
-    else {};
+    then filterAttrs (_: model: isVisionModel model) (llamaSwapCfg.models or { })
+    else { };
 
   autoDiscoveredLlamaSwapVision =
-    if cfg.vision.autoDiscover && autoDiscoveredLlamaSwapModels != {} then
+    if isPipeline && cfg.vision.autoDiscover && autoDiscoveredLlamaSwapModels != { } then
       let
         firstKey = builtins.head (builtins.attrNames autoDiscoveredLlamaSwapModels);
         firstModel = autoDiscoveredLlamaSwapModels.${firstKey};
         port = toString llamaSwapCfg.port;
-      in {
+      in
+      {
         url = "http://localhost:${port}";
         model = firstKey;
       }
@@ -70,9 +74,10 @@
   llamaSwapEndpoints = filterAttrs (_: ep: ep.type == "llama-swap") epCfg;
 
   autoDiscoveredEndpointVision =
-    if cfg.vision.autoDiscover
-    && autoDiscoveredLlamaSwapVision == null
-    && llamaSwapEndpoints != {}
+    if isPipeline
+      && cfg.vision.autoDiscover
+      && autoDiscoveredLlamaSwapVision == null
+      && llamaSwapEndpoints != { }
     then
       let
         # Find the first llama-swap endpoint with at least one model
@@ -80,7 +85,8 @@
         firstEpConfig = llamaSwapEndpoints.${firstEp};
         firstModelKey = builtins.head (builtins.attrNames firstEpConfig.models);
         firstModelEntry = firstEpConfig.models.${firstModelKey};
-      in {
+      in
+      {
         url = firstEpConfig.url;
         model = firstModelEntry.name;
       }
@@ -95,14 +101,33 @@
 
   # --- ACP backend config ---
 
-  rubricBackend = cfg.rubric.backend;
+  rubricBackend =
+    if cfg.rubric.backend != null
+    then cfg.rubric.backend
+    else if cfg.mode == "direct"
+    then "codex-acp"
+    else "opencode";
+
+  rubricModel =
+    if cfg.rubric.modelOverride != null
+    then cfg.rubric.modelOverride
+    else if rubricBackend == "codex-acp"
+    then "gpt-5.5"
+    else null;
+
+  rubricEffort =
+    if cfg.rubric.effort != null
+    then cfg.rubric.effort
+    else if rubricBackend == "codex-acp"
+    then "medium"
+    else null;
 
   rubricAcpArgs =
-    if cfg.rubric.acpArgs != []
+    if cfg.rubric.acpArgs != [ ]
     then cfg.rubric.acpArgs
     else if rubricBackend == "codex-acp"
-    then ["-c" "model=\"${cfg.rubric.modelOverride or "gpt-5.4-mini"}\"" "-c" "model_reasoning_effort=\"${cfg.rubric.effort or "medium"}\""]
-    else ["acp"];
+    then [ "-c" "model=\"${rubricModel}\"" "-c" "model_reasoning_effort=\"${rubricEffort}\"" ]
+    else [ "acp" ];
 
   rubricAcpArgsStr = builtins.concatStringsSep " " rubricAcpArgs;
 
@@ -111,21 +136,102 @@
     then "codex-acp"
     else "opencode";
 
+  # --- Package resolution ---
+
+  visualRubricPackages =
+    if infernixVisualRubric != null
+      && builtins.hasAttr "packages" infernixVisualRubric
+      && builtins.hasAttr system infernixVisualRubric.packages
+    then infernixVisualRubric.packages.${system}
+    else { };
+
+  visualRubricDefaultPackage = visualRubricPackages.default or null;
+  visualRubricCodexAcpPackage = visualRubricPackages."codex-acp" or null;
+
+  resolvedPackage =
+    if cfg.package != null
+    then cfg.package
+    else if rubricBackend == "codex-acp"
+    then visualRubricCodexAcpPackage
+    else visualRubricDefaultPackage;
+
+  expectedPackageAttr =
+    if rubricBackend == "codex-acp"
+    then "codex-acp"
+    else "default";
+
   # --- Generated outputs ---
 
   generatedConfig =
-    if cfg.enable && resolvedVision != null
-    then {
-      vision_url = resolvedVision.url;
-      vision_model = resolvedVision.model;
-      rubric_backend = rubricBackend;
-      rubric_binary = rubricBinary;
-      rubric_acp_args_str = rubricAcpArgsStr;
+    if cfg.enable && (!isPipeline || resolvedVision != null)
+    then
+      {
+        mode = cfg.mode;
+        rubric_backend = rubricBackend;
+        rubric_binary = rubricBinary;
+        rubric_acp_args = rubricAcpArgs;
+        rubric_acp_args_str = rubricAcpArgsStr;
+      }
+      // optionalAttrs (rubricModel != null) {
+        rubric_model = rubricModel;
+      }
+      // optionalAttrs (rubricEffort != null) {
+        rubric_effort = rubricEffort;
+      }
+      // optionalAttrs isPipeline {
+        vision_url = resolvedVision.url;
+        vision_model = resolvedVision.model;
+      }
+    else { };
+
+  generatedToml =
+    {
+      mode = generatedConfig.mode;
+      rubric =
+        {
+          backend = generatedConfig.rubric_backend;
+        }
+        // optionalAttrs (generatedConfig ? rubric_model) {
+          model = generatedConfig.rubric_model;
+        }
+        // optionalAttrs (generatedConfig ? rubric_effort) {
+          effort = generatedConfig.rubric_effort;
+        }
+        // optionalAttrs (generatedConfig.mode == "pipeline") {
+          args = generatedConfig.rubric_acp_args;
+        };
     }
-    else {};
-in {
+    // optionalAttrs (generatedConfig.mode == "pipeline") {
+      vision = {
+        url = generatedConfig.vision_url;
+        model = generatedConfig.vision_model;
+      };
+    };
+in
+{
   options.services.infernix.visual-rubric = {
     enable = mkEnableOption "auto-generation of visual-rubric config from infernix endpoints";
+
+    mode = mkOption {
+      type = types.enum [ "direct" "pipeline" ];
+      default = "direct";
+      description = ''
+        visual-rubric backend mode. "direct" sends one multimodal prompt to
+        codex-acp. "pipeline" uses a vision endpoint first, then an ACP
+        rubric scorer.
+      '';
+    };
+
+    package = mkOption {
+      type = types.nullOr types.package;
+      default = null;
+      description = ''
+        visual-rubric package to install. When null, the module selects the
+        package from infernix's visual-rubric input: codex-acp backends use
+        packages.''${system}.codex-acp, and other backends use
+        packages.''${system}.default.
+      '';
+    };
 
     vision = {
       autoDiscover = mkOption {
@@ -164,26 +270,27 @@ in {
 
     rubric = {
       backend = mkOption {
-        type = types.enum ["opencode" "codex-acp"];
-        default = "opencode";
+        type = types.nullOr (types.enum [ "opencode" "codex-acp" ]);
+        default = null;
         description = ''
           Which ACP backend to use for rubric scoring.
+          When null, direct mode defaults to "codex-acp" and pipeline mode
+          defaults to "opencode".
           - "opencode": uses the opencode binary with its configured model
             (e.g. DeepSeek V4). The model comes from opencode's config, not
             from infernix endpoints.
-          - "codex-acp": uses codex-acp binary. The model is passed on the
-            command line and must be specified in rubric.modelOverride.
+          - "codex-acp": uses the subscription-backed codex-acp binary.
         '';
       };
 
       acpArgs = mkOption {
         type = types.listOf types.str;
-        default = [];
-        example = ["acp"];
+        default = [ ];
+        example = [ "acp" ];
         description = ''
           Extra CLI arguments for the ACP binary.
           For opencode (default): ["acp"]
-          For codex-acp: ["-c", "model=\"gpt-5.4-mini\"", "-c", "model_reasoning_effort=\"medium\""]
+          For codex-acp: ["-c", "model=\"gpt-5.5\"", "-c", "model_reasoning_effort=\"medium\""]
           When empty (default), the module derives appropriate args from
           the chosen backend.
         '';
@@ -194,15 +301,13 @@ in {
         default = null;
         example = "deepseek-v4-flash";
         description = ''
-          Model override for the rubric ACP backend. When backend is
-          "opencode", this is ignored (model comes from opencode's config).
-          When backend is "codex-acp", this value is used to construct the
-          -c model="..." argument, falling back to a default if null.
+          Model override for the rubric ACP backend. Direct codex-acp mode
+          defaults to gpt-5.5 when this is null.
         '';
       };
 
       effort = mkOption {
-        type = types.nullOr (types.enum ["low" "medium" "high"]);
+        type = types.nullOr (types.enum [ "low" "medium" "high" ]);
         default = null;
         description = ''
           Reasoning effort for the rubric ACP backend. Only meaningful
@@ -219,8 +324,10 @@ in {
         or explicit endpoint configuration. Contains:
         - vision_url: base URL of the vision API
         - vision_model: model name for the vision API
+        - mode: "direct" or "pipeline"
         - rubric_backend: "opencode" or "codex-acp"
         - rubric_binary: path to the ACP binary
+        - rubric_acp_args: ACP CLI argument list
         - rubric_acp_args_str: space-separated ACP CLI arguments
       '';
     };
@@ -229,27 +336,34 @@ in {
   config = mkIf cfg.enable {
     services.infernix.visual-rubric.generatedConfig = generatedConfig;
 
+    home.packages = mkIf (cfg.enable && resolvedPackage != null) [
+      resolvedPackage
+    ];
+
     xdg.configFile."visual-rubric/config.toml" =
-      if generatedConfig != {}
+      if generatedConfig != { }
       then {
-        source = (pkgs.formats.toml {}).generate "visual-rubric-config" {
-          vision = {
-            url = generatedConfig.vision_url;
-            model = generatedConfig.vision_model;
-          };
-          rubric = {
-            backend = generatedConfig.rubric_backend;
-            args = generatedConfig.rubric_acp_args;
-          };
-        };
+        source = (pkgs.formats.toml { }).generate "visual-rubric-config" generatedToml;
       }
-      else {};
+      else { };
 
     assertions =
       [
         {
           assertion =
             !cfg.enable
+            || resolvedPackage != null;
+          message = ''
+            services.infernix.visual-rubric could not resolve a visual-rubric
+            package for ${system}. Expected infernix's visual-rubric input to
+            expose packages.${system}.${expectedPackageAttr}, or set
+            services.infernix.visual-rubric.package explicitly.
+          '';
+        }
+        {
+          assertion =
+            !cfg.enable
+            || !isPipeline
             || resolvedVision != null
             || cfg.vision.endpoint != null;
           message = ''
@@ -269,7 +383,7 @@ in {
           assertion =
             cfg.vision.model
             == null
-            || (epCfg.${cfg.vision.endpoint}.models or {}) ? ${cfg.vision.model};
+            || (epCfg.${cfg.vision.endpoint}.models or { }) ? ${cfg.vision.model};
           message = "services.infernix.visual-rubric.vision.model = '${toString cfg.vision.model}' is not defined in endpoint '${toString cfg.vision.endpoint}'.";
         }
       ];

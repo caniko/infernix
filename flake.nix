@@ -7,18 +7,10 @@
     # Keep the default input remote; use `--override-input mnemo path:/...`
     # when developing against a local checkout.
     # mnemo is a private repo; SSH is required for authentication.
-    # embr and visual-rubric below use HTTPS since they are public.
     mnemo = {
       url = "git+ssh://git@codeberg.org/caniko/mnemo.git";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rs-harbor.inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    # embr: code embedding indexer (replaces the old nushell indexer).
-    # Lives in its own repo so it can be used standalone.
-    embr = {
-      url = "git+https://codeberg.org/caniko/rs-embr.git";
-      inputs.nixpkgs.follows = "nixpkgs";
     };
 
     visual-rubric = {
@@ -64,7 +56,6 @@
     { self
     , nixpkgs
     , mnemo
-    , embr
     , visual-rubric
     , plinth
     , rs-harbor
@@ -135,7 +126,6 @@
               ./modules/nixos
               # Re-export upstream NixOS modules under the same default import
               # path so consumers get their options for free.
-              embr.nixosModules.default
               hermes-agent.nixosModules.default
               hermes-webui.nixosModules.default
             ];
@@ -146,15 +136,9 @@
             _module.args.infernixHermesAgent = hermes-agent;
             _module.args.infernixHermesWebui = hermes-webui;
             _module.args.infernixMnemo = mnemo;
-            _module.args.infernixEmbr = embr;
             _module.args.infernixVisualRubric = visual-rubric;
             _module.args.infernixSelf = self;
             _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
-            # Default `services.embr.package` to the one locked by infernix,
-            # picking the binary for the active host system. mkDefault keeps
-            # it overridable downstream.
-            services.embr.package =
-              lib.mkDefault embr.packages.${pkgs.stdenv.hostPlatform.system}.embr;
           };
 
         mnemo = { ... }: {
@@ -217,13 +201,9 @@
         in
         {
           inherit infernix-lb;
-          default =
-            if system == "x86_64-linux"
-            then embr.packages.${system}.embr
-            else infernix-lb;
+          default = infernix-lb;
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
-          embr = embr.packages.${system}.embr;
           website = website;
           site = website;
         }
@@ -303,20 +283,6 @@
 
                 services.infernix.qdrant.enable = true;
                 services.infernix.ollama.enable = true;
-
-                services.infernix.embr = {
-                  enable = true;
-                  qdrant.useInfernixService = true;
-                  embedding.useInfernixService = true;
-                  projectsRoot = "/srv/projects";
-                  embedding.vectors = [
-                    {
-                      name = "code";
-                      model = "qwen3-embedding:8b";
-                      dim = 4096;
-                    }
-                  ];
-                };
               }
             ];
           };
@@ -402,6 +368,43 @@
                   };
                   settings = {
                     toolsets = [ "all" ];
+                    moa = {
+                      default_preset = "gpt55_dsflash";
+                      presets = {
+                        gpt55_dsflash = {
+                          reference_models = [
+                            {
+                              model = "deepseek-v4-flash";
+                              provider = "cloud-router";
+                            }
+                          ];
+                          aggregator = {
+                            model = "gpt-5.5";
+                            provider = "openai-codex";
+                          };
+                          enabled = true;
+                        };
+                      };
+                    };
+                  };
+                  scheduledSettings = {
+                    enable = true;
+                    timeZone = "America/Los_Angeles";
+                    restartService = true;
+                    profiles = {
+                      day.settingsOverlay.moa.default_preset = "gpt55_mimo";
+                      night.settingsOverlay.moa.default_preset = "gpt55_dsflash";
+                    };
+                    switches = {
+                      day = {
+                        profile = "day";
+                        onCalendar = "*-*-* 09:00:00";
+                      };
+                      night = {
+                        profile = "night";
+                        onCalendar = "*-*-* 17:00:00";
+                      };
+                    };
                   };
                 };
               }
@@ -595,13 +598,6 @@
           };
         in
         {
-          embr-wrapper = pkgs.runCommand "infernix-embr-wrapper-check" { } ''
-            test "${sample.config.services.embr.qdrant.url}" = "http://127.0.0.1:6333"
-            test "${sample.config.services.embr.embedding.url}" = "http://127.0.0.1:11434"
-            test "${sample.config.services.embr.package}" = "${embr.packages.${system}.embr}"
-            touch "$out"
-          '';
-
           pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" { } ''
             test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
             test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-embedding-8b"
@@ -616,6 +612,13 @@
             printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "cloud-router" and .base_url == "http://127.0.0.1:2099/v1")'
             printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.auxiliary.vision.model == "qwen3-vl-8b"'
             printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.fallback_model[0].provider == "cloud-router"'
+            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'
+            test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-day".timerConfig.OnCalendar}" = "*-*-* 09:00:00 America/Los_Angeles"
+            test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-night".timerConfig.OnCalendar}" = "*-*-* 17:00:00 America/Los_Angeles"
+            case ${pkgs.lib.escapeShellArg (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart)} in
+              *"--restart"*) ;;
+              *) echo "day schedule service does not restart hermes-agent" >&2; exit 1 ;;
+            esac
             test "${hermesAgentSample.config.services.infernix.fleet.nodes.atlas.address}" = "192.168.178.88"
             test "${hermesAgentSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"
             test "${fleetLegacyLanIpSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"

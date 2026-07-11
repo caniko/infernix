@@ -159,6 +159,25 @@ let
   # Systemd service that renders the env file from agenix secrets
   envFileDir = "/run/infernix-cloud-router";
   envFilePath = "${envFileDir}/env";
+  envFileScript =
+    let
+      entries = lib.mapAttrsToList (name: path: ''
+        printf '%s=' ${lib.escapeShellArg name}
+        tr -d '\r\n' < ${lib.escapeShellArg path}
+        printf '\n'
+      '') cfg.apiKeyFiles;
+    in
+    ''
+      set -eu
+      umask 077
+      tmp="${envFilePath}.tmp"
+      {
+        ${lib.concatStringsSep "\n" entries}
+      } > "$tmp"
+      chmod 0400 "$tmp"
+      mv "$tmp" "${envFilePath}"
+    '';
+  envFileScriptTrigger = pkgs.writeText "infernix-cloud-router-env-script" envFileScript;
 in
 {
   options.services.infernix.cloud-router = {
@@ -204,20 +223,7 @@ in
         RuntimeDirectoryMode = "0700";
       };
 
-      script =
-        let
-          entries = lib.mapAttrsToList (name: path: "export ${name}=$(cat ${path})") cfg.apiKeyFiles;
-        in
-        ''
-          set -eu
-          umask 077
-          tmp="${envFilePath}.tmp"
-          {
-            ${lib.concatStringsSep "\n" entries}
-          } > "$tmp"
-          chmod 0400 "$tmp"
-          mv "$tmp" "${envFilePath}"
-        '';
+      script = envFileScript;
     };
 
     systemd.services.infernix-cloud-router = {
@@ -226,6 +232,7 @@ in
       wants = [ "network-online.target" ];
       requires = [ "infernix-cloud-router-env.service" ];
       wantedBy = [ "multi-user.target" ];
+      restartTriggers = [ envFileScriptTrigger ];
 
       serviceConfig = {
         ExecStart = "${routerPkg}/bin/infernix-cloud-router";

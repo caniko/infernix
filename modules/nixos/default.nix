@@ -2,7 +2,6 @@
   imports = [
     ./cloud-router.nix
     ./comfyui.nix
-    ./embr.nix
     ./fleet.nix
     ./hermes-agent.nix
     ./hermes-dashboard.nix

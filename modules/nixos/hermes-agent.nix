@@ -5,7 +5,7 @@
 , ...
 }:
 let
-  inherit (lib) mkEnableOption mkIf mkOption recursiveUpdate types;
+  inherit (lib) mkEnableOption mkIf mkMerge mkOption recursiveUpdate types;
   cfg = config.services.infernix.hermes-agent;
   fleetCfg = config.services.infernix.fleet;
   system = pkgs.stdenv.hostPlatform.system;
@@ -38,6 +38,114 @@ let
           profile = cfg.modelRouting.profile;
         }
     else { };
+
+  baseHermesSettings = recursiveUpdate (recursiveUpdate legacyFleetSettings modelRoutingSettings) cfg.settings;
+
+  scheduledCfg = cfg.scheduledSettings;
+  scheduleEnabled = scheduledCfg.enable;
+  configYamlMode = if cfg.addToSystemPackages then "0660" else "0640";
+  scheduledProfileConfigs =
+    lib.mapAttrs
+      (name: profile:
+        pkgs.writeText "hermes-agent-${name}-config.yaml"
+          (builtins.toJSON (recursiveUpdate baseHermesSettings profile.settingsOverlay)))
+      scheduledCfg.profiles;
+  dailySwitches =
+    lib.mapAttrsToList
+      (name: switch:
+        let
+          parseTwoDigits = value:
+            (lib.toInt (builtins.substring 0 1 value)) * 10
+            + lib.toInt (builtins.substring 1 1 value);
+          match = builtins.match "\\*-\\*-\\* ([0-9][0-9]):([0-9][0-9]):([0-9][0-9])" switch.onCalendar;
+          hour = parseTwoDigits (builtins.elemAt match 0);
+          minute = parseTwoDigits (builtins.elemAt match 1);
+          second = parseTwoDigits (builtins.elemAt match 2);
+        in
+        {
+          inherit name;
+          inherit (switch) profile onCalendar;
+          seconds = hour * 3600 + minute * 60 + second;
+        })
+      scheduledCfg.switches;
+  sortedDailySwitches = lib.sort (a: b: a.seconds < b.seconds) dailySwitches;
+  lastDailySwitch =
+    if sortedDailySwitches == [ ]
+    then null
+    else lib.last sortedDailySwitches;
+  profileCase = lib.concatStringsSep "\n" (
+    lib.mapAttrsToList
+      (name: source: ''
+        ${lib.escapeShellArg name})
+          source=${lib.escapeShellArg source}
+          ;;
+      '')
+      scheduledProfileConfigs
+  );
+  switchHermesSchedule = pkgs.writeShellScript "hermes-agent-scheduled-settings-switch" ''
+    set -eu
+
+    if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+      echo "usage: $0 PROFILE [--restart|--no-restart]" >&2
+      exit 64
+    fi
+
+    profile="$1"
+    restart="''${2:---restart}"
+
+    case "$profile" in
+      ${profileCase}
+      *)
+        echo "hermes-agent schedule: unknown profile '$profile'" >&2
+        exit 64
+        ;;
+    esac
+
+    target=${lib.escapeShellArg "${cfg.stateDir}/.hermes/config.yaml"}
+    marker=${lib.escapeShellArg "${cfg.stateDir}/.hermes/.scheduled-settings-profile"}
+    tmp="$target.tmp.$$"
+    changed=0
+
+    ${pkgs.coreutils}/bin/install -d -o ${lib.escapeShellArg cfg.user} -g ${lib.escapeShellArg cfg.group} -m 2770 ${lib.escapeShellArg "${cfg.stateDir}/.hermes"}
+    if ! ${pkgs.diffutils}/bin/cmp -s "$source" "$target"; then
+      ${pkgs.coreutils}/bin/install -o ${lib.escapeShellArg cfg.user} -g ${lib.escapeShellArg cfg.group} -m ${configYamlMode} "$source" "$tmp"
+      ${pkgs.coreutils}/bin/mv -f "$tmp" "$target"
+      changed=1
+    fi
+
+    printf '%s\n' "$profile" > "$marker.tmp.$$"
+    ${pkgs.coreutils}/bin/chown ${lib.escapeShellArg cfg.user}:${lib.escapeShellArg cfg.group} "$marker.tmp.$$"
+    ${pkgs.coreutils}/bin/chmod 0644 "$marker.tmp.$$"
+    ${pkgs.coreutils}/bin/mv -f "$marker.tmp.$$" "$marker"
+
+    echo "hermes-agent schedule: active_profile=$profile changed=$changed config=$target"
+
+    if [ "$restart" = "--restart" ] && [ "$changed" -eq 1 ] && [ ${lib.escapeShellArg (lib.boolToString scheduledCfg.restartService)} = "true" ]; then
+      ${pkgs.systemd}/bin/systemctl try-restart hermes-agent.service
+    fi
+  '';
+  bootstrapHermesSchedule = pkgs.writeShellScript "hermes-agent-scheduled-settings-bootstrap" ''
+    set -eu
+
+    now_h="$(TZ=${lib.escapeShellArg scheduledCfg.timeZone} ${pkgs.coreutils}/bin/date +%H)"
+    now_m="$(TZ=${lib.escapeShellArg scheduledCfg.timeZone} ${pkgs.coreutils}/bin/date +%M)"
+    now_s="$(TZ=${lib.escapeShellArg scheduledCfg.timeZone} ${pkgs.coreutils}/bin/date +%S)"
+    now_seconds=$((10#$now_h * 3600 + 10#$now_m * 60 + 10#$now_s))
+    profile=${lib.escapeShellArg (if lastDailySwitch == null then "" else lastDailySwitch.profile)}
+
+    ${lib.concatMapStringsSep "\n" (switch: ''
+      if [ "$now_seconds" -ge ${toString switch.seconds} ]; then
+        profile=${lib.escapeShellArg switch.profile}
+      fi
+    '') sortedDailySwitches}
+
+    if [ -z "$profile" ]; then
+      echo "hermes-agent schedule: no bootstrap profile could be selected" >&2
+      exit 1
+    fi
+
+    exec ${switchHermesSchedule} "$profile" --no-restart
+  '';
 in
 {
   options.services.infernix.hermes-agent = {
@@ -72,6 +180,57 @@ in
           into settings.model, custom_providers, model_aliases, fallback_model,
           and auxiliary.
         '';
+      };
+    };
+
+    scheduledSettings = {
+      enable = mkEnableOption "scheduled Hermes settings overlays";
+
+      timeZone = mkOption {
+        type = types.str;
+        default = "UTC";
+        description = "IANA timezone used by scheduled Hermes settings timers and bootstrap profile selection.";
+      };
+
+      restartService = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Restart hermes-agent.service after a scheduled profile switch changes config.yaml.";
+      };
+
+      profiles = mkOption {
+        type = types.attrsOf (types.submodule {
+          options.settingsOverlay = mkOption {
+            type = types.attrs;
+            default = { };
+            description = "Hermes settings overlay recursively merged over the normal generated settings for this profile.";
+          };
+        });
+        default = { };
+        description = "Named scheduled Hermes settings profiles.";
+      };
+
+      switches = mkOption {
+        type = types.attrsOf (types.submodule {
+          options = {
+            profile = mkOption {
+              type = types.str;
+              description = "Scheduled settings profile activated by this switch.";
+            };
+
+            onCalendar = mkOption {
+              type = types.str;
+              example = "*-*-* 09:00:00";
+              description = ''
+                Daily systemd OnCalendar expression without timezone. The
+                configured scheduledSettings.timeZone is appended for the timer
+                and used for bootstrap selection.
+              '';
+            };
+          };
+        });
+        default = { };
+        description = "Daily scheduled switches for Hermes settings profiles.";
       };
     };
 
@@ -225,39 +384,108 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = cfg.package != null;
-        message = ''
-          services.infernix.hermes-agent: the upstream hermes-agent package is
-          not available for the host system `${system}`. Ensure the
-          hermes-agent flake supports this system.
-        '';
+  config = mkIf cfg.enable (mkMerge [
+    {
+      assertions = [
+        {
+          assertion = cfg.package != null;
+          message = ''
+            services.infernix.hermes-agent: the upstream hermes-agent package is
+            not available for the host system `${system}`. Ensure the
+            hermes-agent flake supports this system.
+          '';
+        }
+      ]
+      ++ lib.optional scheduleEnabled {
+        assertion = scheduledCfg.profiles != { };
+        message = "services.infernix.hermes-agent.scheduledSettings: at least one profile is required when enabled.";
       }
-    ];
+      ++ lib.optional scheduleEnabled {
+        assertion = scheduledCfg.switches != { };
+        message = "services.infernix.hermes-agent.scheduledSettings: at least one switch is required when enabled.";
+      }
+      ++ lib.optionals scheduleEnabled (
+        lib.mapAttrsToList
+          (name: switch: {
+            assertion = builtins.hasAttr switch.profile scheduledCfg.profiles;
+            message = "services.infernix.hermes-agent.scheduledSettings.switches.${name}: profile '${switch.profile}' is not defined.";
+          })
+          scheduledCfg.switches
+      )
+      ++ lib.optionals scheduleEnabled (
+        lib.mapAttrsToList
+          (name: switch: {
+            assertion = builtins.match "\\*-\\*-\\* ([0-9][0-9]):([0-9][0-9]):([0-9][0-9])" switch.onCalendar != null;
+            message = "services.infernix.hermes-agent.scheduledSettings.switches.${name}.onCalendar must use daily '*-*-* HH:MM:SS' form.";
+          })
+          scheduledCfg.switches
+      );
 
-    services.hermes-agent = {
-      enable = true;
-      package = cfg.package;
+      services.hermes-agent = {
+        enable = true;
+        package = cfg.package;
 
-      inherit (cfg) user group stateDir addToSystemPackages
-        environmentFiles environment documents extraPackages
-        extraPlugins extraPythonPackages extraDependencyGroups
-        configFile authFile authFileForceOverwrite extraArgs restart restartSec;
+        inherit (cfg) user group stateDir addToSystemPackages
+          environmentFiles environment documents extraPackages
+          extraPlugins extraPythonPackages extraDependencyGroups
+          configFile authFile authFileForceOverwrite extraArgs restart restartSec;
 
-      settings = recursiveUpdate (recursiveUpdate legacyFleetSettings modelRoutingSettings) cfg.settings;
+        settings = baseHermesSettings;
 
-      mcpServers = cfg.mcpServers;
+        mcpServers = cfg.mcpServers;
 
-      container = {
-        enable = cfg.container.enable;
-        backend = cfg.container.backend;
-        extraVolumes = cfg.container.extraVolumes;
-        extraOptions = cfg.container.extraOptions;
-        image = cfg.container.image;
-        hostUsers = cfg.container.hostUsers;
+        container = {
+          enable = cfg.container.enable;
+          backend = cfg.container.backend;
+          extraVolumes = cfg.container.extraVolumes;
+          extraOptions = cfg.container.extraOptions;
+          image = cfg.container.image;
+          hostUsers = cfg.container.hostUsers;
+        };
       };
-    };
-  };
+    }
+
+    (mkIf scheduleEnabled {
+      systemd.services =
+        {
+          hermes-agent-scheduled-settings-bootstrap = {
+            description = "Select scheduled Hermes settings profile";
+            before = [ "hermes-agent.service" ];
+            wantedBy = [ "multi-user.target" ];
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStart = "${bootstrapHermesSchedule}";
+            };
+          };
+
+          hermes-agent = {
+            after = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
+            requires = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
+          };
+        }
+        // lib.mapAttrs'
+          (name: switch:
+            lib.nameValuePair "hermes-agent-scheduled-settings-${name}" {
+              description = "Switch Hermes settings profile to ${switch.profile}";
+              serviceConfig = {
+                Type = "oneshot";
+                ExecStart = "${switchHermesSchedule} ${lib.escapeShellArg switch.profile} --restart";
+              };
+            })
+          scheduledCfg.switches;
+
+      systemd.timers = lib.mapAttrs'
+        (name: switch:
+          lib.nameValuePair "hermes-agent-scheduled-settings-${name}" {
+            description = "Activate Hermes settings profile ${switch.profile}";
+            wantedBy = [ "timers.target" ];
+            timerConfig = {
+              OnCalendar = "${switch.onCalendar} ${scheduledCfg.timeZone}";
+              Persistent = true;
+              Unit = "hermes-agent-scheduled-settings-${name}.service";
+            };
+          })
+        scheduledCfg.switches;
+    })
+  ]);
 }

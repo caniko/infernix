@@ -30,27 +30,6 @@
         "type": "github"
       }
     },
-    "embr": {
-      "inputs": {
-        "crane": "crane",
-        "flake-parts": "flake-parts",
-        "nixpkgs": [
-          "infernix",
-          "nixpkgs"
-        ],
-        "rust-overlay": "rust-overlay_2"
-      },
-      "locked": {
-        "lastModified": 1776844641,
-        "narHash": "sha256-3TbDIrl6NC4T0J4PHW3DIxkx934w6nwaXCiolIbFBnw=",
-        "path": "/data/nvme0/can/Projects/rs-embr",
-        "type": "path"
-      },
-      "original": {
-        "type": "git",
-        "url": "ssh://git@codeberg.org/caniko/rs-embr.git"
-      }
-    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": "nixpkgs-lib"
@@ -168,7 +147,6 @@
     },
     "infernix": {
       "inputs": {
-        "embr": "embr",
         "mnemo": "mnemo",
         "nixpkgs": "nixpkgs"
       },
@@ -352,7 +330,6 @@
       "inputs": {
         "nixpkgs": [
           "infernix",
-          "embr",
           "nixpkgs"
         ]
       },

@@ -225,29 +225,6 @@
         "type": "github"
       }
     },
-    "embr": {
-      "inputs": {
-        "crane": "crane",
-        "flake-parts": "flake-parts",
-        "nixpkgs": [
-          "nixpkgs"
-        ],
-        "rust-overlay": "rust-overlay"
-      },
-      "locked": {
-        "lastModified": 1775942857,
-        "narHash": "sha256-7qjw5yeJGJDNo+dRgnaB1NdIA9KvnwzrlFFMjJRrUDk=",
-        "ref": "refs/heads/trunk",
-        "rev": "45ca536cf9f4e5545ab94c34a668cf188e7ec88e",
-        "revCount": 1,
-        "type": "git",
-        "url": "https://codeberg.org/caniko/rs-embr.git"
-      },
-      "original": {
-        "type": "git",
-        "url": "https://codeberg.org/caniko/rs-embr.git"
-      }
-    },
     "flake-compat": {
       "flake": false,
       "locked": {
@@ -1344,7 +1321,6 @@
     },
     "root": {
       "inputs": {
-        "embr": "embr",
         "fleetix": "fleetix",
         "hermes-agent": "hermes-agent",
         "hermes-webui": "hermes-webui",
@@ -1513,7 +1489,6 @@
     "rust-overlay": {
       "inputs": {
         "nixpkgs": [
-          "embr",
           "nixpkgs"
         ]
       },

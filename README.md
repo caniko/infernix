@@ -39,9 +39,6 @@ NixOS modules (`nixosModules.default`):
   backend selection via `backend = "surrealkv" | "rocksdb" | "memory"` with
   SurrealKV as the default, optional raw `dbPath` override, structured root
   auth options, extra CLI flags, and firewall handling.
-- **`services.infernix.mnemo`** — installs the Mnemo CLI/MCP/hooks bundle,
-  writes `/etc/mnemo/config.toml`, and can follow infernix-managed SurrealDB
-  and Qdrant automatically.
 - **`services.infernix.fleet`** — declares GPU backend nodes for the
   generated load balancer and node control service. Set `address` for the
   backend dial address; `lanIp` remains as a compatibility alias for older
@@ -73,6 +70,12 @@ Home-manager modules (`homeModules.default`):
   user, writing to `programs.yh.steeds` under `mkIf` still triggers
   type-checking for users who don't import yeeHaw's HM module. Wire it in
   yourself with one line per user — see the snippet below.
+- **`services.infernix.graphify`** — installs the Infernix-owned Graphify
+  package with its OpenAI-compatible semantic extras, resolves the configured
+  endpoint/model, and registers Graphify with every Unix harness supported by
+  the pinned Graphify release. Registration runs idempotently during Home
+  Manager activation; the read-only `registeredHarnesses` and
+  `registrationCommands` options expose the resolved contract.
 
 Additional opt-in Home Manager modules:
 
@@ -138,10 +141,6 @@ Additional opt-in Home Manager modules:
             };
           };
 
-          services.infernix.mnemo = {
-            enable = true;
-            settings.storage.cache_size_mb = 256;
-          };
         })
       ];
     };
@@ -191,21 +190,17 @@ If you already import yeeHaw's Home Manager module, add
 `infernix.homeModules.yeehaw` to the module list to write
 `programs.yh.steeds` from `services.infernix.yeehaw.generatedSteeds`.
 
-When `services.infernix.mnemo.enable = true`, infernix writes
-`/etc/mnemo/config.toml` and defaults to the host's
-`services.infernix.surrealdb` and `services.infernix.qdrant` endpoints.
-SurrealDB integration requires
-`services.infernix.surrealdb.auth.enable = true` because Mnemo always
-authenticates over WebSocket. To point Mnemo somewhere else, set
-`services.infernix.mnemo.surrealdb.useInfernixService = false` and/or
-`services.infernix.mnemo.qdrant.useInfernixService = false`, then override the
-connection fields explicitly.
+To enable Graphify and its shared harness registration, declare one Infernix
+endpoint and select its model. The default `harnesses` list covers the full
+Unix Graphify target set; override it only for a deliberately narrower
+profile:
 
-For local Mnemo development, keep Infernix's default input remote and override
-it per command instead of hard-coding a machine-local path:
-
-```bash
-nix build .#default --override-input mnemo path:/path/to/mnemo
+```nix
+services.infernix.graphify = {
+  enable = true;
+  endpoint = "local-llama-swap";
+  model = "coder";
+};
 ```
 
 ## GPU configuration

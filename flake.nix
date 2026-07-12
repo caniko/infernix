@@ -4,13 +4,12 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    # Keep the default input remote; use `--override-input mnemo path:/...`
-    # when developing against a local checkout.
-    # mnemo is a private repo; SSH is required for authentication.
-    mnemo = {
-      url = "git+ssh://git@codeberg.org/caniko/mnemo.git";
+    # HM modules are checked with a real Home Manager module graph. Keeping
+    # this input direct prevents fixtures from accidentally omitting HM's
+    # activation options and lib.hm DAG helpers.
+    home-manager = {
+      url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
-      inputs.rs-harbor.inputs.nixpkgs.follows = "nixpkgs";
     };
 
     visual-rubric = {
@@ -50,12 +49,19 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.hermes-agent.follows = "hermes-agent";
     };
+
+    # Graphify is exposed through Infernix so every supported agent harness
+    # receives the same registration and package revision.
+    graphify = {
+      url = "github:caniko/graphify/7817ce8a010c91975035c8343ec3f380742c59e0";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     { self
     , nixpkgs
-    , mnemo
+    , home-manager
     , visual-rubric
     , plinth
     , rs-harbor
@@ -64,6 +70,7 @@
     , rust-overlay
     , hermes-agent
     , hermes-webui
+    , graphify
     ,
     }:
     let
@@ -86,10 +93,25 @@
         let
           toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; };
           inherit (toolchain) craneLib;
-          src = craneLib.cleanCargoSource (builtins.path {
+          source = builtins.path {
             path = ./.;
             name = "infernix-source";
-          });
+            filter = path: _type:
+              let
+                baseName = builtins.baseNameOf path;
+              in
+                baseName != ".git"
+                && baseName != ".direnv"
+                && baseName != "target"
+                && baseName != "result";
+          };
+          src = let
+            cleanSrc = craneLib.cleanCargoSource source;
+          in
+            # rs-harbor inspects src/Cargo.toml during evaluation. Force the
+            # filtered source before that probe so the lazy source cannot be
+            # reported as an invalid store path.
+            builtins.toPath (builtins.toString cleanSrc);
           commonArgs = {
             inherit src;
             pname = "infernix-lb";
@@ -135,16 +157,11 @@
             _module.args.infernixBleedingNixpkgs = nixpkgs;
             _module.args.infernixHermesAgent = hermes-agent;
             _module.args.infernixHermesWebui = hermes-webui;
-            _module.args.infernixMnemo = mnemo;
             _module.args.infernixVisualRubric = visual-rubric;
+            _module.args.infernixGraphify = graphify;
             _module.args.infernixSelf = self;
             _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
           };
-
-        mnemo = { ... }: {
-          imports = [ ./modules/nixos/mnemo.nix ];
-          _module.args.infernixMnemo = mnemo;
-        };
 
         pink-raven-workload = ./modules/nixos/pink-raven-workload.nix;
       };
@@ -153,6 +170,7 @@
         default = { ... }: {
           imports = [ (import ./modules/home-manager) ];
           _module.args.infernixVisualRubric = visual-rubric;
+          _module.args.infernixGraphify = graphify;
         };
         # Opt-in sub-module that writes programs.goose.* from the
         # services.infernix.goose outputs. Only import for users that also
@@ -174,13 +192,6 @@
       packages = forAllPackageSystems (system:
         let
           infernix-lb = mkLbPackage system;
-          mnemoPackage =
-            if
-              builtins.hasAttr "packages" mnemo
-              && builtins.hasAttr system mnemo.packages
-              && builtins.hasAttr "default" mnemo.packages.${system}
-            then mnemo.packages.${system}.default
-            else null;
           visualRubricPackage =
             if
               builtins.hasAttr "packages" visual-rubric
@@ -201,14 +212,12 @@
         in
         {
           inherit infernix-lb;
+          graphify = graphify.packages.${system}.default;
           default = infernix-lb;
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           website = website;
           site = website;
-        }
-        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux" && mnemoPackage != null) {
-          mnemo = mnemoPackage;
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux" && visualRubricPackage != null) {
           visual-rubric = visualRubricPackage;
@@ -482,52 +491,32 @@
             pkgs.writeText
               "infernix-download-extra-files-script"
               llamaSwapExtraFilesSample.config.systemd.services.infernix-download.script;
-          visualRubricModuleOptions = { lib, ... }: {
-            options = {
-              assertions = lib.mkOption {
-                type = lib.types.listOf lib.types.attrs;
-                default = [ ];
-                description = "Minimal assertions fixture option.";
-              };
-              home.shellAliases = lib.mkOption {
-                type = lib.types.attrsOf lib.types.str;
-                default = { };
-                description = "Minimal Home Manager shellAliases fixture option.";
-              };
-              home.packages = lib.mkOption {
-                type = lib.types.listOf lib.types.package;
-                default = [ ];
-                description = "Minimal Home Manager packages fixture option.";
-              };
-              xdg.configFile = lib.mkOption {
-                type = lib.types.attrsOf lib.types.attrs;
-                default = { };
-                description = "Minimal Home Manager xdg.configFile fixture option.";
-              };
-            };
-          };
-          visualRubricDirectSample = nixpkgs.lib.evalModules {
-            specialArgs = {
-              inherit pkgs;
-              osConfig = null;
-            };
+          visualRubricDirectSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            extraSpecialArgs = { osConfig = null; };
             modules = [
               self.homeModules.default
-              visualRubricModuleOptions
               {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
                 services.infernix.visual-rubric.enable = true;
               }
             ];
           };
-          visualRubricPipelineSample = nixpkgs.lib.evalModules {
-            specialArgs = {
-              inherit pkgs;
-              osConfig = null;
-            };
+          visualRubricPipelineSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            extraSpecialArgs = { osConfig = null; };
             modules = [
               self.homeModules.default
-              visualRubricModuleOptions
               {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
                 services.infernix.endpoints.local-lb = {
                   type = "llama-swap";
                   url = "http://127.0.0.1:8013";
@@ -551,6 +540,58 @@
             builtins.head visualRubricDirectSample.config.home.packages;
           visualRubricPipelinePackage =
             builtins.head visualRubricPipelineSample.config.home.packages;
+          graphifyHarnesses = [
+            "agents"
+            "aider"
+            "amp"
+            "antigravity"
+            "claude"
+            "claw"
+            "codebuddy"
+            "codex"
+            "copilot"
+            "cursor"
+            "devin"
+            "droid"
+            "gemini"
+            "hermes"
+            "kilo"
+            "kiro"
+            "kimi"
+            "opencode"
+            "pi"
+            "trae"
+            "trae-cn"
+            "vscode"
+          ];
+          graphifySample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                services.infernix.endpoints.local = {
+                  type = "llama-swap";
+                  url = "http://127.0.0.1:8013";
+                  models.dsv4.name = "dsv4";
+                };
+                services.infernix.graphify = {
+                  enable = true;
+                  endpoint = "local";
+                };
+              }
+            ];
+          };
+          graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
+            set -eu
+            export HOME="$TMPDIR/graphify-home"
+            mkdir -p "$HOME"
+            ${graphifySample.config.home.activation.infernixGraphify.data}
+          '';
           modelCatalogSample = {
             models = {
               qwen3-vl-8b = {
@@ -641,6 +682,30 @@
             grep -Fq 'url = "http://127.0.0.1:8013"' ${visualRubricPipelineConfig}
             grep -Fq 'model = "qwen3-vl-8b"' ${visualRubricPipelineConfig}
             test "${visualRubricPipelinePackage}" = "${visual-rubric.packages.${system}.default}"
+            touch "$out"
+          '';
+
+          graphify-harness-registration = pkgs.runCommand "infernix-graphify-harness-registration-check" { } ''
+            ${graphifyRegistrationScript}
+            ${graphifyRegistrationScript}
+            expected='${builtins.toJSON graphifyHarnesses}'
+            actual='${builtins.toJSON graphifySample.config.services.infernix.graphify.registeredHarnesses}'
+            test "$actual" = "$expected"
+            test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_BASE_URL}" = "http://127.0.0.1:8013/v1"
+            test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_MODEL}" = "dsv4"
+            test "${graphifySample.config.services.infernix.graphify.package.name}" = "graphify-with-openai"
+            commands='${builtins.toJSON graphifySample.config.services.infernix.graphify.registrationCommands}'
+            printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'length == 22'
+            printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'all(.[]; contains("graphify"))'
+            test -f "$TMPDIR/graphify-home/AGENTS.md"
+            test -f "$TMPDIR/graphify-home/CLAUDE.md"
+            test -f "$TMPDIR/graphify-home/.claude/settings.json"
+            test -f "$TMPDIR/graphify-home/.codex/hooks.json"
+            test -f "$TMPDIR/graphify-home/.gemini/settings.json"
+            test -f "$TMPDIR/graphify-home/.cursor/rules/graphify.mdc"
+            test -f "$TMPDIR/graphify-home/.kilo/kilo.json"
+            test -f "$TMPDIR/graphify-home/.opencode/opencode.json"
+            test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
             touch "$out"
           '';
 

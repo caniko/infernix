@@ -14,5 +14,6 @@
     ./qdrant.nix
     ./surrealdb.nix
     ./visual-rubric.nix
+    ./workload-fabric.nix
   ];
 }

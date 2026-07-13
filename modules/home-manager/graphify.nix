@@ -48,13 +48,22 @@
     && infernixGraphify.packages ? ${system}
     then infernixGraphify.packages.${system}.default
     else null;
+  graphifyFullPackage =
+    if infernixGraphify != null
+    && infernixGraphify ? packages
+    && infernixGraphify.packages ? ${system}
+    && infernixGraphify.packages.${system} ? full
+    then infernixGraphify.packages.${system}.full
+    else null;
   openaiPython = pkgs.python312.withPackages (pythonPackages: [
     pythonPackages.mcp
     pythonPackages.openai
     pythonPackages.tiktoken
   ]);
   graphifyRuntimePackage =
-    if graphifyPackage == null
+    if graphifyFullPackage != null
+    then graphifyFullPackage
+    else if graphifyPackage == null
     then null
     else pkgs.symlinkJoin {
       name = "graphify-with-openai";
@@ -161,9 +170,10 @@ in {
       default = graphifyRuntimePackage;
       description = ''
         Graphify package used for the command and harness registrations. A
-        consumer may override this with a package carrying optional semantic
-        extraction dependencies, while Infernix retains ownership of the
-        registration boundary.
+        consumer may override this package, while Infernix retains ownership
+        of the registration boundary. The upstream full package is preferred
+        when available; the compatibility wrapper remains for pre-module
+        Graphify revisions that expose only the lean default package.
       '';
     };
 

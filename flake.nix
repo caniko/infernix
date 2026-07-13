@@ -89,7 +89,7 @@
 
       mkLbPackageForPkgs = pkgs: pkgs.callPackage ./packages/infernix-lb.nix { };
 
-      mkLbPackageWithCrane = pkgs:
+      mkCargoPackageWithCrane = { pkgs, packageName }:
         let
           toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; };
           inherit (toolchain) craneLib;
@@ -100,24 +100,25 @@
               let
                 baseName = builtins.baseNameOf path;
               in
-                baseName != ".git"
-                && baseName != ".direnv"
-                && baseName != "target"
-                && baseName != "result";
+              baseName != ".git"
+              && baseName != ".direnv"
+              && baseName != "target"
+              && baseName != "result";
           };
-          src = let
-            cleanSrc = craneLib.cleanCargoSource source;
-          in
+          src =
+            let
+              cleanSrc = craneLib.cleanCargoSource source;
+            in
             # rs-harbor inspects src/Cargo.toml during evaluation. Force the
-            # filtered source before that probe so the lazy source cannot be
-            # reported as an invalid store path.
+              # filtered source before that probe so the lazy source cannot be
+              # reported as an invalid store path.
             builtins.toPath (builtins.toString cleanSrc);
           commonArgs = {
             inherit src;
-            pname = "infernix-lb";
+            pname = packageName;
             version = "0.1.0";
             strictDeps = true;
-            cargoExtraArgs = "-p infernix-lb";
+            cargoExtraArgs = "-p ${packageName}";
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         in
@@ -126,8 +127,26 @@
           inherit cargoArtifacts;
         });
 
+      mkLbPackageWithCrane = pkgs:
+        mkCargoPackageWithCrane {
+          inherit pkgs;
+          packageName = "infernix-lb";
+        };
+
+      mkWorkerdPackageWithCrane = pkgs:
+        mkCargoPackageWithCrane {
+          inherit pkgs;
+          packageName = "infernix-workerd";
+        };
+
       mkLbPackage = system:
         mkLbPackageWithCrane (import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        });
+
+      mkWorkerdPackage = system:
+        mkWorkerdPackageWithCrane (import nixpkgs {
           inherit system;
           overlays = [ rust-overlay.overlays.default ];
         });
@@ -150,7 +169,10 @@
               # path so consumers get their options for free.
               hermes-agent.nixosModules.default
               hermes-webui.nixosModules.default
-            ];
+            ]
+            ++ lib.optional
+              (graphify ? nixosModules && graphify.nixosModules ? default)
+              graphify.nixosModules.default;
             # Thread the locked nixos-unstable nixpkgs flake into the module tree
             # so ollama / llama-cpp / llama-swap can re-instantiate it with the
             # consumer's own system + config (GPU flags, allowUnfree, etc.).
@@ -164,7 +186,12 @@
           };
 
         pink-raven-workload = ./modules/nixos/pink-raven-workload.nix;
-      };
+      }
+      // nixpkgs.lib.optionalAttrs
+        (graphify ? nixosModules && graphify.nixosModules ? default)
+        {
+          graphify = graphify.nixosModules.default;
+        };
 
       homeModules = {
         default = { ... }: {
@@ -192,6 +219,7 @@
       packages = forAllPackageSystems (system:
         let
           infernix-lb = mkLbPackage system;
+          infernix-workerd = mkWorkerdPackage system;
           visualRubricPackage =
             if
               builtins.hasAttr "packages" visual-rubric
@@ -211,8 +239,10 @@
             else null;
         in
         {
-          inherit infernix-lb;
-          graphify = graphify.packages.${system}.default;
+          inherit infernix-lb infernix-workerd;
+          graphify =
+            graphify.packages.${system}.full
+              or graphify.packages.${system}.default;
           default = infernix-lb;
         }
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
@@ -292,6 +322,55 @@
 
                 services.infernix.qdrant.enable = true;
                 services.infernix.ollama.enable = true;
+              }
+            ];
+          };
+          graphifyNixosModuleAvailable =
+            graphify ? nixosModules
+            && graphify.nixosModules ? default;
+          graphifyNixosSample =
+            if graphifyNixosModuleAvailable
+            then
+              nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.default
+                  {
+                    system.stateVersion = "24.11";
+                    services.graphify = {
+                      enable = true;
+                      instances.postgresql = {
+                        source.postgresql = {
+                          enable = true;
+                          database = "infernix";
+                        };
+                        extraction.onCalendar = "daily";
+                        server.enable = true;
+                      };
+                    };
+                  }
+                ];
+              }
+            else null;
+          workloadFabricSample = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              {
+                system.stateVersion = "24.11";
+
+                services.infernix.workloadFabric = {
+                  enable = true;
+                  databaseUrl = "postgres:///canix?host=/run/postgresql";
+                  workerId = "atlas";
+                  capabilities = [ "cpu" "semantic" ];
+                  adapters.graphify = {
+                    workload = "graphify";
+                    queues = [ "code" "semantic" ];
+                    command = "/bin/canix";
+                    args = [ "graphify" "run-job" ];
+                  };
+                };
               }
             ];
           };
@@ -586,6 +665,10 @@
               }
             ];
           };
+          graphifyExpectedPackageName =
+            if graphify.packages.${system} ? full
+            then graphify.packages.${system}.full.name
+            else "graphify-with-openai";
           graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
             set -eu
             export HOME="$TMPDIR/graphify-home"
@@ -693,7 +776,7 @@
             test "$actual" = "$expected"
             test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_BASE_URL}" = "http://127.0.0.1:8013/v1"
             test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_MODEL}" = "dsv4"
-            test "${graphifySample.config.services.infernix.graphify.package.name}" = "graphify-with-openai"
+            test "${graphifySample.config.services.infernix.graphify.package.name}" = "${graphifyExpectedPackageName}"
             commands='${builtins.toJSON graphifySample.config.services.infernix.graphify.registrationCommands}'
             printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'length == 22'
             printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'all(.[]; contains("graphify"))'
@@ -706,6 +789,35 @@
             test -f "$TMPDIR/graphify-home/.kilo/kilo.json"
             test -f "$TMPDIR/graphify-home/.opencode/opencode.json"
             test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
+            touch "$out"
+          '';
+
+          graphify-nixos-module =
+            if graphifyNixosModuleAvailable
+            then
+              pkgs.runCommand "infernix-graphify-nixos-module-check" { } ''
+                test "${graphifyNixosSample.config.services.graphify.instances.postgresql.source.postgresql.database}" = infernix
+                test "${graphifyNixosSample.config.services.graphify.package}" = "${graphify.packages.${system}.full}"
+                test "${graphifyNixosSample.config.systemd.services.graphify-postgresql.serviceConfig.User}" = graphify
+                test "${toString graphifyNixosSample.config.systemd.services.graphify-postgresql.serviceConfig.ExecStart}" != ""
+                touch "$out"
+              ''
+            else
+              pkgs.runCommand "infernix-graphify-nixos-module-unavailable" { } ''
+                echo "Graphify input predates nixosModules.default; override or bump it to exercise this check." >&2
+                touch "$out"
+              '';
+
+          workload-fabric = pkgs.runCommand "infernix-workload-fabric-check" { } ''
+            test "${workloadFabricSample.config.services.infernix.workloadFabric.workerId}" = "atlas"
+            case ${pkgs.lib.escapeShellArg (toString workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig.ExecStart)} in
+              *"/bin/infernix-workerd --config"*" worker") ;;
+              *) echo "workerd service does not run the worker command" >&2; exit 1 ;;
+            esac
+            requires='${builtins.toJSON workloadFabricSample.config.systemd.services.infernix-workerd.requires}'
+            printf '%s' "$requires" | ${pkgs.jq}/bin/jq -e 'index("infernix-workload-migrate.service")'
+            queues='${builtins.toJSON workloadFabricSample.config.services.infernix.workloadFabric.adapters.graphify.queues}'
+            printf '%s' "$queues" | ${pkgs.jq}/bin/jq -e '.[0] == "code" and .[1] == "semantic"'
             touch "$out"
           '';
 

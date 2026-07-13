@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/infernix-lb"]
+members = [
+  "crates/infernix-lb",
+  "crates/infernix-workload",
+  "crates/infernix-workerd",
+]
 resolver = "2"
 
 [workspace.package]
@@ -11,4 +15,3 @@ version = "0.1.0"
 
 [workspace.metadata.crane]
 name = "infernix"
-

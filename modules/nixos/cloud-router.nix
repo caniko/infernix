@@ -39,6 +39,23 @@ let
     PORT = ${toString port}
     PROVIDERS = ${builtins.toJSON providerMap}
 
+    # requests decodes upstream transfer/content encodings before exposing
+    # response bytes.  Do not forward those hop-by-hop or representation
+    # headers after decoding; clients need a fresh, self-consistent response
+    # framing from this proxy.
+    HOP_BY_HOP_HEADERS = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-encoding",
+        "content-length",
+    }
+
 
     def route_model(model):
         if model.startswith("deepseek-"):
@@ -106,19 +123,26 @@ let
                         stream=True,
                         timeout=300,
                     )
-                    self.send_response(resp.status_code)
-                    for k, v in resp.headers.items():
-                        if k.lower() in ("content-type", "transfer-encoding", "cache-control"):
-                            self.send_header(k, v)
-                    self.end_headers()
-                    for chunk in resp.iter_content(chunk_size=None):
-                        if chunk:
-                            try:
-                                self.wfile.write(chunk)
-                                self.wfile.flush()
-                            except BrokenPipeError:
-                                break
-                    resp.close()
+                    try:
+                        self.send_response(resp.status_code)
+                        for k, v in resp.headers.items():
+                            if k.lower() not in HOP_BY_HOP_HEADERS:
+                                self.send_header(k, v)
+                        # iter_content() yields already de-chunked bytes.  A
+                        # close-delimited HTTP/1.0 response avoids claiming
+                        # chunked framing that this proxy does not generate.
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.close_connection = True
+                        for chunk in resp.iter_content(chunk_size=None):
+                            if chunk:
+                                try:
+                                    self.wfile.write(chunk)
+                                    self.wfile.flush()
+                                except (BrokenPipeError, ConnectionResetError):
+                                    break
+                    finally:
+                        resp.close()
                 else:
                     resp = http_requests.post(
                         provider["url"],
@@ -126,12 +150,17 @@ let
                         headers=headers,
                         timeout=300,
                     )
-                    self.send_response(resp.status_code)
-                    for k, v in resp.headers.items():
-                        if k.lower() not in ("transfer-encoding",):
-                            self.send_header(k, v)
-                    self.end_headers()
-                    self.wfile.write(resp.content)
+                    try:
+                        response_body = resp.content
+                        self.send_response(resp.status_code)
+                        for k, v in resp.headers.items():
+                            if k.lower() not in HOP_BY_HOP_HEADERS:
+                                self.send_header(k, v)
+                        self.send_header("Content-Length", str(len(response_body)))
+                        self.end_headers()
+                        self.wfile.write(response_body)
+                    finally:
+                        resp.close()
             except Exception as e:
                 self._json_response(500, {"error": str(e)})
 
@@ -144,7 +173,12 @@ let
             self.wfile.write(body)
 
 
-    with socketserver.TCPServer(("127.0.0.1", PORT), Proxy) as httpd:
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+
+    with ThreadingHTTPServer(("127.0.0.1", PORT), Proxy) as httpd:
         httpd.serve_forever()
   '';
 

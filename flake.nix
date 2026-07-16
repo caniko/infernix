@@ -158,6 +158,10 @@
       };
 
       nixosModules = {
+        visual-rubric = {
+          imports = [./modules/nixos/visual-rubric.nix];
+          _module.args.infernixVisualRubric = visual-rubric;
+        };
         default =
           { lib
           , pkgs

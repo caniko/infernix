@@ -120,10 +120,34 @@
       # upstream installers copy read-only reference files from the Nix store,
       # so refresh modes immediately before the second shared install too.
       refreshSharedRoots = lib.optionalString (harness == "vscode") makeGraphifyRootsWritable;
+      repairOpenCodePlugin = lib.optionalString (harness == "opencode") ''
+        # graphify installs the global OpenCode plugin under ~/.opencode. In
+        # that scope OpenCode resolves entries relative to the .opencode
+        # directory itself, so the project-style plugins/graphify.js entry
+        # becomes ~/.opencode/.opencode/plugins/graphify.js. Keep the repair
+        # here at the Infernix harness boundary until the upstream installer
+        # has a scope-aware global registration path.
+        opencode_config="$HOME/.opencode/opencode.json"
+        if [ -f "$opencode_config" ]; then
+          opencode_config_tmp="$(mktemp "$opencode_config.XXXXXX")"
+          if ${pkgs.jq}/bin/jq '
+            if (.plugin | type) == "array" then
+              .plugin |= map(if (. == ".opencode/plugins/graphify.js" or . == "plugins/graphify.js") then "./plugins/graphify.js" else . end) | .plugin |= unique
+            else . end
+          ' "$opencode_config" > "$opencode_config_tmp"; then
+            ${pkgs.coreutils}/bin/mv "$opencode_config_tmp" "$opencode_config"
+          else
+            ${pkgs.coreutils}/bin/rm -f "$opencode_config_tmp"
+            echo "infernix graphify: failed to repair $opencode_config" >&2
+            exit 1
+          fi
+        fi
+      '';
     in ''
       ${refreshSharedRoots}
       echo "infernix graphify: ${lib.escapeShellArg command}"
       ${command}
+      ${repairOpenCodePlugin}
     '') cfg.harnesses}
   '';
 

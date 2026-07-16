@@ -788,6 +788,9 @@
             test -f "$TMPDIR/graphify-home/.cursor/rules/graphify.mdc"
             test -f "$TMPDIR/graphify-home/.kilo/kilo.json"
             test -f "$TMPDIR/graphify-home/.opencode/opencode.json"
+            ${pkgs.jq}/bin/jq -e '.plugin | index("./plugins/graphify.js") != null' "$TMPDIR/graphify-home/.opencode/opencode.json"
+            ${pkgs.jq}/bin/jq -e '.plugin | index("plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
+            ${pkgs.jq}/bin/jq -e '.plugin | index(".opencode/plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
             test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
             touch "$out"
           '';

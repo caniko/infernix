@@ -93,18 +93,7 @@
         let
           toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; };
           inherit (toolchain) craneLib;
-          source = builtins.path {
-            path = ./.;
-            name = "infernix-source";
-            filter = path: _type:
-              let
-                baseName = builtins.baseNameOf path;
-              in
-              baseName != ".git"
-              && baseName != ".direnv"
-              && baseName != "target"
-              && baseName != "result";
-          };
+          source = ./.;
           src = craneLib.cleanCargoSource source;
           commonArgs = {
             inherit src;

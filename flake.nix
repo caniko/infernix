@@ -105,16 +105,10 @@
               && baseName != "target"
               && baseName != "result";
           };
-          src =
-            let
-              cleanSrc = craneLib.cleanCargoSource source;
-            in
-            # rs-harbor inspects src/Cargo.toml during evaluation. Force the
-              # filtered source before that probe so the lazy source cannot be
-              # reported as an invalid store path.
-            builtins.toPath (builtins.toString cleanSrc);
+          src = craneLib.cleanCargoSource source;
           commonArgs = {
             inherit src;
+            rsHarborCargoTomlContents = builtins.readFile (source + "/Cargo.toml");
             pname = packageName;
             version = "0.1.0";
             strictDeps = true;

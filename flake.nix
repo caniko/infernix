@@ -108,7 +108,7 @@
           src = craneLib.cleanCargoSource source;
           commonArgs = {
             inherit src;
-            rsHarborCargoTomlContents = builtins.readFile (source + "/Cargo.toml");
+            rsHarborCargoTomlContents = builtins.readFile ./Cargo.toml;
             pname = packageName;
             version = "0.1.0";
             strictDeps = true;

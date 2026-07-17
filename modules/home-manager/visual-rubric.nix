@@ -171,6 +171,8 @@ let
         rubric_binary = rubricBinary;
         rubric_acp_args = rubricAcpArgs;
         rubric_acp_args_str = rubricAcpArgsStr;
+        sequence_max_frames = cfg.sequence.maxFrames;
+        sequence_require_transition = cfg.sequence.requireTransition;
       }
       // optionalAttrs (rubricModel != null) {
         rubric_model = rubricModel;
@@ -187,6 +189,10 @@ let
   generatedToml =
     {
       mode = generatedConfig.mode;
+      sequence = {
+        max_frames = generatedConfig.sequence_max_frames;
+        require_transition = generatedConfig.sequence_require_transition;
+      };
       rubric =
         {
           backend = generatedConfig.rubric_backend;
@@ -316,6 +322,20 @@ in
       };
     };
 
+    sequence = {
+      maxFrames = mkOption {
+        type = types.ints.positive;
+        default = 8;
+        description = "Maximum ordered screenshot checkpoints accepted by visual-rubric.";
+      };
+
+      requireTransition = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Require sequence rubrics to assess before/after transition semantics.";
+      };
+    };
+
     generatedConfig = mkOption {
       type = types.attrs;
       readOnly = true;
@@ -329,6 +349,8 @@ in
         - rubric_binary: path to the ACP binary
         - rubric_acp_args: ACP CLI argument list
         - rubric_acp_args_str: space-separated ACP CLI arguments
+        - sequence_max_frames: maximum ordered checkpoints
+        - sequence_require_transition: require before/after semantics
       '';
     };
   };

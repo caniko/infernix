@@ -11,6 +11,7 @@
   inherit (lib) mkEnableOption mkOption types;
   cfg = config.services.infernix.graphify;
   endpoints = config.services.infernix.endpoints;
+  acpProviders = config.services.infernix.acp.providers;
   system = pkgs.stdenv.hostPlatform.system;
 
   # These are Graphify's user-facing install targets. Windows-only variants
@@ -55,13 +56,22 @@
     && infernixGraphify.packages.${system} ? full
     then infernixGraphify.packages.${system}.full
     else null;
+  graphifyAcpPackage =
+    if infernixGraphify != null
+      && infernixGraphify ? packages
+      && infernixGraphify.packages ? ${system}
+      && infernixGraphify.packages.${system} ? acp
+    then infernixGraphify.packages.${system}.acp
+    else null;
   openaiPython = pkgs.python312.withPackages (pythonPackages: [
     pythonPackages.mcp
     pythonPackages.openai
     pythonPackages.tiktoken
   ]);
   graphifyRuntimePackage =
-    if graphifyFullPackage != null
+    if cfg.semanticBackend == "acp" && graphifyAcpPackage != null
+    then graphifyAcpPackage
+    else if graphifyFullPackage != null
     then graphifyFullPackage
     else if graphifyPackage == null
     then null
@@ -84,6 +94,12 @@
     if cfg.package == null
     then []
     else map installCommand cfg.harnesses;
+
+  acpProvider = acpProviders.${cfg.acp.provider} or null;
+  acpConfigOptions =
+    if acpProvider == null
+    then { }
+    else acpProvider.configOptions // cfg.acp.configOptions;
   graphifyInstallRoots = [
     ".agents/skills/graphify"
     ".aider/graphify"
@@ -163,9 +179,18 @@
     then endpoint.url
     else "${endpoint.url}/v1";
   generatedSettings =
-    if !cfg.enable || endpoint == null || model == null || baseUrl == null
+    if !cfg.enable
     then {}
+    else if cfg.semanticBackend == "acp" && acpProvider != null then {
+      GRAPHIFY_SEMANTIC_BACKEND = "acp";
+      GRAPHIFY_ACP_BIN = acpProvider.command;
+      GRAPHIFY_ACP_ARGS_JSON = builtins.toJSON acpProvider.args;
+      GRAPHIFY_ACP_CONFIG_JSON = builtins.toJSON acpConfigOptions;
+      GRAPHIFY_ACP_MODEL = cfg.acp.model;
+    } // acpProvider.environment
+    else if endpoint == null || model == null || baseUrl == null then { }
     else {
+      GRAPHIFY_SEMANTIC_BACKEND = "openai";
       OPENAI_BASE_URL = baseUrl;
       OPENAI_MODEL = model.name;
       # The OpenAI SDK requires a non-empty key even when the local endpoint
@@ -176,6 +201,30 @@
 in {
   options.services.infernix.graphify = {
     enable = mkEnableOption "Graphify semantic extraction through Infernix";
+
+    semanticBackend = mkOption {
+      type = types.enum [ "openai" "acp" ];
+      default = "openai";
+      description = "Semantic extraction transport. ACP uses the shared provider registry.";
+    };
+
+    acp = {
+      provider = mkOption {
+        type = types.str;
+        default = "codex";
+        description = "ACP provider name from services.infernix.acp.providers.";
+      };
+      model = mkOption {
+        type = types.str;
+        default = "gpt-5.5";
+        description = "Model selected through ACP session configuration.";
+      };
+      configOptions = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        description = "Consumer ACP session settings merged over provider defaults.";
+      };
+    };
 
     endpoint = mkOption {
       type = types.str;
@@ -245,16 +294,20 @@ in {
         message = "services.infernix.graphify.package must resolve to a Graphify package when Graphify is enabled.";
       }
       {
-        assertion = endpoints ? ${cfg.endpoint};
+        assertion = cfg.semanticBackend == "acp" || endpoints ? ${cfg.endpoint};
         message = "services.infernix.graphify.endpoint refers to '${cfg.endpoint}', which is not declared in services.infernix.endpoints.";
       }
       {
-        assertion = endpoint == null || endpoint.type == "llama-swap";
+        assertion = cfg.semanticBackend == "acp" || endpoint == null || endpoint.type == "llama-swap";
         message = "services.infernix.graphify.endpoint '${cfg.endpoint}' must be a llama-swap endpoint (OpenAI-compatible).";
       }
       {
-        assertion = endpoint == null || endpoint.models ? ${cfg.model};
+        assertion = cfg.semanticBackend == "acp" || endpoint == null || endpoint.models ? ${cfg.model};
         message = "services.infernix.graphify.model '${cfg.model}' is not defined on endpoint '${cfg.endpoint}'.";
+      }
+      {
+        assertion = cfg.semanticBackend != "acp" || acpProvider != null;
+        message = "services.infernix.graphify.acp.provider '${cfg.acp.provider}' is not declared in services.infernix.acp.providers.";
       }
     ];
 

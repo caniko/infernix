@@ -53,7 +53,7 @@
     # Graphify is exposed through Infernix so every supported agent harness
     # receives the same registration and package revision.
     graphify = {
-      url = "github:caniko/graphify/7817ce8a010c91975035c8343ec3f380742c59e0";
+      url = "github:caniko/graphify/5f00d73d882021cdcdba74442fa216a52ad64ed9";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -168,6 +168,7 @@
             _module.args.infernixHermesWebui = hermes-webui;
             _module.args.infernixVisualRubric = visual-rubric;
             _module.args.infernixGraphify = graphify;
+            _module.args.infernixCodexAcp = self.packages.${pkgs.system}.codex-acp;
             _module.args.infernixSelf = self;
             _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
           };
@@ -181,10 +182,11 @@
         };
 
       homeModules = {
-        default = { ... }: {
+        default = { pkgs, ... }: {
           imports = [ (import ./modules/home-manager) ];
           _module.args.infernixVisualRubric = visual-rubric;
           _module.args.infernixGraphify = graphify;
+          _module.args.infernixCodexAcp = self.packages.${pkgs.system}.codex-acp;
         };
         # Opt-in sub-module that writes programs.goose.* from the
         # services.infernix.goose outputs. Only import for users that also
@@ -205,6 +207,7 @@
 
       packages = forAllPackageSystems (system:
         let
+          pkgs = nixpkgs.legacyPackages.${system};
           infernix-lb = mkLbPackage system;
           infernix-workerd = mkWorkerdPackage system;
           visualRubricPackage =
@@ -227,6 +230,7 @@
         in
         {
           inherit infernix-lb infernix-workerd;
+          codex-acp = pkgs.callPackage ./packages/codex-acp.nix { };
           graphify =
             graphify.packages.${system}.full
               or graphify.packages.${system}.default;
@@ -603,9 +607,15 @@
           visualRubricPipelineConfig =
             visualRubricPipelineSample.config.xdg.configFile."visual-rubric/config.toml".source;
           visualRubricDirectPackage =
-            builtins.head visualRubricDirectSample.config.home.packages;
+            pkgs.lib.findFirst
+              (package: package == visual-rubric.packages.${system}."codex-acp")
+              null
+              visualRubricDirectSample.config.home.packages;
           visualRubricPipelinePackage =
-            builtins.head visualRubricPipelineSample.config.home.packages;
+            pkgs.lib.findFirst
+              (package: package == visual-rubric.packages.${system}.default)
+              null
+              visualRubricPipelineSample.config.home.packages;
           graphifyHarnesses = [
             "agents"
             "aider"
@@ -656,6 +666,23 @@
             if graphify.packages.${system} ? full
             then graphify.packages.${system}.full.name
             else "graphify-with-openai";
+          graphifyAcpSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                services.infernix.graphify = {
+                  enable = true;
+                  semanticBackend = "acp";
+                };
+              }
+            ];
+          };
           graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
             set -eu
             export HOME="$TMPDIR/graphify-home"
@@ -740,7 +767,7 @@
 
           visual-rubric-home = pkgs.runCommand "infernix-visual-rubric-home-check" { } ''
             grep -Fq 'mode = "direct"' ${visualRubricDirectConfig}
-            grep -Fq 'backend = "codex-acp"' ${visualRubricDirectConfig}
+            grep -Fq 'backend = "${visualRubricDirectSample.config.services.infernix.acp.providers.codex.command}"' ${visualRubricDirectConfig}
             grep -Fq 'model = "gpt-5.5"' ${visualRubricDirectConfig}
             grep -Fq 'effort = "medium"' ${visualRubricDirectConfig}
             ! grep -Fq '[vision]' ${visualRubricDirectConfig}
@@ -779,6 +806,14 @@
             ${pkgs.jq}/bin/jq -e '.plugin | index("plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
             ${pkgs.jq}/bin/jq -e '.plugin | index(".opencode/plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
             test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
+            touch "$out"
+          '';
+
+          graphify-acp-provider = pkgs.runCommand "infernix-graphify-acp-provider-check" { } ''
+            test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_SEMANTIC_BACKEND}" = acp
+            test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_BIN}" = "${graphifyAcpSample.config.services.infernix.acp.providers.codex.command}"
+            test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_MODEL}" = gpt-5.5
+            test "${graphifyAcpSample.config.services.infernix.graphify.package}" = "${graphify.packages.${system}.acp}"
             touch "$out"
           '';
 

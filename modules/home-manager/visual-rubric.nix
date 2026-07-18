@@ -20,6 +20,7 @@ let
   inherit (lib) mkEnableOption mkOption mkIf types filterAttrs optionalAttrs;
   cfg = config.services.infernix.visual-rubric;
   epCfg = config.services.infernix.endpoints;
+  acpProviders = config.services.infernix.acp.providers;
   system = pkgs.stdenv.hostPlatform.system;
   isPipeline = cfg.mode == "pipeline";
 
@@ -122,18 +123,20 @@ let
     then "medium"
     else null;
 
+  rubricProvider = acpProviders.${cfg.rubric.provider} or null;
+
   rubricAcpArgs =
     if cfg.rubric.acpArgs != [ ]
     then cfg.rubric.acpArgs
     else if rubricBackend == "codex-acp"
-    then [ "-c" "model=\"${rubricModel}\"" "-c" "model_reasoning_effort=\"${rubricEffort}\"" ]
+    then [ ]
     else [ "acp" ];
 
   rubricAcpArgsStr = builtins.concatStringsSep " " rubricAcpArgs;
 
   rubricBinary =
     if rubricBackend == "codex-acp"
-    then "codex-acp"
+    then if rubricProvider == null then "codex-acp" else rubricProvider.command
     else "opencode";
 
   # --- Package resolution ---
@@ -168,6 +171,7 @@ let
       {
         mode = cfg.mode;
         rubric_backend = rubricBackend;
+        rubric_provider = cfg.rubric.provider;
         rubric_binary = rubricBinary;
         rubric_acp_args = rubricAcpArgs;
         rubric_acp_args_str = rubricAcpArgsStr;
@@ -195,7 +199,7 @@ let
       };
       rubric =
         {
-          backend = generatedConfig.rubric_backend;
+          backend = generatedConfig.rubric_binary;
         }
         // optionalAttrs (generatedConfig ? rubric_model) {
           model = generatedConfig.rubric_model;
@@ -289,16 +293,20 @@ in
         '';
       };
 
+      provider = mkOption {
+        type = types.str;
+        default = "codex";
+        description = "ACP provider name from services.infernix.acp.providers.";
+      };
+
       acpArgs = mkOption {
         type = types.listOf types.str;
         default = [ ];
         example = [ "acp" ];
         description = ''
-          Extra CLI arguments for the ACP binary.
-          For opencode (default): ["acp"]
-          For codex-acp: ["-c", "model=\"gpt-5.5\"", "-c", "model_reasoning_effort=\"medium\""]
-          When empty (default), the module derives appropriate args from
-          the chosen backend.
+          Extra CLI arguments for the ACP binary. For modern codex-acp,
+          model and reasoning are sent through ACP session configuration, so
+          the default is empty. For opencode use ["acp"].
         '';
       };
 
@@ -394,6 +402,10 @@ in
             explicitly, or enable autoDiscover (default) so the module can
             scan llama-swap or endpoint models.
           '';
+        }
+        {
+          assertion = !cfg.enable || rubricBackend != "codex-acp" || rubricProvider != null;
+          message = "services.infernix.visual-rubric.rubric.provider '${cfg.rubric.provider}' is not declared in services.infernix.acp.providers.";
         }
       ]
       ++ lib.optionals (cfg.vision.endpoint != null) [

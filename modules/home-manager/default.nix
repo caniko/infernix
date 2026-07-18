@@ -1,6 +1,7 @@
 {
   imports = [
     ./endpoints.nix
+    ./acp.nix
     ./graphify.nix
     ./goose.nix
     ./hermes-agent.nix

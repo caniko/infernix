@@ -37,18 +37,27 @@ let
       };
       environment = mkOption {
         type = types.attrsOf types.str;
-        default = if name == "codex" then { CODEX_PATH = lib.getExe pkgs.codex; } else { };
+        default = if name == "codex" then {
+          CODEX_HOME = "${config.home.homeDirectory}/.codex";
+          CODEX_PATH = lib.getExe pkgs.codex;
+        } else { };
         description = "Environment inherited by the ACP agent.";
       };
       configOptions = mkOption {
-        type = types.attrsOf types.str;
-        default = { mode = "read-only"; };
-        description = "ACP session options advertised to consumers.";
+        type = types.attrsOf (types.oneOf [ types.str types.bool ]);
+        default = { };
+        description = "Provider-wide ACP session option defaults.";
       };
-      readOnly = mkOption {
-        type = types.bool;
-        default = true;
-        description = "Whether consumers should enforce a read-only ACP session.";
+      capabilities = mkOption {
+        type = types.attrsOf types.bool;
+        default = if name == "codex" then {
+          image = true;
+          sessionConfig = true;
+          text = true;
+        } else {
+          text = true;
+        };
+        description = "ACP capabilities available to consumers of this provider.";
       };
     };
   });
@@ -65,9 +74,16 @@ in {
         duplicate adapter-specific command-line flags.
       '';
     };
+
+    resolvedProviders = mkOption {
+      type = types.attrsOf providerSubmodule;
+      readOnly = true;
+      description = "Fully resolved ACP provider commands, packages, environment, and capabilities.";
+    };
   };
 
   config = {
+    services.infernix.acp.resolvedProviders = cfg.providers;
     assertions = lib.optionals cfg.enable [
       {
         assertion = lib.all (provider: provider.command != "") (lib.attrValues cfg.providers);
@@ -75,7 +91,7 @@ in {
       }
     ];
     home.packages = lib.mkIf cfg.enable (
-      lib.unique (lib.filter (package: package != null) (map (provider: provider.package) (lib.attrValues cfg.providers)))
+      lib.unique (lib.filter (package: package != null) (map (provider: provider.package) (lib.attrValues cfg.resolvedProviders)))
     );
   };
 }

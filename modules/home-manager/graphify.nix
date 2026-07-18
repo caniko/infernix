@@ -11,7 +11,7 @@
   inherit (lib) mkEnableOption mkOption types;
   cfg = config.services.infernix.graphify;
   endpoints = config.services.infernix.endpoints;
-  acpProviders = config.services.infernix.acp.providers;
+  acpProviders = config.services.infernix.acp.resolvedProviders;
   system = pkgs.stdenv.hostPlatform.system;
 
   # These are Graphify's user-facing install targets. Windows-only variants
@@ -220,8 +220,8 @@ in {
         description = "Model selected through ACP session configuration.";
       };
       configOptions = mkOption {
-        type = types.attrsOf types.str;
-        default = { };
+        type = types.attrsOf (types.oneOf [ types.str types.bool ]);
+        default = { mode = "read-only"; };
         description = "Consumer ACP session settings merged over provider defaults.";
       };
     };

@@ -561,17 +561,17 @@
         "uv2nix": "uv2nix"
       },
       "locked": {
-        "lastModified": 1784365599,
-        "narHash": "sha256-IfZpwT1eQXj1rVMzeX02fQ2PxRzFPZE1AwTEDqs5ka4=",
+        "lastModified": 1784378301,
+        "narHash": "sha256-qXcxh11+brSpJ3EIXTp7/NoTOzlt5Y1AyqaJxGo4Elc=",
         "owner": "caniko",
         "repo": "graphify",
-        "rev": "5f00d73d882021cdcdba74442fa216a52ad64ed9",
+        "rev": "0b1e9723577b35b974eb36441eec47a624ef0082",
         "type": "github"
       },
       "original": {
         "owner": "caniko",
         "repo": "graphify",
-        "rev": "5f00d73d882021cdcdba74442fa216a52ad64ed9",
+        "rev": "0b1e9723577b35b974eb36441eec47a624ef0082",
         "type": "github"
       }
     },
@@ -1869,11 +1869,11 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1784365915,
-        "narHash": "sha256-+de/LyxTsLtaXUGXrJ5TdE2SeGTXiZq5sMfntwaMz3g=",
+        "lastModified": 1784378301,
+        "narHash": "sha256-+EP47j2dl4V25KRO2XOS2eNttDQwYdiDhkvrJz3kBZ0=",
         "ref": "refs/heads/trunk",
-        "rev": "21af961d3c3cc7fb912432a90b348ce84c282aba",
-        "revCount": 67,
+        "rev": "fcac2afdf320f3a1ed2c4132b9c3f5599b8f3b3e",
+        "revCount": 68,
         "type": "git",
         "url": "https://codeberg.org/caniko/visual-rubric.git"
       },

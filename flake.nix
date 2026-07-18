@@ -53,7 +53,7 @@
     # Graphify is exposed through Infernix so every supported agent harness
     # receives the same registration and package revision.
     graphify = {
-      url = "github:caniko/graphify/5f00d73d882021cdcdba74442fa216a52ad64ed9";
+      url = "github:caniko/graphify/0b1e9723577b35b974eb36441eec47a624ef0082";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -767,7 +767,7 @@
 
           visual-rubric-home = pkgs.runCommand "infernix-visual-rubric-home-check" { } ''
             grep -Fq 'mode = "direct"' ${visualRubricDirectConfig}
-            grep -Fq 'backend = "${visualRubricDirectSample.config.services.infernix.acp.providers.codex.command}"' ${visualRubricDirectConfig}
+            grep -Fq 'backend = "${visualRubricDirectSample.config.services.infernix.acp.resolvedProviders.codex.command}"' ${visualRubricDirectConfig}
             grep -Fq 'model = "gpt-5.5"' ${visualRubricDirectConfig}
             grep -Fq 'effort = "medium"' ${visualRubricDirectConfig}
             ! grep -Fq '[vision]' ${visualRubricDirectConfig}
@@ -810,10 +810,29 @@
           '';
 
           graphify-acp-provider = pkgs.runCommand "infernix-graphify-acp-provider-check" { } ''
+            provider='${builtins.toJSON graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex}'
+            printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.capabilities == {"image":true,"sessionConfig":true,"text":true}'
+            printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.configOptions == {}'
+            printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.environment.CODEX_HOME == "/home/tester/.codex"'
             test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_SEMANTIC_BACKEND}" = acp
-            test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_BIN}" = "${graphifyAcpSample.config.services.infernix.acp.providers.codex.command}"
+            test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_BIN}" = "${graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex.command}"
             test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_MODEL}" = gpt-5.5
+            test '${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_CONFIG_JSON}' = '{"mode":"read-only"}'
             test "${graphifyAcpSample.config.services.infernix.graphify.package}" = "${graphify.packages.${system}.acp}"
+            touch "$out"
+          '';
+
+          codex-acp-closure = let
+            closure = pkgs.closureInfo {
+              rootPaths = [ self.packages.${system}.codex-acp ];
+            };
+          in pkgs.runCommand "infernix-codex-acp-closure-check" { } ''
+            package=${self.packages.${system}.codex-acp}
+            test -x "$package/bin/codex-acp"
+            test -f "$package/libexec/codex-acp/index.js"
+            test ! -e "$package/lib/node_modules"
+            test "$(find "$package" -type f | wc -l)" -eq 2
+            test "$(grep -Fxc '${pkgs.codex}' ${closure}/store-paths)" -eq 1
             touch "$out"
           '';
 

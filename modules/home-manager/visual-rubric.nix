@@ -20,7 +20,7 @@ let
   inherit (lib) mkEnableOption mkOption mkIf types filterAttrs optionalAttrs;
   cfg = config.services.infernix.visual-rubric;
   epCfg = config.services.infernix.endpoints;
-  acpProviders = config.services.infernix.acp.providers;
+  acpProviders = config.services.infernix.acp.resolvedProviders;
   system = pkgs.stdenv.hostPlatform.system;
   isPipeline = cfg.mode == "pipeline";
 

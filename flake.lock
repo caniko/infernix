@@ -1498,11 +1498,11 @@
         "rust-overlay": "rust-overlay_8"
       },
       "locked": {
-        "lastModified": 1784711898,
-        "narHash": "sha256-WL18TSUcx9bBPSfyusYWZFJzmLba0GzOjTl/gsdPa0c=",
+        "lastModified": 1784741543,
+        "narHash": "sha256-ai5RSo+srmSC6QETj5idMswrYOct5hJ/i2TnsRErck8=",
         "owner": "caniko",
         "repo": "openpencil",
-        "rev": "1f702bc6c29a7fe1065377a63dff73ab87830380",
+        "rev": "3b79846037a753d3c1a26055264ce4614a208cb6",
         "type": "github"
       },
       "original": {

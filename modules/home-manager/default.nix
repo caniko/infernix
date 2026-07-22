@@ -4,6 +4,7 @@
     ./acp.nix
     ./mcp.nix
     ./graphify.nix
+    ./ponytail.nix
     ./goose.nix
     ./hermes-agent.nix
     ./ollama-aliases.nix

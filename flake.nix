@@ -196,6 +196,7 @@
           _module.args.infernixVisualRubric = visual-rubric;
           _module.args.infernixGraphify = graphify;
           _module.args.infernixCodexAcp = self.packages.${pkgs.system}.codex-acp;
+          _module.args.infernixPonytail = self.packages.${pkgs.system}.ponytail;
         };
         # Opt-in sub-module that writes programs.goose.* from the
         # services.infernix.goose outputs. Only import for users that also
@@ -244,6 +245,7 @@
         {
           inherit infernix-lb infernix-workerd;
           codex-acp = pkgs.callPackage ./packages/codex-acp.nix { };
+          ponytail = pkgs.callPackage ./packages/ponytail.nix { };
           graphify =
             graphify.packages.${system}.full
               or graphify.packages.${system}.default;

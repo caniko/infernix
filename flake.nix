@@ -677,6 +677,67 @@
               }
             ];
           };
+          ponytailHarnesses = [
+            "agents"
+            "aider"
+            "amp"
+            "antigravity"
+            "claude"
+            "cline"
+            "claw"
+            "codebuddy"
+            "codewhale"
+            "codex"
+            "copilot"
+            "copilot-cli"
+            "cursor"
+            "devin"
+            "droid"
+            "gemini"
+            "hermes"
+            "jules"
+            "junie"
+            "kilo"
+            "kiro"
+            "kimi"
+            "opencode"
+            "pi"
+            "qoder"
+            "swival"
+            "trae"
+            "trae-cn"
+            "vscode"
+            "windsurf"
+            "zed"
+          ];
+          ponytailSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                services.infernix.ponytail = {
+                  enable = true;
+                  runtimeDir = "/tmp/infernix-ponytail-fixture";
+                };
+              }
+            ];
+          };
+          ponytailActivation = pkgs.writeShellScript "infernix-ponytail-harness-registration" ''
+            set -eu
+            export HOME="$TMPDIR/ponytail-home"
+            rm -rf "$HOME" /tmp/infernix-ponytail-fixture
+            mkdir -p "$HOME/.opencode" "$HOME/.codex"
+            printf '%s\n' '# existing user guidance' > "$HOME/AGENTS.md"
+            printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}' > "$HOME/.codex/hooks.json"
+            printf '%s\n' '{"plugin":["plugins/graphify.js"]}' > "$HOME/.opencode/opencode.json"
+            ${ponytailSample.config.home.activation.infernixPonytail.data}
+            ${ponytailSample.config.home.activation.infernixPonytail.data}
+          '';
           graphifyExpectedPackageName =
             if graphify.packages.${system} ? full
             then graphify.packages.${system}.full.name
@@ -860,6 +921,31 @@
             ${pkgs.jq}/bin/jq -e '.plugin | index("plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
             ${pkgs.jq}/bin/jq -e '.plugin | index(".opencode/plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
             test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
+            touch "$out"
+          '';
+
+          ponytail-harness-registration = pkgs.runCommand "infernix-ponytail-harness-registration-check" { } ''
+            ${ponytailActivation}
+            expected='${builtins.toJSON ponytailHarnesses}'
+            actual='${builtins.toJSON ponytailSample.config.services.infernix.ponytail.registeredHarnesses}'
+            test "$actual" = "$expected"
+            test "${ponytailSample.config.services.infernix.ponytail.adapterStatus.codex.mode}" = native
+            test "${ponytailSample.config.services.infernix.ponytail.adapterStatus.cursor.scope}" = project-only
+            test -f "$TMPDIR/ponytail-home/AGENTS.md"
+            test "$(grep -Fc '<!-- infernix-ponytail: begin -->' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
+            test "$(grep -Fc '# existing user guidance' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
+            ${pkgs.jq}/bin/jq -e '.hooks.SessionStart | length == 2' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit | length == 1' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart == null' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
+            ${pkgs.jq}/bin/jq -e '.plugin | index("/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs") != null' "$TMPDIR/ponytail-home/.opencode/opencode.json"
+            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
+            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
+            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs
+            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/pi-extension/index.js
+            test -L "$TMPDIR/ponytail-home/.pi/agent/extensions/ponytail"
+            test -L "$TMPDIR/ponytail-home/.gemini/extensions/ponytail"
+            test -L "$TMPDIR/ponytail-home/.openclaw/skills/ponytail"
             touch "$out"
           '';
 

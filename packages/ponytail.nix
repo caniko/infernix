@@ -10,7 +10,7 @@ stdenvNoCC.mkDerivation {
     owner = "DietrichGebert";
     repo = "ponytail";
     rev = "16f29800fd2681bdf24f3eb4ccffe38be3baec6b";
-    hash = "sha256-pnNRf7Kz1LoQeCGfdvFvZl8s/Y35YCtJaaE1MviYkQQ=";
+    hash = "sha256-Y7d4s7uqjH6IbEXhqAiQ+yaxr6iiGcv2X64LuMtG1T8=";
   };
 
   dontConfigure = true;

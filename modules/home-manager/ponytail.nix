@@ -215,7 +215,7 @@
       if [ -L "$target" ]; then
         current="$(readlink "$target")"
         case "$current" in
-          "$runtime_dir"/*) ;;
+          "$runtime_dir"|"$runtime_dir"/*) ;;
           *)
             echo "infernix ponytail: refusing to replace unrelated symlink $target" >&2
             exit 1
@@ -290,6 +290,9 @@ in {
     ];
 
     home.packages = lib.mkIf cfg.enable [pkgs.nodejs];
+    home.sessionVariables = lib.mkIf (cfg.enable && cfg.subagentMatcher != null) {
+      PONYTAIL_SUBAGENT_MATCHER = cfg.subagentMatcher;
+    };
 
     home.activation.infernixPonytail = lib.mkIf cfg.enable (lib.hm.dag.entryAfter ["writeBoundary"] ''
       set -eu
@@ -305,6 +308,7 @@ in {
       if [ ! -e "$runtime_version" ]; then
         runtime_tmp="$(mktemp -d "$runtime_parent/.ponytail.XXXXXX")"
         cp -a "$runtime_store/." "$runtime_tmp/"
+        chmod -R u+w "$runtime_tmp"
         printf '%s\n' '${ponytailRevision}' > "$runtime_tmp/.infernix-ponytail-revision"
         mv "$runtime_tmp" "$runtime_version"
       fi
@@ -371,9 +375,6 @@ in {
         mv "$mode_tmp" "$HOME/.config/ponytail/config.json"
       ''}
 
-      ${lib.optionalString (cfg.subagentMatcher != null) ''
-        export PONYTAIL_SUBAGENT_MATCHER=${lib.escapeShellArg cfg.subagentMatcher}
-      ''}
     '');
   };
 }

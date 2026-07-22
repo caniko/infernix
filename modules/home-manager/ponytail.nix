@@ -181,7 +181,7 @@
       fi
       stripped="$(mktemp "$target.XXXXXX")"
       if [ -f "$target" ]; then
-        awk -v begin='${beginMarker}' -v end='${endMarker}' '
+        ${pkgs.gawk}/bin/awk -v begin='${beginMarker}' -v end='${endMarker}' '
           $0 == begin {inside=1; next}
           $0 == end {inside=0; next}
           !inside {print}

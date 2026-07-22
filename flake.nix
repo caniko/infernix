@@ -37,6 +37,13 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
+    openpencil = {
+      # Consume the dependent integration branch until the minimal flake PR
+      # lands; this branch contains the manifest/runtime surface.
+      url = "github:caniko/openpencil/agent/openpencil-integration-publish";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     rust-overlay.follows = "rs-harbor/rust-overlay";
 
     hermes-agent = {
@@ -67,6 +74,7 @@
     , rs-harbor
     , fleetix
     , nix-pklx
+    , openpencil
     , rust-overlay
     , hermes-agent
     , hermes-webui
@@ -138,6 +146,7 @@
       lib = {
         inherit mkLbPackageForPkgs;
         modelCatalog = import ./lib/model-catalog.nix { lib = nixpkgs.lib; };
+        openpencilSupport = true;
       };
 
       nixosModules = {
@@ -203,6 +212,10 @@
         # services.infernix.endpoints. Only import for users that also
         # configure services.infernix.hermes-agent.
         hermes-agent = import ./modules/home-manager/hermes-agent-programs.nix;
+        openpencil = { pkgs, ... }: {
+          imports = [ ./modules/home-manager/mcp.nix ];
+          _module.args.infernixOpenPencil = openpencil;
+        };
       };
 
       packages = forAllPackageSystems (system:
@@ -683,6 +696,45 @@
               }
             ];
           };
+          openpencilFixturePackage = pkgs.runCommand "openpencil-fixture" { } ''
+            mkdir -p "$out/bin" "$out/share/openpencil"
+            printf '#!/bin/sh\n' > "$out/bin/openpencil-desktop"
+            chmod +x "$out/bin/openpencil-desktop"
+            printf '{"version":"fixture","children":[]}\n' > "$out/share/openpencil/default.op"
+          '';
+          openpencilFixture = {
+            lib.integrationManifest = {
+              integration = {
+                packages.prebuiltRuntime = "runtime-prebuilt";
+                executables.desktop = "openpencil-desktop";
+                documentTemplate = "share/openpencil/default.op";
+                harnesses = {
+                  claude = { format = "json"; configPath = "~/.claude.json"; serverKey = "openpencil"; };
+                };
+              };
+            };
+            packages.${system}.runtime-prebuilt = openpencilFixturePackage;
+          };
+          openpencilSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              ./modules/home-manager/mcp.nix
+              {
+                _module.args.infernixOpenPencil = openpencilFixture;
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                xdg.enable = true;
+                services.infernix.openpencil = {
+                  enable = true;
+                  harnesses = [ "claude" ];
+                };
+              }
+            ];
+          };
+          openpencilActivation = pkgs.writeText "infernix-openpencil-activation" openpencilSample.config.home.activation.infernixOpenPencil.data;
           graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
             set -eu
             export HOME="$TMPDIR/graphify-home"
@@ -806,6 +858,13 @@
             ${pkgs.jq}/bin/jq -e '.plugin | index("plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
             ${pkgs.jq}/bin/jq -e '.plugin | index(".opencode/plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
             test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
+            touch "$out"
+          '';
+
+          openpencil-mcp = pkgs.runCommand "infernix-openpencil-mcp-check" { } ''
+            test "${openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.command}" = "${openpencilFixturePackage}/bin/openpencil-desktop"
+            test "${builtins.elemAt openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.args 0}" = "--mcp"
+            grep -Fq 'INFERNIX_OPENPENCIL_PLAN' ${openpencilActivation}
             touch "$out"
           '';
 

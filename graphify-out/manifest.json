@@ -1,0 +1,232 @@
+{
+  "crates/infernix-lb/src/main.rs": {
+    "mtime": 1781171957.1992476,
+    "ast_hash": "45cb41454a7e40101cc092ce1afa70b3",
+    "semantic_hash": "45cb41454a7e40101cc092ce1afa70b3"
+  },
+  "crates/infernix-workerd/src/main.rs": {
+    "mtime": 1783869089.6729362,
+    "ast_hash": "03e304f2fced2b0b92bf4b755d567ddf",
+    "semantic_hash": "03e304f2fced2b0b92bf4b755d567ddf"
+  },
+  "crates/infernix-workload/src/lib.rs": {
+    "mtime": 1783869100.0409024,
+    "ast_hash": "4780b79a6605b0bd5c79213c35ea6e61",
+    "semantic_hash": "4780b79a6605b0bd5c79213c35ea6e61"
+  },
+  "flake.nix": {
+    "mtime": 1784708510.6742177,
+    "ast_hash": "8a32e88630d450752ba99f8e328622b5",
+    "semantic_hash": "8a32e88630d450752ba99f8e328622b5"
+  },
+  "lib/gpu.nix": {
+    "mtime": 1781166365.0282197,
+    "ast_hash": "466ed30f5f07deea7746bde38316b132",
+    "semantic_hash": "466ed30f5f07deea7746bde38316b132"
+  },
+  "lib/hermes-model-routing.nix": {
+    "mtime": 1783234767.107858,
+    "ast_hash": "e7cb22dbaba88e48739e660b670697b1",
+    "semantic_hash": "e7cb22dbaba88e48739e660b670697b1"
+  },
+  "lib/hermes/ModelRouting.pkl": {
+    "mtime": 1783234204.8413122,
+    "ast_hash": "b0d47aecc362ead5ebbe0ea887811adc",
+    "semantic_hash": "b0d47aecc362ead5ebbe0ea887811adc"
+  },
+  "lib/hermes/model-routing.nix": {
+    "mtime": 1783234767.107858,
+    "ast_hash": "5364247c62fe2278aa51527af9a677cb",
+    "semantic_hash": "5364247c62fe2278aa51527af9a677cb"
+  },
+  "lib/model-catalog.nix": {
+    "mtime": 1783262897.2857206,
+    "ast_hash": "569cfe24138b9ed2312ca0ddc07acad5",
+    "semantic_hash": "569cfe24138b9ed2312ca0ddc07acad5"
+  },
+  "modules/home-manager/acp.nix": {
+    "mtime": 1784377871.305778,
+    "ast_hash": "6ccc6634da6d4c8a98962d718bac6be4",
+    "semantic_hash": "6ccc6634da6d4c8a98962d718bac6be4"
+  },
+  "modules/home-manager/default.nix": {
+    "mtime": 1784707571.4623632,
+    "ast_hash": "b1f9800418bdaed0475c6780c4e6ca99",
+    "semantic_hash": "b1f9800418bdaed0475c6780c4e6ca99"
+  },
+  "modules/home-manager/endpoints.nix": {
+    "mtime": 1776792921.0492892,
+    "ast_hash": "ca3826573131c7f50869b268f03663e1",
+    "semantic_hash": "ca3826573131c7f50869b268f03663e1"
+  },
+  "modules/home-manager/goose-programs.nix": {
+    "mtime": 1776792921.0485988,
+    "ast_hash": "420386917a18ce42fa35dff4870fac02",
+    "semantic_hash": "420386917a18ce42fa35dff4870fac02"
+  },
+  "modules/home-manager/goose.nix": {
+    "mtime": 1776792921.0489883,
+    "ast_hash": "8d5e1043661fea8e488ce7fd9c6ced1c",
+    "semantic_hash": "8d5e1043661fea8e488ce7fd9c6ced1c"
+  },
+  "modules/home-manager/graphify.nix": {
+    "mtime": 1784377871.3077781,
+    "ast_hash": "5c0a773cde43c0a298d89f878bb21aa2",
+    "semantic_hash": "5c0a773cde43c0a298d89f878bb21aa2"
+  },
+  "modules/home-manager/hermes-agent-programs.nix": {
+    "mtime": 1781708753.8501356,
+    "ast_hash": "1a6760847532609a049dda598302bb86",
+    "semantic_hash": "1a6760847532609a049dda598302bb86"
+  },
+  "modules/home-manager/hermes-agent.nix": {
+    "mtime": 1781708747.9361532,
+    "ast_hash": "3d6ad35a7923e571e7d0deeb4fdfc3d7",
+    "semantic_hash": "3d6ad35a7923e571e7d0deeb4fdfc3d7"
+  },
+  "modules/home-manager/mcp.nix": {
+    "mtime": 1784709179.4768329,
+    "ast_hash": "5f5ea036f1604df3cccc4c54b4610726",
+    "semantic_hash": "5f5ea036f1604df3cccc4c54b4610726"
+  },
+  "modules/home-manager/ollama-aliases.nix": {
+    "mtime": 1776792921.0487916,
+    "ast_hash": "edc0782d09712a564012613a12a5e1eb",
+    "semantic_hash": "edc0782d09712a564012613a12a5e1eb"
+  },
+  "modules/home-manager/skill-telemetry.nix": {
+    "mtime": 1783754286.2938676,
+    "ast_hash": "a6909d23e004db238d9cbbec7196d2eb",
+    "semantic_hash": "a6909d23e004db238d9cbbec7196d2eb"
+  },
+  "modules/home-manager/visual-rubric-programs.nix": {
+    "mtime": 1783286351.2399647,
+    "ast_hash": "e864a6dee95c276bc4ec58a894076720",
+    "semantic_hash": "e864a6dee95c276bc4ec58a894076720"
+  },
+  "modules/home-manager/visual-rubric.nix": {
+    "mtime": 1784377871.309778,
+    "ast_hash": "c558168b1c0a07cd9771f6033b9db134",
+    "semantic_hash": "c558168b1c0a07cd9771f6033b9db134"
+  },
+  "modules/home-manager/yeehaw-programs.nix": {
+    "mtime": 1776792921.0492384,
+    "ast_hash": "ea23f0db701baa818e0cda45c080f739",
+    "semantic_hash": "ea23f0db701baa818e0cda45c080f739"
+  },
+  "modules/home-manager/yeehaw.nix": {
+    "mtime": 1776792921.049267,
+    "ast_hash": "6e31d8693f76c075951f72077f635e20",
+    "semantic_hash": "6e31d8693f76c075951f72077f635e20"
+  },
+  "modules/nixos/cloud-router.nix": {
+    "mtime": 1783931927.865377,
+    "ast_hash": "5967c234620e5ccbfdd9b3f08bb89bd8",
+    "semantic_hash": "5967c234620e5ccbfdd9b3f08bb89bd8"
+  },
+  "modules/nixos/comfyui.nix": {
+    "mtime": 1779825651.8340087,
+    "ast_hash": "71f2d51b7b2ce59a962f2fc0f34000cb",
+    "semantic_hash": "71f2d51b7b2ce59a962f2fc0f34000cb"
+  },
+  "modules/nixos/default.nix": {
+    "mtime": 1783868123.3761194,
+    "ast_hash": "0a14aa4a3663880123055af572448884",
+    "semantic_hash": "0a14aa4a3663880123055af572448884"
+  },
+  "modules/nixos/fleet.nix": {
+    "mtime": 1782830349.4538677,
+    "ast_hash": "e8a285a6e3113704defea1d48047b31a",
+    "semantic_hash": "e8a285a6e3113704defea1d48047b31a"
+  },
+  "modules/nixos/gpu.nix": {
+    "mtime": 1781166365.0282197,
+    "ast_hash": "2157cdc795f1bfb81eccd099a91e3af7",
+    "semantic_hash": "2157cdc795f1bfb81eccd099a91e3af7"
+  },
+  "modules/nixos/hermes-agent.nix": {
+    "mtime": 1783422835.3210082,
+    "ast_hash": "64ac5af7ea493089323c327caf0fd48c",
+    "semantic_hash": "64ac5af7ea493089323c327caf0fd48c"
+  },
+  "modules/nixos/hermes-dashboard.nix": {
+    "mtime": 1782823099.0639668,
+    "ast_hash": "e0d491434151acaa21ddd36e8fcd65b6",
+    "semantic_hash": "e0d491434151acaa21ddd36e8fcd65b6"
+  },
+  "modules/nixos/hermes-webui.nix": {
+    "mtime": 1781983309.665013,
+    "ast_hash": "0188d7c79445ae96b42fd41d89c96df5",
+    "semantic_hash": "0188d7c79445ae96b42fd41d89c96df5"
+  },
+  "modules/nixos/llama-swap.nix": {
+    "mtime": 1782821572.8801868,
+    "ast_hash": "fbfafc2d879a8ab6314524bf126e1d98",
+    "semantic_hash": "fbfafc2d879a8ab6314524bf126e1d98"
+  },
+  "modules/nixos/load-balancer.nix": {
+    "mtime": 1781172650.6316383,
+    "ast_hash": "abc8871ca919e0162dfb7ce6f3516a5e",
+    "semantic_hash": "abc8871ca919e0162dfb7ce6f3516a5e"
+  },
+  "modules/nixos/node.nix": {
+    "mtime": 1781170828.3224566,
+    "ast_hash": "62649e645e7b979f9d0cf5113412db07",
+    "semantic_hash": "62649e645e7b979f9d0cf5113412db07"
+  },
+  "modules/nixos/ollama.nix": {
+    "mtime": 1777311591.810409,
+    "ast_hash": "1509527250b5e17ea54f8641fb410f18",
+    "semantic_hash": "1509527250b5e17ea54f8641fb410f18"
+  },
+  "modules/nixos/pink-raven-workload.nix": {
+    "mtime": 1781304288.100647,
+    "ast_hash": "586e9d3fae033e06cf67910476259519",
+    "semantic_hash": "586e9d3fae033e06cf67910476259519"
+  },
+  "modules/nixos/qdrant.nix": {
+    "mtime": 1776792921.0495067,
+    "ast_hash": "9e0fcbfcf94c97ea8b75a2ae4f91c69e",
+    "semantic_hash": "9e0fcbfcf94c97ea8b75a2ae4f91c69e"
+  },
+  "modules/nixos/surrealdb.nix": {
+    "mtime": 1782243929.6448078,
+    "ast_hash": "72e5b330cf353c0cc3049f4ed5a02653",
+    "semantic_hash": "72e5b330cf353c0cc3049f4ed5a02653"
+  },
+  "modules/nixos/visual-rubric.nix": {
+    "mtime": 1784196259.7720141,
+    "ast_hash": "64f065bc1ec9fb54e82ec0c9ce71b36e",
+    "semantic_hash": "64f065bc1ec9fb54e82ec0c9ce71b36e"
+  },
+  "modules/nixos/workload-fabric.nix": {
+    "mtime": 1783868796.31689,
+    "ast_hash": "31d91b3191a2e563eb4cec65c156bf8d",
+    "semantic_hash": "31d91b3191a2e563eb4cec65c156bf8d"
+  },
+  "nix/pre-commit.nix": {
+    "mtime": 1781643664.6169796,
+    "ast_hash": "bddda90e1bdbcccac6623a43ebffc306",
+    "semantic_hash": "bddda90e1bdbcccac6623a43ebffc306"
+  },
+  "packages/codex-acp.nix": {
+    "mtime": 1784366226.2854674,
+    "ast_hash": "2567b25f352cd2f7123a43bae608fdf5",
+    "semantic_hash": "2567b25f352cd2f7123a43bae608fdf5"
+  },
+  "packages/infernix-lb.nix": {
+    "mtime": 1781172739.823299,
+    "ast_hash": "99e8dcbbd4fca470d75c1734ba3e2f6f",
+    "semantic_hash": "99e8dcbbd4fca470d75c1734ba3e2f6f"
+  },
+  "test/goose-hm/flake.nix": {
+    "mtime": 1783060831.254414,
+    "ast_hash": "393480a1db162f1380148ec422c10c3e",
+    "semantic_hash": "393480a1db162f1380148ec422c10c3e"
+  },
+  "test/yeehaw-hm/flake.nix": {
+    "mtime": 1783060831.2553878,
+    "ast_hash": "37bb9f3eba7e3bf9f54ee38c0c3036d2",
+    "semantic_hash": "37bb9f3eba7e3bf9f54ee38c0c3036d2"
+  }
+}

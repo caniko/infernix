@@ -734,6 +734,7 @@
             mkdir -p "$HOME/.opencode" "$HOME/.codex"
             printf '%s\n' '# existing user guidance' > "$HOME/AGENTS.md"
             printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}' > "$HOME/.codex/hooks.json"
+            printf '%s\n' '[hooks.state]' > "$HOME/.codex/config.toml"
             printf '%s\n' '{"plugin":["plugins/graphify.js"]}' > "$HOME/.opencode/opencode.json"
             ${ponytailSample.config.home.activation.infernixPonytail.data}
             ${ponytailSample.config.home.activation.infernixPonytail.data}
@@ -938,6 +939,9 @@
             ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit | length == 1' "$TMPDIR/ponytail-home/.codex/hooks.json"
             ${pkgs.jq}/bin/jq -e '.hooks.SessionStart[1].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
             ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit[0].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            test "$(grep -Fc 'hooks.json:session_start:1:0' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 1
+            test "$(grep -Fc 'hooks.json:user_prompt_submit:0:0' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 1
+            test "$(grep -Ec 'trusted_hash = \"sha256:[0-9a-f]{64}\"' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 2
             ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart == null' "$TMPDIR/ponytail-home/.codex/hooks.json"
             ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
             ${pkgs.jq}/bin/jq -e '.plugin | index("/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs") != null' "$TMPDIR/ponytail-home/.opencode/opencode.json"

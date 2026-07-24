@@ -84,7 +84,113 @@
   endMarker = "<!-- infernix-ponytail: end -->";
   jq = "${pkgs.jq}/bin/jq";
   node = "${pkgs.nodejs}/bin/node";
+  python = "${pkgs.python3.withPackages (p: [p.tomlkit])}/bin/python3";
   runtimeStore = if package == null then "/nonexistent" else toString package;
+  codexTrustScript = pkgs.writeText "infernix-codex-hook-trust.py" ''
+    import hashlib
+    import json
+    import os
+    import pathlib
+    import stat
+    import tempfile
+
+    from tomlkit import dumps, document, load, table
+    from tomlkit.items import Table
+
+
+    EVENT_LABELS = {
+        "SessionStart": "session_start",
+        "UserPromptSubmit": "user_prompt_submit",
+    }
+
+
+    def canonical(value):
+        if isinstance(value, list):
+            return [canonical(item) for item in value]
+        if isinstance(value, dict):
+            return {key: canonical(value[key]) for key in sorted(value)}
+        return value
+
+
+    def hook_hash(event_name, group, command):
+        identity = {"event_name": EVENT_LABELS[event_name]}
+        if "matcher" in group:
+            identity["matcher"] = group["matcher"]
+        # Keep this in sync with Codex's normalized command-hook identity:
+        # optional None fields are omitted by TOML serialization.
+        identity["hooks"] = [{
+            "type": "command",
+            "command": command,
+            "timeout": 600,
+            "async": False,
+        }]
+        serialized = json.dumps(
+            canonical(identity),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        return "sha256:" + hashlib.sha256(serialized).hexdigest()
+
+
+    def atomic_write(path, text, mode):
+        fd, temporary = tempfile.mkstemp(prefix=".infernix-codex-", dir=path.parent)
+        try:
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+    hooks_path = pathlib.Path(os.environ["INFERNIX_CODEX_HOOKS"]).expanduser().resolve()
+    config_path = pathlib.Path(os.environ["INFERNIX_CODEX_CONFIG"]).expanduser()
+    with hooks_path.open(encoding="utf-8") as handle:
+        hooks_document = json.load(handle)
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if config_path.exists():
+        with config_path.open(encoding="utf-8") as handle:
+            config = load(handle)
+        mode = stat.S_IMODE(config_path.stat().st_mode)
+    else:
+        config = document()
+        mode = 0o600
+
+    hooks_table = config.get("hooks")
+    if hooks_table is None:
+        hooks_table = table()
+        config["hooks"] = hooks_table
+    if not isinstance(hooks_table, Table):
+        raise ValueError("Codex hooks configuration must be a TOML table")
+
+    state_table = hooks_table.get("state")
+    if state_table is None:
+        state_table = table()
+        hooks_table["state"] = state_table
+    if not isinstance(state_table, Table):
+        raise ValueError("Codex hooks.state configuration must be a TOML table")
+
+    for event_name, event_label in EVENT_LABELS.items():
+        for group_index, group in enumerate(hooks_document.get("hooks", {}).get(event_name, [])):
+            for handler_index, handler in enumerate(group.get("hooks", [])):
+                command = handler.get("command", "")
+                if not any(script in command for script in ("ponytail-activate.js", "ponytail-mode-tracker.js")):
+                    continue
+                key = f"{hooks_path}:{event_label}:{group_index}:{handler_index}"
+                state = state_table.get(key)
+                if state is None:
+                    state = table()
+                    state_table[key] = state
+                if not isinstance(state, Table):
+                    raise ValueError(f"Codex hook state {key!r} must be a TOML table")
+                state["trusted_hash"] = hook_hash(event_name, group, command)
+
+    atomic_write(config_path, dumps(config), mode)
+  '';
   jsonHookScript = ''
     merge_hook_json() {
       hook_file="$1"
@@ -346,6 +452,9 @@ in {
       managed_block "$HOME/.qoder/rules/ponytail.md" "$runtime_dir/.qoder/rules/ponytail.md"
 
       merge_hook_json "$HOME/.codex/hooks.json" false true
+      INFERNIX_CODEX_HOOKS="$HOME/.codex/hooks.json" \
+        INFERNIX_CODEX_CONFIG="$HOME/.codex/config.toml" \
+        ${python} ${codexTrustScript}
       merge_hook_json "$HOME/.claude/settings.json" true false
 
       opencode_config_count=0

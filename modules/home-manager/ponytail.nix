@@ -89,6 +89,7 @@
     merge_hook_json() {
       hook_file="$1"
       include_subagent="$2"
+      codex_hook="$3"
       hook_dir="$(dirname "$hook_file")"
       mkdir -p "$hook_dir"
       if [ -e "$hook_file" ] && [ ! -f "$hook_file" ]; then
@@ -106,16 +107,19 @@
         --arg activate "$runtime_dir/hooks/ponytail-activate.js" \
         --arg tracker "$runtime_dir/hooks/ponytail-mode-tracker.js" \
         --arg subagent "$runtime_dir/hooks/ponytail-subagent.js" \
+        --arg codexData "$HOME/.codex/.ponytail-data" \
         --arg node "${node}" \
-        --argjson include_subagent "$include_subagent" '
+        --argjson include_subagent "$include_subagent" \
+        --argjson codex_hook "$codex_hook" '
           def command($script): ($node + " " + ($script | @sh));
+          def codexCommand($script): ("PLUGIN_DATA=" + ($codexData | @sh) + " " + command($script));
           {
             SessionStart: [{
               matcher: "startup|resume|clear|compact",
-              hooks: [{type: "command", command: command($activate)}]
+              hooks: [{type: "command", command: (if $codex_hook then codexCommand($activate) else command($activate) end)}]
             }],
             UserPromptSubmit: [{
-              hooks: [{type: "command", command: command($tracker)}]
+              hooks: [{type: "command", command: (if $codex_hook then codexCommand($tracker) else command($tracker) end)}]
             }]
           }
           + (if $include_subagent then {
@@ -335,8 +339,8 @@ in {
       managed_block "$HOME/.kiro/steering/ponytail.md" "$runtime_dir/.kiro/steering/ponytail.md"
       managed_block "$HOME/.qoder/rules/ponytail.md" "$runtime_dir/.qoder/rules/ponytail.md"
 
-      merge_hook_json "$HOME/.codex/hooks.json" false
-      merge_hook_json "$HOME/.claude/settings.json" true
+      merge_hook_json "$HOME/.codex/hooks.json" false true
+      merge_hook_json "$HOME/.claude/settings.json" true false
 
       opencode_config_count=0
       for opencode_config in "$HOME/.config/opencode/opencode.json" "$HOME/.opencode/opencode.json"; do

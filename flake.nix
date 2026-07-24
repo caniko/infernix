@@ -936,6 +936,8 @@
             test "$(grep -Fc '# existing user guidance' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
             ${pkgs.jq}/bin/jq -e '.hooks.SessionStart | length == 2' "$TMPDIR/ponytail-home/.codex/hooks.json"
             ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit | length == 1' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.SessionStart[1].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit[0].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
             ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart == null' "$TMPDIR/ponytail-home/.codex/hooks.json"
             ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
             ${pkgs.jq}/bin/jq -e '.plugin | index("/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs") != null' "$TMPDIR/ponytail-home/.opencode/opencode.json"

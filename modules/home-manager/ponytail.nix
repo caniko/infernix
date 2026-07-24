@@ -128,10 +128,16 @@
             }]
           } else {} end)')"
       tmp="$(mktemp "$hook_file.XXXXXX")"
-      if ! ${jq} --argjson additions "$additions" '
+      if ! ${jq} --argjson additions "$additions" --argjson codex_hook "$codex_hook" '
+        def ponytail_hook($item):
+          any($item.hooks[]?; ((.command // "") | test("ponytail-(activate|mode-tracker)\\.js")));
         def append_unique($old; $new):
           reduce $new[] as $item ($old; if any(.[]; . == $item) then . else . + [$item] end);
         .hooks = (.hooks // {})
+        | if $codex_hook then
+            .hooks.SessionStart = [(.hooks.SessionStart // [])[] | select((ponytail_hook(.) | not))]
+            | .hooks.UserPromptSubmit = [(.hooks.UserPromptSubmit // [])[] | select((ponytail_hook(.) | not))]
+          else . end
         | reduce ($additions | to_entries[]) as $entry (.;
             .hooks[$entry.key] = append_unique((.hooks[$entry.key] // []); $entry.value))
       ' "$hook_file" > "$tmp"; then

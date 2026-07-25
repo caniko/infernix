@@ -8,6 +8,7 @@
   inherit (lib) mkEnableOption mkOption types;
   cfg = config.services.infernix.ponytail;
   ponytailRevision = "16f29800fd2681bdf24f3eb4ccffe38be3baec6b";
+  ponytailVersion = "4.8.4";
   defaultHarnesses = [
     "agents"
     "aider"
@@ -181,6 +182,21 @@
     if not isinstance(features_table, Table):
         raise ValueError("Codex features configuration must be a TOML table")
     features_table["plugins"] = True
+
+    marketplaces_table = config.get("marketplaces")
+    if marketplaces_table is None:
+        marketplaces_table = table()
+        config["marketplaces"] = marketplaces_table
+    if not isinstance(marketplaces_table, Table):
+        raise ValueError("Codex marketplaces configuration must be a TOML table")
+    ponytail_marketplace = marketplaces_table.get("ponytail")
+    if ponytail_marketplace is None:
+        ponytail_marketplace = table()
+        marketplaces_table["ponytail"] = ponytail_marketplace
+    if not isinstance(ponytail_marketplace, Table):
+        raise ValueError("Codex Ponytail marketplace configuration must be a TOML table")
+    ponytail_marketplace["source_type"] = "local"
+    ponytail_marketplace["source"] = os.environ["INFERNIX_CODEX_MARKETPLACE_ROOT"]
 
     plugins_table = config.get("plugins")
     if plugins_table is None:
@@ -476,6 +492,7 @@ in {
       merge_hook_json "$HOME/.codex/hooks.json" false true
       INFERNIX_CODEX_HOOKS="$HOME/.codex/hooks.json" \
         INFERNIX_CODEX_CONFIG="$HOME/.codex/config.toml" \
+        INFERNIX_CODEX_MARKETPLACE_ROOT="$runtime_dir" \
         ${python} ${codexTrustScript}
       merge_hook_json "$HOME/.claude/settings.json" true false
 
@@ -497,6 +514,25 @@ in {
       managed_link "$runtime_dir" "$HOME/.copilot/plugins/ponytail"
       managed_link "$runtime_dir" "$HOME/.codex/plugins/ponytail"
       managed_link "$runtime_dir" "$HOME/.codex/plugins/cache/ponytail/ponytail/local"
+      codex_plugin_cache="$HOME/.codex/plugins/cache/ponytail/ponytail/${ponytailVersion}"
+      if [ -L "$codex_plugin_cache" ]; then
+        current="$(readlink "$codex_plugin_cache")"
+        case "$current" in
+          "$runtime_dir"|"$runtime_dir"/*) rm -f "$codex_plugin_cache" ;;
+          *)
+            echo "infernix ponytail: refusing to replace unrelated symlink $codex_plugin_cache" >&2
+            exit 1
+            ;;
+        esac
+      elif [ -e "$codex_plugin_cache" ] && [ ! -f "$codex_plugin_cache/.infernix-ponytail-revision" ]; then
+        echo "infernix ponytail: refusing to replace user path $codex_plugin_cache" >&2
+        exit 1
+      fi
+      if [ ! -e "$codex_plugin_cache" ]; then
+        codex_plugin_tmp="$(mktemp -d "$(dirname "$codex_plugin_cache")/.ponytail.XXXXXX")"
+        cp -a "$runtime_dir/." "$codex_plugin_tmp/"
+        mv "$codex_plugin_tmp" "$codex_plugin_cache"
+      fi
       managed_link "$runtime_dir" "$HOME/.claude/plugins/ponytail"
 
       if command -v hermes >/dev/null 2>&1; then

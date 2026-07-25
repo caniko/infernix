@@ -954,6 +954,8 @@
             test -L "$TMPDIR/ponytail-home/.openclaw/skills/ponytail"
             test -L "$TMPDIR/ponytail-home/.codex/plugins/ponytail"
             test -L "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/local"
+            test -d "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4"
+            test -f "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4/.codex-plugin/plugin.json"
             test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/.codex-plugin/plugin.json"
             test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/skills/ponytail/SKILL.md"
             test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/hooks/claude-codex-hooks.json"
@@ -961,6 +963,9 @@
             grep -Fq 'enabled = true' "$TMPDIR/ponytail-home/.codex/config.toml"
             grep -Fq '[features]' "$TMPDIR/ponytail-home/.codex/config.toml"
             grep -Fq 'plugins = true' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq '[marketplaces.ponytail]' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq 'source_type = "local"' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq 'source = "/tmp/infernix-ponytail-fixture"' "$TMPDIR/ponytail-home/.codex/config.toml"
             touch "$out"
           '';
 

@@ -471,10 +471,10 @@ in {
       managed_link "$runtime_dir/pi-extension" "$HOME/.pi/agent/extensions/ponytail"
       managed_link "$runtime_dir" "$HOME/.gemini/extensions/ponytail"
       managed_link "$runtime_dir/.openclaw/skills/ponytail" "$HOME/.openclaw/skills/ponytail"
-      managed_link "$runtime_dir/.devin-plugin" "$HOME/.devin/plugins/ponytail"
-      managed_link "$runtime_dir/.github/plugin" "$HOME/.copilot/plugins/ponytail"
-      managed_link "$runtime_dir/.codex-plugin" "$HOME/.codex/plugins/ponytail"
-      managed_link "$runtime_dir/.claude-plugin" "$HOME/.claude/plugins/ponytail"
+      managed_link "$runtime_dir" "$HOME/.devin/plugins/ponytail"
+      managed_link "$runtime_dir" "$HOME/.copilot/plugins/ponytail"
+      managed_link "$runtime_dir" "$HOME/.codex/plugins/ponytail"
+      managed_link "$runtime_dir" "$HOME/.claude/plugins/ponytail"
 
       if command -v hermes >/dev/null 2>&1; then
         managed_link "$runtime_dir" "$HOME/.hermes/plugins/ponytail"

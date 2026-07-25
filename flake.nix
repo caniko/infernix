@@ -952,6 +952,10 @@
             test -L "$TMPDIR/ponytail-home/.pi/agent/extensions/ponytail"
             test -L "$TMPDIR/ponytail-home/.gemini/extensions/ponytail"
             test -L "$TMPDIR/ponytail-home/.openclaw/skills/ponytail"
+            test -L "$TMPDIR/ponytail-home/.codex/plugins/ponytail"
+            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/.codex-plugin/plugin.json"
+            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/skills/ponytail/SKILL.md"
+            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/hooks/claude-codex-hooks.json"
             touch "$out"
           '';
 

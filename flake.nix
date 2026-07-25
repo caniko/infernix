@@ -953,9 +953,12 @@
             test -L "$TMPDIR/ponytail-home/.gemini/extensions/ponytail"
             test -L "$TMPDIR/ponytail-home/.openclaw/skills/ponytail"
             test -L "$TMPDIR/ponytail-home/.codex/plugins/ponytail"
+            test -L "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/local"
             test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/.codex-plugin/plugin.json"
             test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/skills/ponytail/SKILL.md"
             test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/hooks/claude-codex-hooks.json"
+            grep -Fq '[plugins."ponytail@ponytail"]' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq 'enabled = true' "$TMPDIR/ponytail-home/.codex/config.toml"
             touch "$out"
           '';
 

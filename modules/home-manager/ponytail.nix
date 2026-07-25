@@ -174,6 +174,20 @@
     if not isinstance(state_table, Table):
         raise ValueError("Codex hooks.state configuration must be a TOML table")
 
+    plugins_table = config.get("plugins")
+    if plugins_table is None:
+        plugins_table = table()
+        config["plugins"] = plugins_table
+    if not isinstance(plugins_table, Table):
+        raise ValueError("Codex plugins configuration must be a TOML table")
+    ponytail_plugin = plugins_table.get("ponytail@ponytail")
+    if ponytail_plugin is None:
+        ponytail_plugin = table()
+        plugins_table["ponytail@ponytail"] = ponytail_plugin
+    if not isinstance(ponytail_plugin, Table):
+        raise ValueError("Codex Ponytail plugin configuration must be a TOML table")
+    ponytail_plugin["enabled"] = True
+
     for event_name, event_label in EVENT_LABELS.items():
         for group_index, group in enumerate(hooks_document.get("hooks", {}).get(event_name, [])):
             for handler_index, handler in enumerate(group.get("hooks", [])):
@@ -474,6 +488,7 @@ in {
       managed_link "$runtime_dir" "$HOME/.devin/plugins/ponytail"
       managed_link "$runtime_dir" "$HOME/.copilot/plugins/ponytail"
       managed_link "$runtime_dir" "$HOME/.codex/plugins/ponytail"
+      managed_link "$runtime_dir" "$HOME/.codex/plugins/cache/ponytail/ponytail/local"
       managed_link "$runtime_dir" "$HOME/.claude/plugins/ponytail"
 
       if command -v hermes >/dev/null 2>&1; then

@@ -14,8 +14,8 @@ let
     then infernixOpenPencil.lib.integrationManifest.integration
     else null;
   systemPackages =
-    if manifest != null && infernixOpenPencil.packages ? ${pkgs.system}
-    then infernixOpenPencil.packages.${pkgs.system}
+    if manifest != null && infernixOpenPencil.packages ? ${pkgs.stdenv.hostPlatform.system}
+    then infernixOpenPencil.packages.${pkgs.stdenv.hostPlatform.system}
     else { };
   defaultPackage =
     if manifest != null && systemPackages ? ${manifest.packages.prebuiltRuntime}

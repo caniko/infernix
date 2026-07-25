@@ -1,7 +1,9 @@
 # infernix
 
 <!-- simit:badges:start -->
+
 [![CI](https://img.shields.io/badge/CI-drift-2088ff)](.forgejo/workflows/ci.yaml) [![Nix](https://img.shields.io/badge/Nix-managed-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/infernix-lb)
+
 <!-- simit:badges:end -->
 
 Declarative NixOS and home-manager modules for self-hosted AI/ML inference
@@ -76,6 +78,19 @@ Home-manager modules (`homeModules.default`):
   the pinned Graphify release. Registration runs idempotently during Home
   Manager activation; the read-only `registeredHarnesses` and
   `registrationCommands` options expose the resolved contract.
+- **`services.infernix.ponytail`** — installs the pinned Ponytail runtime and
+  wires native hooks/plugins plus instruction and skill fallbacks across the
+  union of Ponytail's portability matrix and Infernix's harness registry.
+  Activation is local and idempotent: it never runs an interactive upstream
+  installer, preserves existing JSON and instruction files, and exposes the
+  resolved `registeredHarnesses` and `adapterStatus` read-only outputs. Set
+  `defaultMode` only when Infernix should own Ponytail's persisted default;
+  leaving it null preserves Ponytail's own user configuration.
+
+Infernix owns this external plugin's pinned payload, harness adapters, and
+native hook/plugin installation. Skillnet owns canonical authored skills,
+materialised views, and usage storage; canix owns the user/host opt-in. Do not
+copy Ponytail into Skillnet or add per-harness installation policy to canix.
 
 Additional opt-in Home Manager modules:
 
@@ -202,6 +217,23 @@ services.infernix.graphify = {
   model = "coder";
 };
 ```
+
+To enable Ponytail's shared guidance and harness adapters:
+
+```nix
+services.infernix.ponytail = {
+  enable = true;
+  # Optional: default is every supported Infernix/Ponytail harness.
+  # harnesses = [ "codex" "opencode" "claude" ];
+  # Optional: null leaves ~/.config/ponytail/config.json untouched.
+  # defaultMode = "full";
+};
+```
+
+Native JavaScript adapters use the Nix-provided Node runtime. Hosts that only
+support project-local rules receive their upstream assets in the stable
+runtime directory and are reported as `scope = "project-only"`; Infernix does
+not mutate arbitrary project checkouts.
 
 ## GPU configuration
 

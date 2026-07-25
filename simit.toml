@@ -1,5 +1,10 @@
 [ci]
 runner = "atlas-nix-trusted"
+provider = "actions"
+platform = "forgejo"
+runtime = "nix"
+workspace = true
+publish_crates = true
 
 [ci.pages]
 repo = "caniko/infernix"

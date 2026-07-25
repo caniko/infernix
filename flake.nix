@@ -959,6 +959,8 @@
             test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/hooks/claude-codex-hooks.json"
             grep -Fq '[plugins."ponytail@ponytail"]' "$TMPDIR/ponytail-home/.codex/config.toml"
             grep -Fq 'enabled = true' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq '[features]' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq 'plugins = true' "$TMPDIR/ponytail-home/.codex/config.toml"
             touch "$out"
           '';
 

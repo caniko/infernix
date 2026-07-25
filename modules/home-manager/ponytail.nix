@@ -174,6 +174,14 @@
     if not isinstance(state_table, Table):
         raise ValueError("Codex hooks.state configuration must be a TOML table")
 
+    features_table = config.get("features")
+    if features_table is None:
+        features_table = table()
+        config["features"] = features_table
+    if not isinstance(features_table, Table):
+        raise ValueError("Codex features configuration must be a TOML table")
+    features_table["plugins"] = True
+
     plugins_table = config.get("plugins")
     if plugins_table is None:
         plugins_table = table()

@@ -1,5 +1,6 @@
 {
   imports = [
+    ./model-providers.nix
     ./endpoints.nix
     ./acp.nix
     ./mcp.nix

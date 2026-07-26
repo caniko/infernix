@@ -198,6 +198,19 @@
           _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
           _module.args.infernixPonytail = self.packages.${pkgs.stdenv.hostPlatform.system}.ponytail;
         };
+        opencode = {
+          imports = [
+            ./modules/home-manager/model-providers.nix
+            ./modules/home-manager/opencode.nix
+          ];
+        };
+        claude-code = { pkgs, ... }: {
+          imports = [
+            ./modules/home-manager/model-providers.nix
+            ./modules/home-manager/claude-code.nix
+          ];
+          _module.args.infernixCodexProvider = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-provider;
+        };
         # Opt-in sub-module that writes programs.goose.* from the
         # services.infernix.goose outputs. Only import for users that also
         # import goose-hm's HM module.
@@ -245,6 +258,7 @@
         {
           inherit infernix-lb infernix-workerd;
           codex-acp = pkgs.callPackage ./packages/codex-acp.nix { };
+          codex-provider = pkgs.callPackage ./packages/codex-provider.nix { };
           ponytail = pkgs.callPackage ./packages/ponytail.nix { };
           graphify =
             graphify.packages.${system}.full
@@ -331,6 +345,36 @@
               }
             ];
           };
+          claudeCodeSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              self.homeModules.claude-code
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                services.infernix.claude-code.enable = true;
+              }
+            ];
+          };
+          opencodeModelSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              self.homeModules.opencode
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+              }
+            ];
+          };
+          claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.xdg.configFile."claude-code-router/config.json".source);
           graphifyNixosModuleAvailable =
             graphify ? nixosModules
             && graphify.nixosModules ? default;
@@ -1000,6 +1044,28 @@
             test ! -e "$package/lib/node_modules"
             test "$(find "$package" -type f | wc -l)" -eq 2
             test "$(grep -Fxc '${pkgs.codex}' ${closure}/store-paths)" -eq 1
+            touch "$out"
+          '';
+
+          claude-code-routing = pkgs.runCommand "infernix-claude-code-routing-check" { } ''
+            providers='${builtins.toJSON claudeCodeRouterConfig.Providers}'
+            opencode='${builtins.toJSON opencodeModelSample.config.programs.opencode.settings.provider}'
+            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e 'map(.name) | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
+            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_base_url == "http://127.0.0.1:3967/v1/chat/completions"'
+            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "deepseek") | .api_key == "$DEEPSEEK_API_KEY"'
+            printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e 'keys | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
+            test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
+            test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"
+            test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}" = "${pkgs.claude-code-router}/bin/ccr start"
+            touch "$out"
+          '';
+
+          codex-provider-closure = pkgs.runCommand "infernix-codex-provider-closure-check" { } ''
+            package=${self.packages.${system}.codex-provider}
+            test -x "$package/bin/infernix-codex-provider"
+            test -f "$package/libexec/infernix-codex-provider/server.mjs"
+            grep -Fq 'const args = ["exec"' "$package/libexec/infernix-codex-provider/server.mjs"
+            ! grep -Eiq 'mcp|acp' "$package/libexec/infernix-codex-provider/server.mjs"
             touch "$out"
           '';
 

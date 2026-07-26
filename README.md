@@ -56,6 +56,8 @@ without introducing a second nixpkgs channel.
 
 Home-manager modules (`homeModules.default`):
 
+- **`services.infernix.modelProviders`** — one provider/model catalog rendered
+  by the opt-in OpenCode and Claude Code modules.
 - **`services.infernix.endpoints`** — the central abstraction. You declare
   each reachable local model backend once (type, URL, models with context size
   and optional contention metadata) and every other HM module consumes it.
@@ -94,6 +96,11 @@ copy Ponytail into Skillnet or add per-harness installation policy to canix.
 
 Additional opt-in Home Manager modules:
 
+- **`homeModules.opencode`** — writes OpenCode's provider/model settings from
+  the shared catalog.
+- **`homeModules.claude-code`** — installs Claude Code and Claude Code Router,
+  starts the loopback gateway, and exposes Codex through `/model codex,default`.
+  The Codex provider runs `codex exec` directly; it does not use MCP or ACP.
 - **`homeModules.goose`** — writes `programs.goose.*` from the generated
   `services.infernix.goose.*` outputs for users that also import a Goose
   Home Manager module.

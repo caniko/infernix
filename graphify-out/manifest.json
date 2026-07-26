@@ -15,9 +15,9 @@
     "semantic_hash": "4780b79a6605b0bd5c79213c35ea6e61"
   },
   "flake.nix": {
-    "mtime": 1784708510.6742177,
-    "ast_hash": "8a32e88630d450752ba99f8e328622b5",
-    "semantic_hash": "8a32e88630d450752ba99f8e328622b5"
+    "mtime": 1785065582.900674,
+    "ast_hash": "49565e15048dbba9ae165a457fe883db",
+    "semantic_hash": "49565e15048dbba9ae165a457fe883db"
   },
   "lib/gpu.nix": {
     "mtime": 1781166365.0282197,
@@ -50,9 +50,9 @@
     "semantic_hash": "6ccc6634da6d4c8a98962d718bac6be4"
   },
   "modules/home-manager/default.nix": {
-    "mtime": 1784707571.4623632,
-    "ast_hash": "b1f9800418bdaed0475c6780c4e6ca99",
-    "semantic_hash": "b1f9800418bdaed0475c6780c4e6ca99"
+    "mtime": 1785064826.2467966,
+    "ast_hash": "1ef6487298f919262dc58c6133b285af",
+    "semantic_hash": "1ef6487298f919262dc58c6133b285af"
   },
   "modules/home-manager/endpoints.nix": {
     "mtime": 1776792921.0492892,
@@ -85,9 +85,9 @@
     "semantic_hash": "3d6ad35a7923e571e7d0deeb4fdfc3d7"
   },
   "modules/home-manager/mcp.nix": {
-    "mtime": 1784709179.4768329,
-    "ast_hash": "5f5ea036f1604df3cccc4c54b4610726",
-    "semantic_hash": "5f5ea036f1604df3cccc4c54b4610726"
+    "mtime": 1784913888.5930738,
+    "ast_hash": "f1fb7b94eb5bd60612b08e1059fd8fbd",
+    "semantic_hash": "f1fb7b94eb5bd60612b08e1059fd8fbd"
   },
   "modules/home-manager/ollama-aliases.nix": {
     "mtime": 1776792921.0487916,
@@ -228,5 +228,45 @@
     "mtime": 1783060831.2553878,
     "ast_hash": "37bb9f3eba7e3bf9f54ee38c0c3036d2",
     "semantic_hash": "37bb9f3eba7e3bf9f54ee38c0c3036d2"
+  },
+  "codex-provider/server.mjs": {
+    "mtime": 1785065745.6568627,
+    "ast_hash": "71020a055a172ae1d5257c0ab19c782f",
+    "semantic_hash": "71020a055a172ae1d5257c0ab19c782f"
+  },
+  "lib/model-providers.nix": {
+    "mtime": 1785065571.0006604,
+    "ast_hash": "3bda9d2eb85e12c409399e393450c17d",
+    "semantic_hash": "3bda9d2eb85e12c409399e393450c17d"
+  },
+  "modules/home-manager/claude-code.nix": {
+    "mtime": 1785065673.0497787,
+    "ast_hash": "d2a55e7bda4e3f4564e7b2f13e815f62",
+    "semantic_hash": "d2a55e7bda4e3f4564e7b2f13e815f62"
+  },
+  "modules/home-manager/model-providers.nix": {
+    "mtime": 1785065652.2877545,
+    "ast_hash": "9b03a5db2f476d42f529d8970debf832",
+    "semantic_hash": "9b03a5db2f476d42f529d8970debf832"
+  },
+  "modules/home-manager/opencode.nix": {
+    "mtime": 1785065329.3313801,
+    "ast_hash": "502853b5af055962e5c200ffa82d8421",
+    "semantic_hash": "502853b5af055962e5c200ffa82d8421"
+  },
+  "modules/home-manager/ponytail.nix": {
+    "mtime": 1784995088.7082508,
+    "ast_hash": "b638423cdf97f1d2e4f80c280518eef9",
+    "semantic_hash": "b638423cdf97f1d2e4f80c280518eef9"
+  },
+  "packages/codex-provider.nix": {
+    "mtime": 1785065329.33238,
+    "ast_hash": "245309b01c88c64b7219ac70abc3179e",
+    "semantic_hash": "245309b01c88c64b7219ac70abc3179e"
+  },
+  "packages/ponytail.nix": {
+    "mtime": 1784751113.0139446,
+    "ast_hash": "de1fc26d68812716fc9dee17097629ce",
+    "semantic_hash": "de1fc26d68812716fc9dee17097629ce"
   }
 }

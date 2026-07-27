@@ -177,7 +177,7 @@
             _module.args.infernixHermesWebui = hermes-webui;
             _module.args.infernixVisualRubric = visual-rubric;
             _module.args.infernixGraphify = graphify;
-            _module.args.infernixCodexAcp = self.packages.${pkgs.system}.codex-acp;
+            _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
             _module.args.infernixSelf = self;
             _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
           };
@@ -195,8 +195,8 @@
           imports = [ (import ./modules/home-manager) ];
           _module.args.infernixVisualRubric = visual-rubric;
           _module.args.infernixGraphify = graphify;
-          _module.args.infernixCodexAcp = self.packages.${pkgs.system}.codex-acp;
-          _module.args.infernixPonytail = self.packages.${pkgs.system}.ponytail;
+          _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
+          _module.args.infernixPonytail = self.packages.${pkgs.stdenv.hostPlatform.system}.ponytail;
         };
         # Opt-in sub-module that writes programs.goose.* from the
         # services.infernix.goose outputs. Only import for users that also

@@ -2,7 +2,7 @@
 
 <!-- simit:badges:start -->
 
-[![CI](https://img.shields.io/badge/CI-drift-2088ff)](.forgejo/workflows/ci.yaml) [![Nix](https://img.shields.io/badge/Nix-managed-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/infernix-lb)
+![CI](https://img.shields.io/badge/CI-drift-2088ff) [![Nix](https://img.shields.io/badge/Nix-managed-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/infernix-lb)
 
 <!-- simit:badges:end -->
 
@@ -88,14 +88,55 @@ Home-manager modules (`homeModules.default`):
   resolved `registeredHarnesses` and `adapterStatus` read-only outputs. Set
   `defaultMode` only when Infernix should own Ponytail's persisted default;
   leaving it null preserves Ponytail's own user configuration.
+- **`services.infernix.harnesses`** — the shared harness registry used by
+  integrations such as MCP. Each entry declares a probe command and optional
+  adapter metadata. The default `mode = "auto"` probes the Home Manager
+  profile plus the activation `PATH`; `force` is for GUI or config-only
+  clients, and `off` suppresses an integration without removing its package.
+  The declarative plan is exposed as
+  `services.infernix.harnessRegistry.plan`, while activation status is written
+  to `$XDG_STATE_HOME/infernix/harnesses.json`.
 
 Infernix owns this external plugin's pinned payload, harness adapters, and
 native hook/plugin installation. Skillnet owns canonical authored skills,
 materialised views, and usage storage; canix owns the user/host opt-in. Do not
 copy Ponytail into Skillnet or add per-harness installation policy to canix.
 
+### Harness auto-configuration
+
+Integrations contribute adapters to the shared registry; they do not maintain
+separate lists of every possible client. For example, OpenPencil can be
+enabled with automatic detection:
+
+```nix
+{
+  imports = [ infernix.homeModules.default infernix.homeModules.openpencil ];
+
+  services.infernix.openpencil.enable = true;
+
+  # Configure a client with no reliable CLI probe.
+  services.infernix.harnesses.antigravity.mode = "force";
+
+  # Keep a detected client out of this integration.
+  services.infernix.harnesses.codex.mode = "off";
+}
+```
+
+`services.infernix.mcp.servers.<name>.harnesses = null` (the default) selects
+all registered adapters that are detected at activation. A list restricts the
+candidates, while each candidate still follows its registry mode. Missing
+`auto` probes are a successful no-op; they do not create empty client config
+files. Installing a client after activation requires another Home Manager
+switch. Inspect the status JSON when a harness is skipped or unsupported.
+
+The generic registry currently supports JSON and TOML MCP files. Nix-native
+clients consume `services.infernix.mcp.resolvedServers` through their own
+Home Manager companion module rather than receiving arbitrary runtime writes.
+
 Additional opt-in Home Manager modules:
 
+- **`homeModules.openpencil`** — registers OpenPencil's MCP server and its
+  manifest-provided harness adapters with the shared auto-detection registry.
 - **`homeModules.opencode`** — writes OpenCode's provider/model settings from
   the shared catalog.
 - **`homeModules.claude-code`** — installs Claude Code and Claude Code Router,

@@ -1,6 +1,6 @@
 [ci]
-runner = "atlas-nix-trusted"
-provider = "actions"
+runner = "codefloe-global"
+provider = "crow"
 platform = "forgejo"
 runtime = "nix"
 workspace = true

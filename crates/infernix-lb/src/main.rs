@@ -456,17 +456,18 @@ fn requested_model(body: &Value) -> std::result::Result<String, Box<Response>> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": "request body must include string field `model`",
-                        "type": "invalid_request_error"
-                    }
-                })),
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": "request body must include string field `model`",
+                            "type": "invalid_request_error"
+                        }
+                    })),
+                )
+                    .into_response(),
             )
-                .into_response()
-                .into(),
         })
 }
 

@@ -1,7 +1,9 @@
 # infernix
 
 <!-- simit:badges:start -->
+
 [![CI](https://img.shields.io/badge/CI-drift-2088ff)](.forgejo/workflows/ci.yaml) [![Nix](https://img.shields.io/badge/Nix-managed-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/infernix-lb)
+
 <!-- simit:badges:end -->
 
 Declarative NixOS and home-manager modules for self-hosted AI/ML inference

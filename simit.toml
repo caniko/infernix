@@ -1,5 +1,9 @@
 [ci]
-runner = "atlas-nix-trusted"
+runner = "ubuntu-24.04"
+provider = "actions"
+platform = "github"
+runtime = "nix"
+workspace = true
 
 [ci.pages]
 repo = "caniko/infernix"

@@ -3,6 +3,7 @@
     ./model-providers.nix
     ./endpoints.nix
     ./acp.nix
+    ./harnesses.nix
     ./mcp.nix
     ./graphify.nix
     ./ponytail.nix

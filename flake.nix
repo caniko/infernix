@@ -227,7 +227,11 @@
         # configure services.infernix.hermes-agent.
         hermes-agent = import ./modules/home-manager/hermes-agent-programs.nix;
         openpencil = { pkgs, ... }: {
-          imports = [ ./modules/home-manager/mcp.nix ];
+          imports = [
+            ./modules/home-manager/harnesses.nix
+            ./modules/home-manager/mcp.nix
+            ./modules/home-manager/openpencil.nix
+          ];
           _module.args.infernixOpenPencil = openpencil;
         };
       };
@@ -818,15 +822,21 @@
                 documentTemplate = "share/openpencil/default.op";
                 harnesses = {
                   claude = { format = "json"; configPath = "~/.claude.json"; serverKey = "openpencil"; };
+                  codex = { format = "toml"; configPath = "~/.codex/config.toml"; serverKey = "openpencil"; };
+                  hermes = { format = "nix"; configPath = ""; serverKey = "openpencil"; };
                 };
               };
             };
             packages.${system}.runtime-prebuilt = openpencilFixturePackage;
           };
+          openpencilFixtureModules = [
+            ./modules/home-manager/harnesses.nix
+            ./modules/home-manager/mcp.nix
+            ./modules/home-manager/openpencil.nix
+          ];
           openpencilSample = home-manager.lib.homeManagerConfiguration {
             inherit pkgs;
-            modules = [
-              ./modules/home-manager/mcp.nix
+            modules = openpencilFixtureModules ++ [
               {
                 _module.args.infernixOpenPencil = openpencilFixture;
                 home = {
@@ -835,14 +845,129 @@
                   stateVersion = "24.11";
                 };
                 xdg.enable = true;
+                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
                 services.infernix.openpencil = {
                   enable = true;
+                  document = "/tmp/infernix-openpencil-fixture/agent.op";
+                };
+                services.infernix.mcp.servers.extra = {
+                  command = "/bin/extra-mcp";
+                  key = "extra";
                   harnesses = [ "claude" ];
                 };
               }
             ];
           };
-          openpencilActivation = pkgs.writeText "infernix-openpencil-activation" openpencilSample.config.home.activation.infernixOpenPencil.data;
+          openpencilForceSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = openpencilFixtureModules ++ [
+              {
+                _module.args.infernixOpenPencil = openpencilFixture;
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                xdg.enable = true;
+                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
+                services.infernix.openpencil.enable = true;
+                services.infernix.openpencil.document = "/tmp/infernix-openpencil-force/agent.op";
+                services.infernix.harnesses.codex.mode = "force";
+              }
+            ];
+          };
+          openpencilOffSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = openpencilFixtureModules ++ [
+              {
+                _module.args.infernixOpenPencil = openpencilFixture;
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                xdg.enable = true;
+                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
+                services.infernix.openpencil.enable = true;
+                services.infernix.openpencil.document = "/tmp/infernix-openpencil-off/agent.op";
+                services.infernix.harnesses.claude.mode = "off";
+              }
+            ];
+          };
+          openpencilActivation = pkgs.writeShellScript "infernix-openpencil-activation" ''
+            set -eu
+            export HOME="$TMPDIR/openpencil-home"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            rm -rf "$HOME"
+            rm -rf /tmp/infernix-openpencil-fixture
+            mkdir -p "$HOME/bin" "$HOME/.local/state" "$HOME/.codex"
+            printf '#!/bin/sh\n' > "$HOME/bin/claude"
+            chmod +x "$HOME/bin/claude"
+            printf '%s\n' '{"keep":true}' > "$HOME/.claude.json"
+            printf '%s\n' '[settings]' 'keep = true' > "$HOME/.codex/config.toml"
+            export PATH="$HOME/bin:$PATH"
+            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+            ${openpencilSample.config.home.activation.infernixMcp.data}
+            ${pkgs.jq}/bin/jq -e '.keep == true and .mcpServers.openpencil.command == "${openpencilFixturePackage}/bin/openpencil-desktop" and .mcpServers.extra.command == "/bin/extra-mcp"' "$HOME/.claude.json"
+            ${pkgs.jq}/bin/jq -e '.detected | index("claude")' "$HOME/.local/state/infernix/harnesses.json"
+            ${pkgs.jq}/bin/jq -e '.unsupported | index("hermes")' "$HOME/.local/state/infernix/harnesses.json"
+            grep -Fq 'keep = true' "$HOME/.codex/config.toml"
+            test ! -e "$HOME/.codex/config.toml.bak"
+            before="$(sha256sum "$HOME/.claude.json")"
+            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+            ${openpencilSample.config.home.activation.infernixMcp.data}
+            test "$before" = "$(sha256sum "$HOME/.claude.json")"
+          '';
+          openpencilForceActivation = pkgs.writeShellScript "infernix-openpencil-force-activation" ''
+            set -eu
+            export HOME="$TMPDIR/openpencil-force-home"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            rm -rf "$HOME"
+            rm -rf /tmp/infernix-openpencil-force
+            mkdir -p "$HOME/.local/state"
+            export PATH="${pkgs.coreutils}/bin:$HOME/bin"
+            ${openpencilForceSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilForceSample.config.home.activation.infernixOpenPencil.data}
+            ${openpencilForceSample.config.home.activation.infernixMcp.data}
+            ${pkgs.gnugrep}/bin/grep -Fq 'openpencil-desktop' "$HOME/.codex/config.toml"
+            ${pkgs.jq}/bin/jq -e '.forced | index("codex")' "$HOME/.local/state/infernix/harnesses.json"
+          '';
+          openpencilOffActivation = pkgs.writeShellScript "infernix-openpencil-off-activation" ''
+            set -eu
+            export HOME="$TMPDIR/openpencil-off-home"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            rm -rf "$HOME"
+            rm -rf /tmp/infernix-openpencil-off
+            mkdir -p "$HOME/bin" "$HOME/.local/state"
+            printf '#!/bin/sh\n' > "$HOME/bin/claude"
+            chmod +x "$HOME/bin/claude"
+            export PATH="$HOME/bin:$PATH"
+            ${openpencilOffSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilOffSample.config.home.activation.infernixOpenPencil.data}
+            ${openpencilOffSample.config.home.activation.infernixMcp.data}
+            ${pkgs.jq}/bin/jq -e '.disabled | index("claude")' "$HOME/.local/state/infernix/harnesses.json"
+            test ! -e "$HOME/.claude.json"
+          '';
+          openpencilMalformedActivation = pkgs.writeShellScript "infernix-openpencil-malformed-activation" ''
+            set -eu
+            export HOME="$TMPDIR/openpencil-malformed-home"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            rm -rf "$HOME" /tmp/infernix-openpencil-fixture
+            mkdir -p "$HOME/bin" "$HOME/.local/state"
+            printf '#!/bin/sh\n' > "$HOME/bin/claude"
+            chmod +x "$HOME/bin/claude"
+            printf '%s\n' '{' > "$HOME/.claude.json"
+            export PATH="$HOME/bin:$PATH"
+            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+            if ( ${openpencilSample.config.home.activation.infernixMcp.data} ); then
+              echo "malformed JSON unexpectedly succeeded" >&2
+              exit 1
+            fi
+            test "$(cat "$HOME/.claude.json")" = "{"
+          '';
           graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
             set -eu
             export HOME="$TMPDIR/graphify-home"
@@ -1016,7 +1141,10 @@
           openpencil-mcp = pkgs.runCommand "infernix-openpencil-mcp-check" { } ''
             test "${openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.command}" = "${openpencilFixturePackage}/bin/openpencil-desktop"
             test "${builtins.elemAt openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.args 0}" = "--mcp"
-            grep -Fq 'INFERNIX_OPENPENCIL_PLAN' ${openpencilActivation}
+            ${openpencilActivation}
+            ${openpencilForceActivation}
+            ${openpencilOffActivation}
+            ${openpencilMalformedActivation}
             touch "$out"
           '';
 

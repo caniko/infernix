@@ -199,7 +199,7 @@ async fn retrying_buffered_json(
 ) -> Response {
     let requested = match requested_model(&body) {
         Ok(model) => model,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let mut exclusions = Vec::new();
@@ -232,7 +232,7 @@ async fn retrying_buffered_json(
 async fn chat_completions(State(state): State<AppState>, Json(mut body): Json<Value>) -> Response {
     let requested = match requested_model(&body) {
         Ok(model) => model,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let mut exclusions = Vec::new();
     let attempted = BTreeSet::new();
@@ -405,7 +405,7 @@ fn stream_response(response: reqwest::Response, guard: InFlightGuard) -> Respons
             let _keep_alive = &guard;
             bytes
         })
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error));
+        .map_err(std::io::Error::other);
     let mut out = Body::from_stream(stream).into_response();
     *out.status_mut() = status;
     *out.headers_mut() = headers;
@@ -451,7 +451,7 @@ fn filtered_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-fn requested_model(body: &Value) -> std::result::Result<String, Response> {
+fn requested_model(body: &Value) -> std::result::Result<String, Box<Response>> {
     body.get("model")
         .and_then(Value::as_str)
         .map(str::to_owned)
@@ -466,6 +466,7 @@ fn requested_model(body: &Value) -> std::result::Result<String, Response> {
                 })),
             )
                 .into_response()
+                .into(),
         })
 }
 

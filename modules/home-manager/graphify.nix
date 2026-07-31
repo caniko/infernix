@@ -1,16 +1,17 @@
 # Expose Graphify through Infernix. Infernix owns the package revision,
 # endpoint/model routing, and registration of the skill with every supported
 # agent harness; Graphify only owns extraction and graph formats.
-{
-  config,
-  infernixGraphify ? null,
-  lib,
-  pkgs,
-  ...
-}: let
+{ config
+, infernixGraphify ? null
+, lib
+, pkgs
+, ...
+}:
+let
   inherit (lib) mkEnableOption mkOption types;
   cfg = config.services.infernix.graphify;
   endpoints = config.services.infernix.endpoints;
+  resolvedWorkloads = config.services.infernix.resolvedWorkloads;
   acpProviders = config.services.infernix.acp.resolvedProviders;
   system = pkgs.stdenv.hostPlatform.system;
 
@@ -45,15 +46,15 @@
 
   graphifyPackage =
     if infernixGraphify != null
-    && infernixGraphify ? packages
-    && infernixGraphify.packages ? ${system}
+      && infernixGraphify ? packages
+      && infernixGraphify.packages ? ${system}
     then infernixGraphify.packages.${system}.default
     else null;
   graphifyFullPackage =
     if infernixGraphify != null
-    && infernixGraphify ? packages
-    && infernixGraphify.packages ? ${system}
-    && infernixGraphify.packages.${system} ? full
+      && infernixGraphify ? packages
+      && infernixGraphify.packages ? ${system}
+      && infernixGraphify.packages.${system} ? full
     then infernixGraphify.packages.${system}.full
     else null;
   graphifyAcpPackage =
@@ -75,24 +76,25 @@
     then graphifyFullPackage
     else if graphifyPackage == null
     then null
-    else pkgs.symlinkJoin {
-      name = "graphify-with-openai";
-      paths = [graphifyPackage];
-      nativeBuildInputs = [pkgs.makeWrapper];
-      postBuild = ''
-        wrapProgram "$out/bin/graphify" \
-          --prefix PYTHONPATH : "${openaiPython}/${pkgs.python312.sitePackages}"
-      '';
-      meta = (graphifyPackage.meta or {}) // {mainProgram = "graphify";};
-    };
+    else
+      pkgs.symlinkJoin {
+        name = "graphify-with-openai";
+        paths = [ graphifyPackage ];
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+        postBuild = ''
+          wrapProgram "$out/bin/graphify" \
+            --prefix PYTHONPATH : "${openaiPython}/${pkgs.python312.sitePackages}"
+        '';
+        meta = (graphifyPackage.meta or { }) // { mainProgram = "graphify"; };
+      };
 
   installCommand = harness:
-    if builtins.elem harness ["kimi"]
+    if builtins.elem harness [ "kimi" ]
     then "${lib.getExe cfg.package} install --platform ${harness}"
     else "${lib.getExe cfg.package} ${harness} install";
   registrationCommands =
     if cfg.package == null
-    then []
+    then [ ]
     else map installCommand cfg.harnesses;
 
   acpProvider = acpProviders.${cfg.acp.provider} or null;
@@ -123,11 +125,13 @@
     ".trae/skills/graphify"
     ".trae-cn/skills/graphify"
   ];
-  makeGraphifyRootsWritable = lib.concatMapStringsSep "\n" (path: ''
-    if [ -e "$HOME/${path}" ]; then
-      ${pkgs.coreutils}/bin/chmod -R u+w -- "$HOME/${path}"
-    fi
-  '') graphifyInstallRoots;
+  makeGraphifyRootsWritable = lib.concatMapStringsSep "\n"
+    (path: ''
+      if [ -e "$HOME/${path}" ]; then
+        ${pkgs.coreutils}/bin/chmod -R u+w -- "$HOME/${path}"
+      fi
+    '')
+    graphifyInstallRoots;
   registrationScript = ''
     ${makeGraphifyRootsWritable}
     ${lib.concatMapStringsSep "\n" (harness: let
@@ -172,23 +176,33 @@
     if endpoint == null || cfg.model == null
     then null
     else endpoint.models.${cfg.model} or null;
+  workloadProfile =
+    if cfg.workloadProfile == null
+    then null
+    else resolvedWorkloads.${cfg.workloadProfile} or null;
   baseUrl =
     if endpoint == null || endpoint.url == null
     then null
     else if lib.hasSuffix "/v1" endpoint.url
     then endpoint.url
     else "${endpoint.url}/v1";
-  generatedSettings =
-    if !cfg.enable
-    then {}
-    else if cfg.semanticBackend == "acp" && acpProvider != null then {
-      GRAPHIFY_SEMANTIC_BACKEND = "acp";
-      GRAPHIFY_ACP_BIN = acpProvider.command;
-      GRAPHIFY_ACP_ARGS_JSON = builtins.toJSON acpProvider.args;
-      GRAPHIFY_ACP_CONFIG_JSON = builtins.toJSON acpConfigOptions;
-      GRAPHIFY_ACP_MODEL = cfg.acp.model;
-    } // acpProvider.environment
-    else if endpoint == null || model == null || baseUrl == null then { }
+  openaiSettings =
+    if workloadProfile != null
+    then
+      let
+        route = workloadProfile.routing.primary;
+      in
+      {
+        GRAPHIFY_SEMANTIC_BACKEND = "openai";
+        OPENAI_BASE_URL = route.baseUrl;
+        OPENAI_MODEL = route.model;
+      } // lib.optionalAttrs (!workloadProfile.routing.credentialRequired) {
+        # Local OpenAI-compatible clients often require a non-empty key even
+        # when the selected endpoint does not authenticate requests.
+        OPENAI_API_KEY = "sk-infernix-local";
+      }
+    else if endpoint == null || model == null || baseUrl == null
+    then { }
     else {
       GRAPHIFY_SEMANTIC_BACKEND = "openai";
       OPENAI_BASE_URL = baseUrl;
@@ -198,7 +212,19 @@
       # outside the configured local endpoint.
       OPENAI_API_KEY = "sk-infernix-local";
     };
-in {
+  generatedSettings =
+    if !cfg.enable
+    then { }
+    else if cfg.semanticBackend == "acp" && acpProvider != null then {
+      GRAPHIFY_SEMANTIC_BACKEND = "acp";
+      GRAPHIFY_ACP_BIN = acpProvider.command;
+      GRAPHIFY_ACP_ARGS_JSON = builtins.toJSON acpProvider.args;
+      GRAPHIFY_ACP_CONFIG_JSON = builtins.toJSON acpConfigOptions;
+      GRAPHIFY_ACP_MODEL = cfg.acp.model;
+    } // acpProvider.environment
+    else openaiSettings;
+in
+{
   options.services.infernix.graphify = {
     enable = mkEnableOption "Graphify semantic extraction through Infernix";
 
@@ -236,6 +262,17 @@ in {
       type = types.str;
       default = "dsv4";
       description = "Model key from the selected Infernix endpoint.";
+    };
+
+    workloadProfile = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Optional generic workload profile from
+        services.infernix.workloads. When set, the profile owns endpoint,
+        model, capability, health, timeout, fallback, execution, and lease
+        facts; Graphify remains only a consumer of the resolved projection.
+      '';
     };
 
     package = mkOption {
@@ -294,15 +331,19 @@ in {
         message = "services.infernix.graphify.package must resolve to a Graphify package when Graphify is enabled.";
       }
       {
-        assertion = cfg.semanticBackend == "acp" || endpoints ? ${cfg.endpoint};
+        assertion = cfg.workloadProfile == null || resolvedWorkloads ? ${cfg.workloadProfile};
+        message = "services.infernix.graphify.workloadProfile refers to '${toString cfg.workloadProfile}', which is not declared in services.infernix.workloads.";
+      }
+      {
+        assertion = cfg.semanticBackend == "acp" || cfg.workloadProfile != null || endpoints ? ${cfg.endpoint};
         message = "services.infernix.graphify.endpoint refers to '${cfg.endpoint}', which is not declared in services.infernix.endpoints.";
       }
       {
-        assertion = cfg.semanticBackend == "acp" || endpoint == null || endpoint.type == "llama-swap";
+        assertion = cfg.semanticBackend == "acp" || cfg.workloadProfile != null || endpoint == null || endpoint.type == "llama-swap";
         message = "services.infernix.graphify.endpoint '${cfg.endpoint}' must be a llama-swap endpoint (OpenAI-compatible).";
       }
       {
-        assertion = cfg.semanticBackend == "acp" || endpoint == null || endpoint.models ? ${cfg.model};
+        assertion = cfg.semanticBackend == "acp" || cfg.workloadProfile != null || endpoint == null || endpoint.models ? ${cfg.model};
         message = "services.infernix.graphify.model '${cfg.model}' is not defined on endpoint '${cfg.endpoint}'.";
       }
       {
@@ -321,8 +362,8 @@ in {
     # lib.getExe on the null package in standalone fixtures.
     #
     # (The generated endpoint settings remain available even when disabled.)
-    home.packages = lib.mkIf (cfg.enable && cfg.package != null) [cfg.package];
-    home.activation.infernixGraphify = lib.mkIf cfg.enable (lib.hm.dag.entryAfter ["writeBoundary"] ''
+    home.packages = lib.mkIf (cfg.enable && cfg.package != null) [ cfg.package ];
+    home.activation.infernixGraphify = lib.mkIf cfg.enable (lib.hm.dag.entryAfter [ "writeBoundary" ] ''
       cd "$HOME"
       ${registrationScript}
     '');

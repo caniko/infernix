@@ -45,8 +45,192 @@ let
     };
   };
 
+  profileRouteSubmodule = types.submodule {
+    options = {
+      endpoint = mkOption {
+        type = types.str;
+        description = "Logical endpoint name for this route.";
+      };
+
+      baseUrl = mkOption {
+        type = types.str;
+        description = "Non-secret OpenAI-compatible base URL.";
+      };
+
+      model = mkOption {
+        type = types.str;
+        description = "Model identifier sent to the endpoint.";
+      };
+
+      healthUrl = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Health URL required when health-aware routing is enabled.";
+      };
+    };
+  };
+
+  profileSubmodule = types.submodule ({ name, ... }: {
+    options = {
+      workload = mkOption {
+        type = types.str;
+        default = name;
+        description = "Stable generic workload identifier.";
+      };
+
+      routing = {
+        primary = mkOption {
+          type = profileRouteSubmodule;
+          description = "Primary endpoint route.";
+        };
+
+        fallback = mkOption {
+          type = types.nullOr profileRouteSubmodule;
+          default = null;
+          description = "Optional deterministic fallback route.";
+        };
+
+        capability = mkOption {
+          type = types.enum [ "chat" "embeddings" "rerank" ];
+          description = "Capability required from every selected route.";
+        };
+
+        locality = mkOption {
+          type = types.enum [ "local-only" "network-allowed" ];
+          default = "local-only";
+          description = "Network locality permitted by this workload.";
+        };
+
+        dataResidency = mkOption {
+          type = types.enum [ "local-only" "eu" "ch" "us" "unrestricted" ];
+          default = "local-only";
+          description = "Data-residency requirement for this workload.";
+        };
+
+        healthAware = mkOption {
+          type = types.bool;
+          default = true;
+          description = "Require endpoint health before selecting a route.";
+        };
+
+        timeoutSecs = mkOption {
+          type = types.ints.positive;
+          default = 300;
+          description = "Bounded request timeout for the workload route.";
+        };
+
+        retry = {
+          maxAttempts = mkOption {
+            type = types.ints.positive;
+            default = 1;
+            description = "Maximum route attempts, including the primary.";
+          };
+
+          backoffSecs = mkOption {
+            type = types.ints.unsigned;
+            default = 0;
+            description = "Delay between retry/fallback attempts.";
+          };
+        };
+
+        credentialRequired = mkOption {
+          type = types.bool;
+          default = false;
+          description = "Whether the selected endpoint requires a credential.";
+        };
+      };
+
+      execution = {
+        adapter = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Logical adapter name; command paths stay in adapters.";
+        };
+
+        queues = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          description = "Queues the logical adapter may execute.";
+        };
+      };
+
+      lease = {
+        enabled = mkOption {
+          type = types.bool;
+          default = false;
+          description = "Enable durable lease/fencing for this workload.";
+        };
+
+        concurrency = mkOption {
+          type = types.ints.positive;
+          default = 1;
+          description = "Maximum concurrent leases for this profile.";
+        };
+
+        durationSecs = mkOption {
+          type = types.ints.positive;
+          default = 900;
+          description = "Lease duration in seconds.";
+        };
+
+        heartbeatSecs = mkOption {
+          type = types.ints.positive;
+          default = 30;
+          description = "Lease heartbeat interval in seconds.";
+        };
+
+        maxAttempts = mkOption {
+          type = types.ints.positive;
+          default = 3;
+          description = "Maximum execution attempts for one desired job.";
+        };
+      };
+    };
+  });
+
+  renderRoute = route: {
+    endpoint = route.endpoint;
+    base_url = route.baseUrl;
+    model = route.model;
+  } // lib.optionalAttrs (route.healthUrl != null) {
+    health_url = route.healthUrl;
+  };
+
+  renderProfile = _name: profile: {
+    schema_version = 1;
+    workload = profile.workload;
+    routing = {
+      primary = renderRoute profile.routing.primary;
+      capability = profile.routing.capability;
+      locality = profile.routing.locality;
+      data_residency = profile.routing.dataResidency;
+      health_aware = profile.routing.healthAware;
+      timeout_secs = profile.routing.timeoutSecs;
+      retry = {
+        max_attempts = profile.routing.retry.maxAttempts;
+        backoff_secs = profile.routing.retry.backoffSecs;
+      };
+      credential_required = profile.routing.credentialRequired;
+    } // lib.optionalAttrs (profile.routing.fallback != null) {
+      fallback = renderRoute profile.routing.fallback;
+    };
+    execution = {
+      queues = profile.execution.queues;
+    } // lib.optionalAttrs (profile.execution.adapter != null) {
+      adapter = profile.execution.adapter;
+    };
+    lease = {
+      enabled = profile.lease.enabled;
+      concurrency = profile.lease.concurrency;
+      duration_secs = profile.lease.durationSecs;
+      heartbeat_secs = profile.lease.heartbeatSecs;
+      max_attempts = profile.lease.maxAttempts;
+    };
+  };
+
   configFile = (pkgs.formats.toml { }).generate "infernix-workerd.toml" ({
     database_url_env = cfg.databaseUrlEnv;
+    profiles = lib.mapAttrsToList renderProfile cfg.profiles;
     worker = {
       id = cfg.workerId;
       capabilities = cfg.capabilities;
@@ -88,6 +272,13 @@ in
       default = infernixSelf.packages.${pkgs.stdenv.hostPlatform.system}.infernix-workerd;
       defaultText = lib.literalExpression "inputs.infernix.packages.<system>.infernix-workerd";
       description = "Package providing the PostgreSQL-backed infernix-workerd executable.";
+    };
+
+    configFile = mkOption {
+      type = types.path;
+      readOnly = true;
+      default = configFile;
+      description = "Resolved non-secret worker configuration.";
     };
 
     databaseUrlEnv = mkOption {
@@ -162,6 +353,16 @@ in
       default = { };
       description = "Workload adapters available to this worker.";
     };
+
+    profiles = mkOption {
+      type = types.attrsOf profileSubmodule;
+      default = { };
+      description = ''
+        Generic typed routing, execution, and lease profiles. Profile output
+        contains only endpoint facts and logical adapter names; credentials,
+        source, prompts, and executable command lines are not serialized here.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -180,7 +381,39 @@ in
         assertion = adapter.queues != [ ];
         message = "services.infernix.workloadFabric.adapters.${name}.queues must not be empty.";
       })
-      cfg.adapters;
+      cfg.adapters
+    ++ lib.concatLists (lib.mapAttrsToList
+      (name: profile: [
+        {
+          assertion = !profile.routing.healthAware || profile.routing.primary.healthUrl != null;
+          message = "services.infernix.workloadFabric.profiles.${name} requires a primary healthUrl for health-aware routing.";
+        }
+        {
+          assertion = profile.routing.fallback == null || profile.routing.fallback.healthUrl != null || !profile.routing.healthAware;
+          message = "services.infernix.workloadFabric.profiles.${name} requires a fallback healthUrl for health-aware routing.";
+        }
+        {
+          assertion = profile.routing.fallback == null || profile.routing.retry.maxAttempts > 1;
+          message = "services.infernix.workloadFabric.profiles.${name}.routing.retry.maxAttempts must be greater than one when fallback is configured.";
+        }
+        {
+          assertion = profile.execution.adapter != null || profile.execution.queues == [ ];
+          message = "services.infernix.workloadFabric.profiles.${name}.execution.queues requires an adapter.";
+        }
+        {
+          assertion = !profile.lease.enabled || profile.execution.adapter != null;
+          message = "services.infernix.workloadFabric.profiles.${name}.lease.enabled requires an execution adapter.";
+        }
+        {
+          assertion = !profile.lease.enabled || profile.execution.queues != [ ];
+          message = "services.infernix.workloadFabric.profiles.${name}.lease.enabled requires an execution queue.";
+        }
+        {
+          assertion = !profile.lease.enabled || profile.lease.heartbeatSecs < profile.lease.durationSecs;
+          message = "services.infernix.workloadFabric.profiles.${name}.lease.heartbeatSecs must be less than durationSecs.";
+        }
+      ])
+      cfg.profiles);
 
     systemd.services.infernix-workload-migrate = {
       description = "Prepare the Infernix durable workload schema";

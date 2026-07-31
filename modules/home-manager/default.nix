@@ -2,6 +2,7 @@
   imports = [
     ./model-providers.nix
     ./endpoints.nix
+    ./workloads.nix
     ./acp.nix
     ./harnesses.nix
     ./mcp.nix

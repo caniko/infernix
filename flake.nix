@@ -432,6 +432,36 @@
                     command = "/bin/canix";
                     args = [ "graphify" "run-job" ];
                   };
+                  profiles.semantic = {
+                    routing = {
+                      primary = {
+                        endpoint = "local-lb";
+                        baseUrl = "http://127.0.0.1:8014/v1";
+                        model = "fixture-model";
+                        healthUrl = "http://127.0.0.1:8014/healthz";
+                      };
+                      fallback = {
+                        endpoint = "local-fallback";
+                        baseUrl = "http://127.0.0.1:8015/v1";
+                        model = "fixture-model";
+                        healthUrl = "http://127.0.0.1:8015/healthz";
+                      };
+                      capability = "chat";
+                      timeoutSecs = 42;
+                      retry.maxAttempts = 2;
+                    };
+                    execution = {
+                      adapter = "graphify-adapter";
+                      queues = [ "semantic" ];
+                    };
+                    lease = {
+                      enabled = true;
+                      concurrency = 2;
+                      durationSecs = 90;
+                      heartbeatSecs = 30;
+                      maxAttempts = 3;
+                    };
+                  };
                 };
               }
             ];
@@ -737,11 +767,79 @@
                 services.infernix.endpoints.local = {
                   type = "llama-swap";
                   url = "http://127.0.0.1:8013";
+                  healthUrl = "http://127.0.0.1:8013/healthz";
                   models.dsv4.name = "dsv4";
+                  models.dsv4.capabilities = [ "chat" ];
+                };
+                services.infernix.workloads.semantic = {
+                  routing = {
+                    endpoint = "local";
+                    model = "dsv4";
+                    capability = "chat";
+                  };
                 };
                 services.infernix.graphify = {
                   enable = true;
-                  endpoint = "local";
+                  workloadProfile = "semantic";
+                };
+              }
+            ];
+          };
+          workloadProfileSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                services.infernix.endpoints = {
+                  primary = {
+                    type = "llama-swap";
+                    url = "http://127.0.0.1:8014";
+                    healthUrl = "http://127.0.0.1:8014/healthz";
+                    models.semantic = {
+                      name = "fixture-model";
+                      capabilities = [ "chat" ];
+                    };
+                  };
+                  fallback = {
+                    type = "llama-swap";
+                    url = "http://127.0.0.1:8015";
+                    healthUrl = "http://127.0.0.1:8015/healthz";
+                    models.semantic = {
+                      name = "fixture-model";
+                      capabilities = [ "chat" ];
+                    };
+                  };
+                };
+                services.infernix.workloads.semantic = {
+                  routing = {
+                    endpoint = "primary";
+                    model = "semantic";
+                    capability = "chat";
+                    healthAware = true;
+                    timeoutSecs = 42;
+                    retry.maxAttempts = 2;
+                    fallback = {
+                      endpoint = "fallback";
+                      model = "semantic";
+                    };
+                    credentialRef = "opaque-fixture-reference";
+                  };
+                  execution = {
+                    adapter = "fixture-adapter";
+                    queues = [ "semantic" ];
+                  };
+                  lease = {
+                    enabled = true;
+                    concurrency = 2;
+                    durationSecs = 90;
+                    heartbeatSecs = 30;
+                    maxAttempts = 3;
+                  };
                 };
               }
             ];
@@ -1266,6 +1364,27 @@
             printf '%s' "$requires" | ${pkgs.jq}/bin/jq -e 'index("infernix-workload-migrate.service")'
             queues='${builtins.toJSON workloadFabricSample.config.services.infernix.workloadFabric.adapters.graphify.queues}'
             printf '%s' "$queues" | ${pkgs.jq}/bin/jq -e '.[0] == "code" and .[1] == "semantic"'
+            grep -Fq 'timeout_secs = 42' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+            grep -Fq 'heartbeat_secs = 30' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+            grep -Fq 'health_url = "http://127.0.0.1:8014/healthz"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+            ! grep -Eiq 'opaque-fixture-reference|prompt|source' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+            touch "$out"
+          '';
+
+          workload-profile = pkgs.runCommand "infernix-workload-profile-check" { } ''
+            profile='${builtins.toJSON workloadProfileSample.config.services.infernix.resolvedWorkloads.semantic}'
+            printf '%s' "$profile" | ${pkgs.jq}/bin/jq -e '
+              .schemaVersion == 1
+              and .routing.primary.capability == "chat"
+              and .routing.fallback.endpoint == "fallback"
+              and .routing.healthAware == true
+              and .routing.timeoutSecs == 42
+              and .execution.adapter == "fixture-adapter"
+              and .lease.heartbeatSecs == 30
+              and .lease.maxAttempts == 3
+              and .routing.credentialRequired == true
+            '
+            ! printf '%s' "$profile" | ${pkgs.jq}/bin/jq -e 'tostring | test("opaque-fixture-reference|prompt|source")'
             touch "$out"
           '';
 

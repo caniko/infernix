@@ -37,6 +37,8 @@ pub enum WorkloadError {
     StaleLease { job: String },
     #[error("job `{0}` is already terminal")]
     TerminalJob(String),
+    #[error("invalid workload profile field `{field}`")]
+    InvalidProfile { field: &'static str },
 }
 
 macro_rules! identifier {
@@ -71,6 +73,196 @@ identifier!(JobId, "job id");
 identifier!(WorkerId, "worker id");
 identifier!(InputFingerprint, "input fingerprint");
 identifier!(ArtifactDigest, "artifact digest");
+
+/// API capabilities advertised by an endpoint model.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Capability {
+    Chat,
+    Embeddings,
+    Rerank,
+}
+
+/// Network locality required by a workload route.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Locality {
+    LocalOnly,
+    NetworkAllowed,
+}
+
+/// Data-residency constraint carried by a workload route.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DataResidency {
+    LocalOnly,
+    Eu,
+    Ch,
+    Us,
+    Unrestricted,
+}
+
+/// Non-secret endpoint information used by a resolved route.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EndpointRoute {
+    pub endpoint: String,
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub health_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RetryProfile {
+    pub max_attempts: u32,
+    pub backoff_secs: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RoutingProfile {
+    pub primary: EndpointRoute,
+    #[serde(default)]
+    pub fallback: Option<EndpointRoute>,
+    pub capability: Capability,
+    pub locality: Locality,
+    pub data_residency: DataResidency,
+    pub health_aware: bool,
+    pub timeout_secs: u64,
+    pub retry: RetryProfile,
+    /// Only the presence of a credential is exposed. The value and its
+    /// reference remain outside this profile and are never serialized here.
+    pub credential_required: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ExecutionProfile {
+    #[serde(default)]
+    pub adapter: Option<String>,
+    #[serde(default)]
+    pub queues: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LeaseProfile {
+    pub enabled: bool,
+    pub concurrency: usize,
+    pub duration_secs: u64,
+    pub heartbeat_secs: u64,
+    pub max_attempts: u32,
+}
+
+/// Versioned, generic producer-side contract for routed workload execution.
+///
+/// The profile contains only resolved routing facts and logical adapter names.
+/// Workload payloads, source text, prompts, credentials, and executable command
+/// lines stay outside the profile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkloadProfile {
+    pub schema_version: u32,
+    pub workload: String,
+    pub routing: RoutingProfile,
+    #[serde(default)]
+    pub execution: ExecutionProfile,
+    pub lease: LeaseProfile,
+}
+
+impl WorkloadProfile {
+    pub fn validate(&self) -> Result<(), WorkloadError> {
+        if self.schema_version == 0 {
+            return Err(WorkloadError::InvalidProfile {
+                field: "schema_version",
+            });
+        }
+        if self.workload.trim().is_empty() {
+            return Err(WorkloadError::InvalidProfile { field: "workload" });
+        }
+        validate_route(&self.routing.primary, self.routing.health_aware)?;
+        if let Some(fallback) = &self.routing.fallback {
+            validate_route(fallback, self.routing.health_aware)?;
+            if self.routing.retry.max_attempts < 2 {
+                return Err(WorkloadError::InvalidProfile {
+                    field: "routing.retry.max_attempts",
+                });
+            }
+        }
+        if self.routing.timeout_secs == 0 {
+            return Err(WorkloadError::InvalidProfile {
+                field: "routing.timeout_secs",
+            });
+        }
+        if self.routing.retry.max_attempts == 0 {
+            return Err(WorkloadError::InvalidProfile {
+                field: "routing.retry.max_attempts",
+            });
+        }
+        if let Some(adapter) = &self.execution.adapter {
+            if adapter.trim().is_empty() || self.execution.queues.is_empty() {
+                return Err(WorkloadError::InvalidProfile { field: "execution" });
+            }
+        } else if !self.execution.queues.is_empty() {
+            return Err(WorkloadError::InvalidProfile {
+                field: "execution.adapter",
+            });
+        }
+        if self.lease.enabled {
+            if self.lease.concurrency == 0 {
+                return Err(WorkloadError::InvalidProfile {
+                    field: "lease.concurrency",
+                });
+            }
+            if self.lease.duration_secs == 0 || self.lease.heartbeat_secs == 0 {
+                return Err(WorkloadError::InvalidProfile {
+                    field: "lease.duration_secs",
+                });
+            }
+            if self.lease.heartbeat_secs >= self.lease.duration_secs {
+                return Err(WorkloadError::InvalidProfile {
+                    field: "lease.heartbeat_secs",
+                });
+            }
+            if self.lease.max_attempts == 0 {
+                return Err(WorkloadError::InvalidProfile {
+                    field: "lease.max_attempts",
+                });
+            }
+            if self.execution.adapter.is_none() {
+                return Err(WorkloadError::InvalidProfile {
+                    field: "execution.adapter",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_route(route: &EndpointRoute, health_aware: bool) -> Result<(), WorkloadError> {
+    if route.endpoint.trim().is_empty() {
+        return Err(WorkloadError::InvalidProfile {
+            field: "routing.endpoint",
+        });
+    }
+    if route.base_url.trim().is_empty() {
+        return Err(WorkloadError::InvalidProfile {
+            field: "routing.base_url",
+        });
+    }
+    if route.model.trim().is_empty() {
+        return Err(WorkloadError::InvalidProfile {
+            field: "routing.model",
+        });
+    }
+    if health_aware
+        && route
+            .health_url
+            .as_deref()
+            .is_none_or(|url| url.trim().is_empty())
+    {
+        return Err(WorkloadError::InvalidProfile {
+            field: "routing.health_url",
+        });
+    }
+    Ok(())
+}
 
 /// A random token fencing one particular lease generation.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -682,5 +874,79 @@ mod tests {
         assert!(sql::CLAIM.contains("worker.drained = FALSE"));
         assert!(sql::COMPLETE.contains("lease_boot_id = $3"));
         assert!(sql::SCHEMA.contains("UNIQUE (workload, queue, input_fingerprint)"));
+    }
+
+    fn profile() -> WorkloadProfile {
+        WorkloadProfile {
+            schema_version: 1,
+            workload: "fixture".into(),
+            routing: RoutingProfile {
+                primary: EndpointRoute {
+                    endpoint: "primary".into(),
+                    base_url: "http://127.0.0.1:8014/v1".into(),
+                    model: "fixture-model".into(),
+                    health_url: Some("http://127.0.0.1:8014/healthz".into()),
+                },
+                fallback: Some(EndpointRoute {
+                    endpoint: "fallback".into(),
+                    base_url: "http://127.0.0.1:8015/v1".into(),
+                    model: "fixture-model".into(),
+                    health_url: Some("http://127.0.0.1:8015/healthz".into()),
+                }),
+                capability: Capability::Chat,
+                locality: Locality::LocalOnly,
+                data_residency: DataResidency::LocalOnly,
+                health_aware: true,
+                timeout_secs: 42,
+                retry: RetryProfile {
+                    max_attempts: 2,
+                    backoff_secs: 1,
+                },
+                credential_required: true,
+            },
+            execution: ExecutionProfile {
+                adapter: Some("fixture-adapter".into()),
+                queues: BTreeSet::from(["semantic".into()]),
+            },
+            lease: LeaseProfile {
+                enabled: true,
+                concurrency: 2,
+                duration_secs: 90,
+                heartbeat_secs: 30,
+                max_attempts: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn workload_profile_serializes_typed_routes_and_lease_without_sensitive_data() {
+        let profile = profile();
+        profile.validate().unwrap();
+        let json = serde_json::to_string(&profile).unwrap();
+
+        assert!(json.contains("\"capability\":\"chat\""));
+        assert!(json.contains("\"timeout_secs\":42"));
+        assert!(json.contains("\"heartbeat_secs\":30"));
+        assert!(json.contains("\"max_attempts\":3"));
+        assert!(!json.contains("api_key"));
+        assert!(!json.contains("prompt"));
+        assert!(!json.contains("source"));
+    }
+
+    #[test]
+    fn health_aware_profiles_require_healthy_primary_and_fallback_routes() {
+        let mut missing_primary_health = profile();
+        missing_primary_health.routing.primary.health_url = None;
+        assert_eq!(
+            missing_primary_health.validate(),
+            Err(WorkloadError::InvalidProfile {
+                field: "routing.health_url"
+            })
+        );
+
+        let mut no_fallback = profile();
+        no_fallback.routing.fallback = None;
+        no_fallback.routing.retry.max_attempts = 1;
+        no_fallback.validate().unwrap();
     }
 }

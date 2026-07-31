@@ -2,7 +2,7 @@
 
 <!-- simit:badges:start -->
 
-[![CI](https://img.shields.io/badge/CI-drift-2088ff)](.forgejo/workflows/ci.yaml) [![Nix](https://img.shields.io/badge/Nix-managed-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/infernix-lb)
+![CI](https://img.shields.io/badge/CI-managed-2088ff) [![Nix](https://img.shields.io/badge/Nix-managed-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/infernix-lb)
 
 <!-- simit:badges:end -->
 
@@ -95,7 +95,7 @@ Additional opt-in Home Manager modules:
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     home-manager.url = "github:nix-community/home-manager";
-    infernix.url = "codeberg:caniko/infernix";
+    infernix.url = "github:caniko/infernix";
   };
 
   outputs = {nixpkgs, home-manager, infernix, ...}: {
@@ -234,7 +234,7 @@ Early. The module API may still change without deprecation warnings.
 
 ## CI
 
-Woodpecker CI on Codeberg runs `nix flake check` on every push and pull request to verify that all module definitions evaluate correctly.
+GitHub Actions runs the generated package checks on every push and pull request to verify that all module definitions evaluate correctly.
 
 ## License
 

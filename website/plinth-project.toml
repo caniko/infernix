@@ -10,11 +10,11 @@ href = "#overview"
 
 [[nav]]
 label = "Source"
-href = "ssh://git@codeberg.org/caniko/infernix.git"
+href = "https://github.com/caniko/infernix"
 
 [[footer_links]]
 label = "Source"
-href = "ssh://git@codeberg.org/caniko/infernix.git"
+href = "https://github.com/caniko/infernix"
 
 [[pages]]
 slug = "index"
@@ -29,7 +29,7 @@ subtitle = "Declarative NixOS and home-manager modules for self-hosted AI/ML inf
 
 [[pages.sections.ctas]]
 label = "View source"
-href = "ssh://git@codeberg.org/caniko/infernix.git"
+href = "https://github.com/caniko/infernix"
 primary = true
 
 [[pages.sections]]

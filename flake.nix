@@ -151,7 +151,7 @@
 
       nixosModules = {
         visual-rubric = {
-          imports = [./modules/nixos/visual-rubric.nix];
+          imports = [ ./modules/nixos/visual-rubric.nix ];
           _module.args.infernixVisualRubric = visual-rubric;
         };
         default =
@@ -161,9 +161,15 @@
           }: {
             imports = [
               ./modules/nixos
+              ./modules/nixos/hermes-dashboard-instances.nix
               # Re-export upstream NixOS modules under the same default import
               # path so consumers get their options for free.
               hermes-agent.nixosModules.default
+            ]
+            ++ lib.optional
+              (hermes-agent.nixosModules ? instances)
+              hermes-agent.nixosModules.instances
+            ++ [
               hermes-webui.nixosModules.default
             ]
             ++ lib.optional
@@ -337,26 +343,27 @@
           graphifyNixosSample =
             if graphifyNixosModuleAvailable
             then
-              nixpkgs.lib.nixosSystem {
-                inherit system;
-                modules = [
-                  self.nixosModules.default
-                  {
-                    system.stateVersion = "24.11";
-                    services.graphify = {
-                      enable = true;
-                      instances.postgresql = {
-                        source.postgresql = {
-                          enable = true;
-                          database = "infernix";
+              nixpkgs.lib.nixosSystem
+                {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.default
+                    {
+                      system.stateVersion = "24.11";
+                      services.graphify = {
+                        enable = true;
+                        instances.postgresql = {
+                          source.postgresql = {
+                            enable = true;
+                            database = "infernix";
+                          };
+                          extraction.onCalendar = "daily";
+                          server.enable = true;
                         };
-                        extraction.onCalendar = "daily";
-                        server.enable = true;
                       };
-                    };
-                  }
-                ];
-              }
+                    }
+                  ];
+                }
             else null;
           workloadFabricSample = nixpkgs.lib.nixosSystem {
             inherit system;
@@ -500,6 +507,15 @@
                       };
                     };
                   };
+                  instances.iris = {
+                    enable = true;
+                    settings.toolsets = [ "all" ];
+                  };
+                };
+
+                services.infernix.hermes-dashboard.instances.iris = {
+                  enable = true;
+                  port = 9120;
                 };
               }
             ];
@@ -878,6 +894,10 @@
             test "${fleetLegacyLanIpSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"
             test "${hermesAgentSample.config.services.hermes-agent.user}" = "hermes"
             test "${hermesAgentSample.config.services.hermes-agent.group}" = "hermes"
+            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.User}" = "hermes-iris"
+            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.environment.HERMES_HOME}" = "/var/lib/hermes-iris/.hermes"
+            test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.serviceConfig.User}" = "hermes-iris"
+            test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.environment.HERMES_HOME}" = "/var/lib/hermes-iris/.hermes"
             touch "$out"
           '';
 
@@ -989,19 +1009,21 @@
             touch "$out"
           '';
 
-          codex-acp-closure = let
-            closure = pkgs.closureInfo {
-              rootPaths = [ self.packages.${system}.codex-acp ];
-            };
-          in pkgs.runCommand "infernix-codex-acp-closure-check" { } ''
-            package=${self.packages.${system}.codex-acp}
-            test -x "$package/bin/codex-acp"
-            test -f "$package/libexec/codex-acp/index.js"
-            test ! -e "$package/lib/node_modules"
-            test "$(find "$package" -type f | wc -l)" -eq 2
-            test "$(grep -Fxc '${pkgs.codex}' ${closure}/store-paths)" -eq 1
-            touch "$out"
-          '';
+          codex-acp-closure =
+            let
+              closure = pkgs.closureInfo {
+                rootPaths = [ self.packages.${system}.codex-acp ];
+              };
+            in
+            pkgs.runCommand "infernix-codex-acp-closure-check" { } ''
+              package=${self.packages.${system}.codex-acp}
+              test -x "$package/bin/codex-acp"
+              test -f "$package/libexec/codex-acp/index.js"
+              test ! -e "$package/lib/node_modules"
+              test "$(find "$package" -type f | wc -l)" -eq 2
+              test "$(grep -Fxc '${pkgs.codex}' ${closure}/store-paths)" -eq 1
+              touch "$out"
+            '';
 
           graphify-nixos-module =
             if graphifyNixosModuleAvailable

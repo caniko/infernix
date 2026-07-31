@@ -41,6 +41,119 @@ let
 
   baseHermesSettings = recursiveUpdate (recursiveUpdate legacyFleetSettings modelRoutingSettings) cfg.settings;
 
+  instanceSettings = instanceCfg:
+    recursiveUpdate
+      (if instanceCfg.modelRouting.enable
+      then
+        renderHermesModelRouting
+          {
+            inherit fleetBaseUrl;
+            cloudRouterBaseUrl = config.services.infernix.cloud-router.baseUrl;
+            profile = instanceCfg.modelRouting.profile;
+          }
+      else { })
+      instanceCfg.settings;
+
+  instanceModule = { config, name, ... }: {
+    options = {
+      enable = mkEnableOption "Hermes Agent instance ${name}";
+
+      package = mkOption {
+        type = types.nullOr types.package;
+        default = hermesAgentPackage;
+        description = "Hermes Agent package for this instance.";
+      };
+
+      modelRouting = {
+        enable = mkEnableOption "generated Hermes routing for this instance";
+
+        profile = mkOption {
+          type = types.attrs;
+          default = { };
+          description = "Pkl-generated model-routing profile for this instance.";
+        };
+      };
+
+      user = mkOption {
+        type = types.str;
+        default = "hermes-${name}";
+        description = "System user running this instance.";
+      };
+
+      group = mkOption {
+        type = types.str;
+        default = "hermes-${name}";
+        description = "System group running this instance.";
+      };
+
+      createUser = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Create the instance user and group.";
+      };
+
+      stateDir = mkOption {
+        type = types.str;
+        default = "/var/lib/hermes-${name}";
+        description = "State directory for this instance.";
+      };
+
+      workingDirectory = mkOption {
+        type = types.str;
+        default = "/var/lib/hermes-${name}/workspace";
+        description = "Working directory for this instance.";
+      };
+
+      settings = mkOption {
+        type = types.attrs;
+        default = { };
+        description = "Hermes settings for this instance.";
+      };
+
+      environment = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        description = "Non-secret environment values for this instance.";
+      };
+
+      environmentFiles = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "KEY=value files appended to this instance's .env.";
+      };
+
+      documents = mkOption {
+        type = types.attrsOf (types.either types.str types.path);
+        default = { };
+        description = "Workspace documents installed for this instance.";
+      };
+
+      extraPackages = mkOption {
+        type = types.listOf types.package;
+        default = [ ];
+        description = "Packages exposed to this instance.";
+      };
+
+      extraArgs = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Extra arguments passed to this instance's gateway.";
+      };
+
+      restart = mkOption {
+        type = types.str;
+        default = "always";
+        description = "systemd Restart= policy.";
+      };
+
+      restartSec = mkOption {
+        type = types.int;
+        default = 5;
+        description = "systemd RestartSec= value.";
+      };
+    };
+  };
+
   scheduledCfg = cfg.scheduledSettings;
   scheduleEnabled = scheduledCfg.enable;
   configYamlMode = if cfg.addToSystemPackages then "0660" else "0640";
@@ -382,110 +495,153 @@ in
         description = "Interactive users who get a ~/.hermes symlink to the service stateDir.";
       };
     };
+
+    instances = mkOption {
+      type = types.attrsOf (types.submodule instanceModule);
+      default = { };
+      description = "Independent native Hermes Agent instances.";
+    };
   };
 
-  config = mkIf cfg.enable (mkMerge [
-    {
-      assertions = [
-        {
-          assertion = cfg.package != null;
-          message = ''
-            services.infernix.hermes-agent: the upstream hermes-agent package is
-            not available for the host system `${system}`. Ensure the
-            hermes-agent flake supports this system.
-          '';
+  config = mkMerge [
+    (mkIf cfg.enable (mkMerge [
+      {
+        assertions = [
+          {
+            assertion = cfg.package != null;
+            message = ''
+              services.infernix.hermes-agent: the upstream hermes-agent package is
+              not available for the host system `${system}`. Ensure the
+              hermes-agent flake supports this system.
+            '';
+          }
+        ]
+        ++ lib.optional scheduleEnabled {
+          assertion = scheduledCfg.profiles != { };
+          message = "services.infernix.hermes-agent.scheduledSettings: at least one profile is required when enabled.";
         }
-      ]
-      ++ lib.optional scheduleEnabled {
-        assertion = scheduledCfg.profiles != { };
-        message = "services.infernix.hermes-agent.scheduledSettings: at least one profile is required when enabled.";
-      }
-      ++ lib.optional scheduleEnabled {
-        assertion = scheduledCfg.switches != { };
-        message = "services.infernix.hermes-agent.scheduledSettings: at least one switch is required when enabled.";
-      }
-      ++ lib.optionals scheduleEnabled (
-        lib.mapAttrsToList
-          (name: switch: {
-            assertion = builtins.hasAttr switch.profile scheduledCfg.profiles;
-            message = "services.infernix.hermes-agent.scheduledSettings.switches.${name}: profile '${switch.profile}' is not defined.";
-          })
-          scheduledCfg.switches
-      )
-      ++ lib.optionals scheduleEnabled (
-        lib.mapAttrsToList
-          (name: switch: {
-            assertion = builtins.match "\\*-\\*-\\* ([0-9][0-9]):([0-9][0-9]):([0-9][0-9])" switch.onCalendar != null;
-            message = "services.infernix.hermes-agent.scheduledSettings.switches.${name}.onCalendar must use daily '*-*-* HH:MM:SS' form.";
-          })
-          scheduledCfg.switches
-      );
+        ++ lib.optional scheduleEnabled {
+          assertion = scheduledCfg.switches != { };
+          message = "services.infernix.hermes-agent.scheduledSettings: at least one switch is required when enabled.";
+        }
+        ++ lib.optionals scheduleEnabled (
+          lib.mapAttrsToList
+            (name: switch: {
+              assertion = builtins.hasAttr switch.profile scheduledCfg.profiles;
+              message = "services.infernix.hermes-agent.scheduledSettings.switches.${name}: profile '${switch.profile}' is not defined.";
+            })
+            scheduledCfg.switches
+        )
+        ++ lib.optionals scheduleEnabled (
+          lib.mapAttrsToList
+            (name: switch: {
+              assertion = builtins.match "\\*-\\*-\\* ([0-9][0-9]):([0-9][0-9]):([0-9][0-9])" switch.onCalendar != null;
+              message = "services.infernix.hermes-agent.scheduledSettings.switches.${name}.onCalendar must use daily '*-*-* HH:MM:SS' form.";
+            })
+            scheduledCfg.switches
+        );
 
-      services.hermes-agent = {
-        enable = true;
-        package = cfg.package;
+        services.hermes-agent = {
+          enable = true;
+          package = cfg.package;
 
-        inherit (cfg) user group stateDir addToSystemPackages
-          environmentFiles environment documents extraPackages
-          extraPlugins extraPythonPackages extraDependencyGroups
-          configFile authFile authFileForceOverwrite extraArgs restart restartSec;
+          inherit (cfg) user group stateDir addToSystemPackages
+            environmentFiles environment documents extraPackages
+            extraPlugins extraPythonPackages extraDependencyGroups
+            configFile authFile authFileForceOverwrite extraArgs restart restartSec;
 
-        settings = baseHermesSettings;
+          settings = baseHermesSettings;
 
-        mcpServers = cfg.mcpServers;
+          mcpServers = cfg.mcpServers;
 
-        container = {
-          enable = cfg.container.enable;
-          backend = cfg.container.backend;
-          extraVolumes = cfg.container.extraVolumes;
-          extraOptions = cfg.container.extraOptions;
-          image = cfg.container.image;
-          hostUsers = cfg.container.hostUsers;
+          container = {
+            enable = cfg.container.enable;
+            backend = cfg.container.backend;
+            extraVolumes = cfg.container.extraVolumes;
+            extraOptions = cfg.container.extraOptions;
+            image = cfg.container.image;
+            hostUsers = cfg.container.hostUsers;
+          };
         };
-      };
-    }
+      }
 
-    (mkIf scheduleEnabled {
-      systemd.services =
-        {
-          hermes-agent-scheduled-settings-bootstrap = {
-            description = "Select scheduled Hermes settings profile";
-            before = [ "hermes-agent.service" ];
-            wantedBy = [ "multi-user.target" ];
-            serviceConfig = {
-              Type = "oneshot";
-              ExecStart = "${bootstrapHermesSchedule}";
-            };
-          };
-
-          hermes-agent = {
-            after = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
-            requires = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
-          };
-        }
-        // lib.mapAttrs'
-          (name: switch:
-            lib.nameValuePair "hermes-agent-scheduled-settings-${name}" {
-              description = "Switch Hermes settings profile to ${switch.profile}";
+      (mkIf scheduleEnabled {
+        systemd.services =
+          {
+            hermes-agent-scheduled-settings-bootstrap = {
+              description = "Select scheduled Hermes settings profile";
+              before = [ "hermes-agent.service" ];
+              wantedBy = [ "multi-user.target" ];
               serviceConfig = {
                 Type = "oneshot";
-                ExecStart = "${switchHermesSchedule} ${lib.escapeShellArg switch.profile} --restart";
+                ExecStart = "${bootstrapHermesSchedule}";
+              };
+            };
+
+            hermes-agent = {
+              after = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
+              requires = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
+            };
+          }
+          // lib.mapAttrs'
+            (name: switch:
+              lib.nameValuePair "hermes-agent-scheduled-settings-${name}" {
+                description = "Switch Hermes settings profile to ${switch.profile}";
+                serviceConfig = {
+                  Type = "oneshot";
+                  ExecStart = "${switchHermesSchedule} ${lib.escapeShellArg switch.profile} --restart";
+                };
+              })
+            scheduledCfg.switches;
+
+        systemd.timers = lib.mapAttrs'
+          (name: switch:
+            lib.nameValuePair "hermes-agent-scheduled-settings-${name}" {
+              description = "Activate Hermes settings profile ${switch.profile}";
+              wantedBy = [ "timers.target" ];
+              timerConfig = {
+                OnCalendar = "${switch.onCalendar} ${scheduledCfg.timeZone}";
+                Persistent = true;
+                Unit = "hermes-agent-scheduled-settings-${name}.service";
               };
             })
           scheduledCfg.switches;
+      })
+    ]))
 
-      systemd.timers = lib.mapAttrs'
-        (name: switch:
-          lib.nameValuePair "hermes-agent-scheduled-settings-${name}" {
-            description = "Activate Hermes settings profile ${switch.profile}";
-            wantedBy = [ "timers.target" ];
-            timerConfig = {
-              OnCalendar = "${switch.onCalendar} ${scheduledCfg.timeZone}";
-              Persistent = true;
-              Unit = "hermes-agent-scheduled-settings-${name}.service";
+    {
+      assertions = lib.concatLists (lib.mapAttrsToList
+        (name: instanceCfg:
+          lib.optional (instanceCfg.enable && instanceCfg.package == null) {
+            assertion = false;
+            message = "services.infernix.hermes-agent.instances.${name}: no Hermes package is available for this host system `${system}`.";
+          })
+        cfg.instances);
+
+      services.hermes-agent.instances = lib.mkMerge (lib.mapAttrsToList
+        (name: instanceCfg:
+          lib.optionalAttrs instanceCfg.enable {
+            "${name}" = {
+              enable = true;
+              package = instanceCfg.package;
+              inherit (instanceCfg)
+                user
+                group
+                createUser
+                stateDir
+                workingDirectory
+                environmentFiles
+                environment
+                documents
+                extraPackages
+                extraArgs
+                restart
+                restartSec
+                ;
+              settings = instanceSettings instanceCfg;
             };
           })
-        scheduledCfg.switches;
-    })
-  ]);
+        cfg.instances);
+    }
+  ];
 }

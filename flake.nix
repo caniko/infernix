@@ -48,7 +48,7 @@
 
     hermes-agent = {
       # Temporary fork pin until NousResearch/hermes-agent#75946 lands.
-      url = "github:caniko/hermes-agent/0403ab07af02f6215df503748bfec6271b9ddd29";
+      url = "github:caniko/hermes-agent/9748d68ece1db36ae7116c48e0b74912ba4a99d9";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 

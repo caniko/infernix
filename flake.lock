@@ -938,17 +938,17 @@
         "uv2nix": "uv2nix_2"
       },
       "locked": {
-        "lastModified": 1785566788,
-        "narHash": "sha256-76OaZPF3v6KUS7nXXcyV1gWYLgWGgO/GTkCKloNI7m8=",
+        "lastModified": 1785591986,
+        "narHash": "sha256-a0AQOg9eRsVJ99YfHn7NR0e+HwHF2zG3p1bSo4jbVeE=",
         "owner": "caniko",
         "repo": "hermes-agent",
-        "rev": "0403ab07af02f6215df503748bfec6271b9ddd29",
+        "rev": "9748d68ece1db36ae7116c48e0b74912ba4a99d9",
         "type": "github"
       },
       "original": {
         "owner": "caniko",
         "repo": "hermes-agent",
-        "rev": "0403ab07af02f6215df503748bfec6271b9ddd29",
+        "rev": "9748d68ece1db36ae7116c48e0b74912ba4a99d9",
         "type": "github"
       }
     },

@@ -14,7 +14,7 @@ let
     then infernixHermesAgent.packages.${system}.default
     else null;
 
-  instanceModule = { name, ... }: {
+  instanceModule = { config, name, ... }: {
     options = {
       enable = lib.mkEnableOption "Hermes dashboard instance ${name}";
 
@@ -67,7 +67,7 @@ let
 
       workingDirectory = mkOption {
         type = types.str;
-        default = "/var/lib/hermes-${name}/workspace";
+        default = "${config.stateDir}/workspace";
         description = "Working directory for dashboard chat sessions.";
       };
 
@@ -236,6 +236,8 @@ let
       };
     } else { };
   instanceConfigs = lib.mapAttrsToList mkInstance cfg.instances;
+  enabledPorts = map (instance: instance.port)
+    (lib.filter (instance: instance.enable) (lib.attrValues cfg.instances));
 in
 {
   options.services.infernix.hermes-dashboard.instances = mkOption {
@@ -245,7 +247,12 @@ in
   };
 
   config = {
-    assertions = lib.concatMap (instance: instance.assertions or [ ]) instanceConfigs;
+    assertions = [
+      {
+        assertion = lib.length enabledPorts == lib.length (lib.unique enabledPorts);
+        message = "services.infernix.hermes-dashboard.instances: enabled instances must use unique ports.";
+      }
+    ] ++ lib.concatMap (instance: instance.assertions or [ ]) instanceConfigs;
     networking = lib.mkMerge (map (instance: instance.networking or { }) instanceConfigs);
     systemd = lib.mkMerge (map (instance: instance.systemd or { }) instanceConfigs);
     users = lib.mkMerge (map (instance: instance.users or { }) instanceConfigs);

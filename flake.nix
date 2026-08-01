@@ -494,6 +494,9 @@
                   };
                   instances.iris = {
                     enable = true;
+                    stateDir = "/srv/hermes-iris";
+                    allowedToolsets = [ "web" "vision" ];
+                    readOnlyState = true;
                     settings.toolsets = [ "all" ];
                   };
                 };
@@ -501,6 +504,7 @@
                 services.infernix.hermes-dashboard.instances.iris = {
                   enable = true;
                   port = 9120;
+                  stateDir = "/srv/hermes-iris";
                 };
               }
             ];
@@ -779,9 +783,13 @@
             test "${hermesAgentSample.config.services.hermes-agent.user}" = "hermes"
             test "${hermesAgentSample.config.services.hermes-agent.group}" = "hermes"
             test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.User}" = "hermes-iris"
-            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.environment.HERMES_HOME}" = "/var/lib/hermes-iris/.hermes"
+            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.environment.HERMES_HOME}" = "/srv/hermes-iris/.hermes"
+            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.environment.HERMES_ALLOWED_TOOLSETS}" = "web,vision"
+            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.WorkingDirectory}" = "/srv/hermes-iris/workspace"
+            printf '%s\n' '${builtins.toJSON hermesAgentSample.config.services.hermes-agent.instances.iris.settings}' | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'
+            test "${nixpkgs.lib.boolToString (builtins.elem "/srv/hermes-iris/.hermes/config.yaml" hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.ReadOnlyPaths)}" = "true"
             test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.serviceConfig.User}" = "hermes-iris"
-            test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.environment.HERMES_HOME}" = "/var/lib/hermes-iris/.hermes"
+            test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.environment.HERMES_HOME}" = "/srv/hermes-iris/.hermes"
             touch "$out"
           '';
 

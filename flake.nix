@@ -47,7 +47,8 @@
     rust-overlay.follows = "rs-harbor/rust-overlay";
 
     hermes-agent = {
-      url = "github:NousResearch/hermes-agent";
+      # Temporary fork pin until NousResearch/hermes-agent#75946 lands.
+      url = "github:caniko/hermes-agent/0403ab07af02f6215df503748bfec6271b9ddd29";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 

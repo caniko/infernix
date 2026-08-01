@@ -43,16 +43,18 @@ let
 
   instanceSettings = instanceCfg:
     recursiveUpdate
-      (if instanceCfg.modelRouting.enable
-      then
-        renderHermesModelRouting
-          {
-            inherit fleetBaseUrl;
-            cloudRouterBaseUrl = config.services.infernix.cloud-router.baseUrl;
-            profile = instanceCfg.modelRouting.profile;
-          }
-      else { })
-      instanceCfg.settings;
+      baseHermesSettings
+      (recursiveUpdate
+        (if instanceCfg.modelRouting.enable
+        then
+          renderHermesModelRouting
+            {
+              inherit fleetBaseUrl;
+              cloudRouterBaseUrl = config.services.infernix.cloud-router.baseUrl;
+              profile = instanceCfg.modelRouting.profile;
+            }
+        else { })
+        instanceCfg.settings);
 
   instanceModule = { config, name, ... }: {
     options = {
@@ -100,7 +102,7 @@ let
 
       workingDirectory = mkOption {
         type = types.str;
-        default = "/var/lib/hermes-${name}/workspace";
+        default = "${config.stateDir}/workspace";
         description = "Working directory for this instance.";
       };
 
@@ -138,6 +140,18 @@ let
         type = types.listOf types.str;
         default = [ ];
         description = "Extra arguments passed to this instance's gateway.";
+      };
+
+      allowedToolsets = mkOption {
+        type = types.nullOr (types.listOf types.str);
+        default = null;
+        description = "Hard allowlist of toolsets for this instance.";
+      };
+
+      readOnlyState = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Protect this instance's Nix-managed config and environment files.";
       };
 
       restart = mkOption {
@@ -450,6 +464,18 @@ in
       description = "Extra command-line arguments for hermes gateway.";
     };
 
+    allowedToolsets = mkOption {
+      type = types.nullOr (types.listOf types.str);
+      default = null;
+      description = "Hard allowlist of toolsets for the singleton service.";
+    };
+
+    readOnlyState = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Protect the singleton's Nix-managed config and environment files.";
+    };
+
     restart = mkOption {
       type = types.str;
       default = "always";
@@ -548,7 +574,8 @@ in
           inherit (cfg) user group stateDir addToSystemPackages
             environmentFiles environment documents extraPackages
             extraPlugins extraPythonPackages extraDependencyGroups
-            configFile authFile authFileForceOverwrite extraArgs restart restartSec;
+            configFile authFile authFileForceOverwrite extraArgs restart restartSec
+            allowedToolsets readOnlyState;
 
           settings = baseHermesSettings;
 
@@ -630,14 +657,19 @@ in
                 createUser
                 stateDir
                 workingDirectory
-                environmentFiles
-                environment
-                documents
-                extraPackages
-                extraArgs
                 restart
                 restartSec
                 ;
+              environmentFiles = cfg.environmentFiles ++ instanceCfg.environmentFiles;
+              environment = cfg.environment // instanceCfg.environment;
+              documents = cfg.documents // instanceCfg.documents;
+              extraPackages = cfg.extraPackages ++ instanceCfg.extraPackages;
+              extraArgs = cfg.extraArgs ++ instanceCfg.extraArgs;
+              allowedToolsets =
+                if instanceCfg.allowedToolsets != null
+                then instanceCfg.allowedToolsets
+                else cfg.allowedToolsets;
+              readOnlyState = cfg.readOnlyState || instanceCfg.readOnlyState;
               settings = instanceSettings instanceCfg;
             };
           })

@@ -1019,8 +1019,20 @@
             catalog = modelCatalogSample;
             endpoint = "atlas-lb";
           };
+          nvidiaGpuOverrides = (import ./lib/gpu.nix { lib = nixpkgs.lib; }).systemdGpuOverrides {
+            vendor = "nvidia";
+            visibleDevices = [ "0" ];
+          };
         in
         {
+          nvidia-gpu-systemd-overrides = pkgs.runCommand "infernix-nvidia-gpu-systemd-overrides-check" { } ''
+            test "${nvidiaGpuOverrides.ProcSubset.content}" = all
+            test "${nvidiaGpuOverrides.LimitMEMLOCK}" = infinity
+            test "${nvidiaGpuOverrides.DevicePolicy.content}" = auto
+            test "${builtins.elemAt nvidiaGpuOverrides.Environment 0}" = CUDA_VISIBLE_DEVICES=0
+            touch "$out"
+          '';
+
           pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" { } ''
             test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
             test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-embedding-8b"

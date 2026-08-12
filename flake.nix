@@ -23,7 +23,7 @@
     };
 
     rs-harbor = {
-      url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+      url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=c26b735eede8078f795651c4a9cbf0be8733b221";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -34,6 +34,13 @@
 
     nix-pklx = {
       url = "git+https://codeberg.org/caniko/nix-pklx.git";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    openpencil = {
+      # Consume the dependent integration branch until the minimal flake PR
+      # lands; this branch contains the manifest/runtime surface.
+      url = "github:caniko/openpencil/agent/openpencil-integration-publish";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -68,6 +75,7 @@
     , rs-harbor
     , fleetix
     , nix-pklx
+    , openpencil
     , rust-overlay
     , hermes-agent
     , hermes-webui
@@ -92,7 +100,7 @@
 
       mkCargoPackageWithCrane = { pkgs, packageName }:
         let
-          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; };
+          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
           inherit (toolchain) craneLib;
           source = ./.;
           src = craneLib.cleanCargoSource source;
@@ -139,6 +147,7 @@
       lib = {
         inherit mkLbPackageForPkgs;
         modelCatalog = import ./lib/model-catalog.nix { lib = nixpkgs.lib; };
+        openpencilSupport = true;
       };
 
       nixosModules = {
@@ -194,6 +203,20 @@
           _module.args.infernixVisualRubric = visual-rubric;
           _module.args.infernixGraphify = graphify;
           _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
+          _module.args.infernixPonytail = self.packages.${pkgs.stdenv.hostPlatform.system}.ponytail;
+        };
+        opencode = {
+          imports = [
+            ./modules/home-manager/model-providers.nix
+            ./modules/home-manager/opencode.nix
+          ];
+        };
+        claude-code = { pkgs, ... }: {
+          imports = [
+            ./modules/home-manager/model-providers.nix
+            ./modules/home-manager/claude-code.nix
+          ];
+          _module.args.infernixCodexProvider = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-provider;
         };
         # Opt-in sub-module that writes programs.goose.* from the
         # services.infernix.goose outputs. Only import for users that also
@@ -210,6 +233,14 @@
         # services.infernix.endpoints. Only import for users that also
         # configure services.infernix.hermes-agent.
         hermes-agent = import ./modules/home-manager/hermes-agent-programs.nix;
+        openpencil = { pkgs, ... }: {
+          imports = [
+            ./modules/home-manager/harnesses.nix
+            ./modules/home-manager/mcp.nix
+            ./modules/home-manager/openpencil.nix
+          ];
+          _module.args.infernixOpenPencil = openpencil;
+        };
       };
 
       packages = forAllPackageSystems (system:
@@ -238,6 +269,8 @@
         {
           inherit infernix-lb infernix-workerd;
           codex-acp = pkgs.callPackage ./packages/codex-acp.nix { };
+          codex-provider = pkgs.callPackage ./packages/codex-provider.nix { };
+          ponytail = pkgs.callPackage ./packages/ponytail.nix { };
           graphify =
             graphify.packages.${system}.full
               or graphify.packages.${system}.default;
@@ -289,7 +322,7 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; };
+          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
           cross = rs-harbor.lib.mkCross { inherit pkgs system; };
         in
         {
@@ -323,6 +356,36 @@
               }
             ];
           };
+          claudeCodeSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              self.homeModules.claude-code
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                services.infernix.claude-code.enable = true;
+              }
+            ];
+          };
+          opencodeModelSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              self.homeModules.opencode
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+              }
+            ];
+          };
+          claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.xdg.configFile."claude-code-router/config.json".source);
           graphifyNixosModuleAvailable =
             graphify ? nixosModules
             && graphify.nixosModules ? default;
@@ -683,6 +746,68 @@
               }
             ];
           };
+          ponytailHarnesses = [
+            "agents"
+            "aider"
+            "amp"
+            "antigravity"
+            "claude"
+            "cline"
+            "claw"
+            "codebuddy"
+            "codewhale"
+            "codex"
+            "copilot"
+            "copilot-cli"
+            "cursor"
+            "devin"
+            "droid"
+            "gemini"
+            "hermes"
+            "jules"
+            "junie"
+            "kilo"
+            "kiro"
+            "kimi"
+            "opencode"
+            "pi"
+            "qoder"
+            "swival"
+            "trae"
+            "trae-cn"
+            "vscode"
+            "windsurf"
+            "zed"
+          ];
+          ponytailSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = [
+              self.homeModules.default
+              {
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                services.infernix.ponytail = {
+                  enable = true;
+                  runtimeDir = "/tmp/infernix-ponytail-fixture";
+                };
+              }
+            ];
+          };
+          ponytailActivation = pkgs.writeShellScript "infernix-ponytail-harness-registration" ''
+            set -eu
+            export HOME="$TMPDIR/ponytail-home"
+            rm -rf "$HOME" /tmp/infernix-ponytail-fixture
+            mkdir -p "$HOME/.opencode" "$HOME/.codex"
+            printf '%s\n' '# existing user guidance' > "$HOME/AGENTS.md"
+            printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}' > "$HOME/.codex/hooks.json"
+            printf '%s\n' '[hooks.state]' > "$HOME/.codex/config.toml"
+            printf '%s\n' '{"plugin":["plugins/graphify.js"]}' > "$HOME/.opencode/opencode.json"
+            ${ponytailSample.config.home.activation.infernixPonytail.data}
+            ${ponytailSample.config.home.activation.infernixPonytail.data}
+          '';
           graphifyExpectedPackageName =
             if graphify.packages.${system} ? full
             then graphify.packages.${system}.full.name
@@ -704,6 +829,166 @@
               }
             ];
           };
+          openpencilFixturePackage = pkgs.runCommand "openpencil-fixture" { } ''
+            mkdir -p "$out/bin" "$out/share/openpencil"
+            printf '#!/bin/sh\n' > "$out/bin/openpencil-desktop"
+            chmod +x "$out/bin/openpencil-desktop"
+            printf '{"version":"fixture","children":[]}\n' > "$out/share/openpencil/default.op"
+          '';
+          openpencilFixture = {
+            lib.integrationManifest = {
+              integration = {
+                packages.prebuiltRuntime = "runtime-prebuilt";
+                executables.desktop = "openpencil-desktop";
+                documentTemplate = "share/openpencil/default.op";
+                harnesses = {
+                  claude = { format = "json"; configPath = "~/.claude.json"; serverKey = "openpencil"; };
+                  codex = { format = "toml"; configPath = "~/.codex/config.toml"; serverKey = "openpencil"; };
+                  hermes = { format = "nix"; configPath = ""; serverKey = "openpencil"; };
+                };
+              };
+            };
+            packages.${system}.runtime-prebuilt = openpencilFixturePackage;
+          };
+          openpencilFixtureModules = [
+            ./modules/home-manager/harnesses.nix
+            ./modules/home-manager/mcp.nix
+            ./modules/home-manager/openpencil.nix
+          ];
+          openpencilSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = openpencilFixtureModules ++ [
+              {
+                _module.args.infernixOpenPencil = openpencilFixture;
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                xdg.enable = true;
+                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
+                services.infernix.openpencil = {
+                  enable = true;
+                  document = "/tmp/infernix-openpencil-fixture/agent.op";
+                };
+                services.infernix.mcp.servers.extra = {
+                  command = "/bin/extra-mcp";
+                  key = "extra";
+                  harnesses = [ "claude" ];
+                };
+              }
+            ];
+          };
+          openpencilForceSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = openpencilFixtureModules ++ [
+              {
+                _module.args.infernixOpenPencil = openpencilFixture;
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                xdg.enable = true;
+                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
+                services.infernix.openpencil.enable = true;
+                services.infernix.openpencil.document = "/tmp/infernix-openpencil-force/agent.op";
+                services.infernix.harnesses.codex.mode = "force";
+              }
+            ];
+          };
+          openpencilOffSample = home-manager.lib.homeManagerConfiguration {
+            inherit pkgs;
+            modules = openpencilFixtureModules ++ [
+              {
+                _module.args.infernixOpenPencil = openpencilFixture;
+                home = {
+                  username = "tester";
+                  homeDirectory = "/home/tester";
+                  stateVersion = "24.11";
+                };
+                xdg.enable = true;
+                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
+                services.infernix.openpencil.enable = true;
+                services.infernix.openpencil.document = "/tmp/infernix-openpencil-off/agent.op";
+                services.infernix.harnesses.claude.mode = "off";
+              }
+            ];
+          };
+          openpencilActivation = pkgs.writeShellScript "infernix-openpencil-activation" ''
+            set -eu
+            export HOME="$TMPDIR/openpencil-home"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            rm -rf "$HOME"
+            rm -rf /tmp/infernix-openpencil-fixture
+            mkdir -p "$HOME/bin" "$HOME/.local/state" "$HOME/.codex"
+            printf '#!/bin/sh\n' > "$HOME/bin/claude"
+            chmod +x "$HOME/bin/claude"
+            printf '%s\n' '{"keep":true}' > "$HOME/.claude.json"
+            printf '%s\n' '[settings]' 'keep = true' > "$HOME/.codex/config.toml"
+            export PATH="$HOME/bin:$PATH"
+            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+            ${openpencilSample.config.home.activation.infernixMcp.data}
+            ${pkgs.jq}/bin/jq -e '.keep == true and .mcpServers.openpencil.command == "${openpencilFixturePackage}/bin/openpencil-desktop" and .mcpServers.extra.command == "/bin/extra-mcp"' "$HOME/.claude.json"
+            ${pkgs.jq}/bin/jq -e '.detected | index("claude")' "$HOME/.local/state/infernix/harnesses.json"
+            ${pkgs.jq}/bin/jq -e '.unsupported | index("hermes")' "$HOME/.local/state/infernix/harnesses.json"
+            grep -Fq 'keep = true' "$HOME/.codex/config.toml"
+            test ! -e "$HOME/.codex/config.toml.bak"
+            before="$(sha256sum "$HOME/.claude.json")"
+            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+            ${openpencilSample.config.home.activation.infernixMcp.data}
+            test "$before" = "$(sha256sum "$HOME/.claude.json")"
+          '';
+          openpencilForceActivation = pkgs.writeShellScript "infernix-openpencil-force-activation" ''
+            set -eu
+            export HOME="$TMPDIR/openpencil-force-home"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            rm -rf "$HOME"
+            rm -rf /tmp/infernix-openpencil-force
+            mkdir -p "$HOME/.local/state"
+            export PATH="${pkgs.coreutils}/bin:$HOME/bin"
+            ${openpencilForceSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilForceSample.config.home.activation.infernixOpenPencil.data}
+            ${openpencilForceSample.config.home.activation.infernixMcp.data}
+            ${pkgs.gnugrep}/bin/grep -Fq 'openpencil-desktop' "$HOME/.codex/config.toml"
+            ${pkgs.jq}/bin/jq -e '.forced | index("codex")' "$HOME/.local/state/infernix/harnesses.json"
+          '';
+          openpencilOffActivation = pkgs.writeShellScript "infernix-openpencil-off-activation" ''
+            set -eu
+            export HOME="$TMPDIR/openpencil-off-home"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            rm -rf "$HOME"
+            rm -rf /tmp/infernix-openpencil-off
+            mkdir -p "$HOME/bin" "$HOME/.local/state"
+            printf '#!/bin/sh\n' > "$HOME/bin/claude"
+            chmod +x "$HOME/bin/claude"
+            export PATH="$HOME/bin:$PATH"
+            ${openpencilOffSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilOffSample.config.home.activation.infernixOpenPencil.data}
+            ${openpencilOffSample.config.home.activation.infernixMcp.data}
+            ${pkgs.jq}/bin/jq -e '.disabled | index("claude")' "$HOME/.local/state/infernix/harnesses.json"
+            test ! -e "$HOME/.claude.json"
+          '';
+          openpencilMalformedActivation = pkgs.writeShellScript "infernix-openpencil-malformed-activation" ''
+            set -eu
+            export HOME="$TMPDIR/openpencil-malformed-home"
+            export XDG_STATE_HOME="$HOME/.local/state"
+            rm -rf "$HOME" /tmp/infernix-openpencil-fixture
+            mkdir -p "$HOME/bin" "$HOME/.local/state"
+            printf '#!/bin/sh\n' > "$HOME/bin/claude"
+            chmod +x "$HOME/bin/claude"
+            printf '%s\n' '{' > "$HOME/.claude.json"
+            export PATH="$HOME/bin:$PATH"
+            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
+            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+            if ( ${openpencilSample.config.home.activation.infernixMcp.data} ); then
+              echo "malformed JSON unexpectedly succeeded" >&2
+              exit 1
+            fi
+            test "$(cat "$HOME/.claude.json")" = "{"
+          '';
           graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
             set -eu
             export HOME="$TMPDIR/graphify-home"
@@ -755,8 +1040,20 @@
             catalog = modelCatalogSample;
             endpoint = "atlas-lb";
           };
+          nvidiaGpuOverrides = (import ./lib/gpu.nix { lib = nixpkgs.lib; }).systemdGpuOverrides {
+            vendor = "nvidia";
+            visibleDevices = [ "0" ];
+          };
         in
         {
+          nvidia-gpu-systemd-overrides = pkgs.runCommand "infernix-nvidia-gpu-systemd-overrides-check" { } ''
+            test "${nvidiaGpuOverrides.ProcSubset.content}" = all
+            test "${nvidiaGpuOverrides.LimitMEMLOCK}" = infinity
+            test "${nvidiaGpuOverrides.DevicePolicy.content}" = auto
+            test "${builtins.elemAt nvidiaGpuOverrides.Environment 0}" = CUDA_VISIBLE_DEVICES=0
+            touch "$out"
+          '';
+
           pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" { } ''
             test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
             test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-embedding-8b"
@@ -838,6 +1135,60 @@
             touch "$out"
           '';
 
+          ponytail-harness-registration = pkgs.runCommand "infernix-ponytail-harness-registration-check" { } ''
+            ${ponytailActivation}
+            expected='${builtins.toJSON ponytailHarnesses}'
+            actual='${builtins.toJSON ponytailSample.config.services.infernix.ponytail.registeredHarnesses}'
+            test "$actual" = "$expected"
+            test "${ponytailSample.config.services.infernix.ponytail.adapterStatus.codex.mode}" = native
+            test "${ponytailSample.config.services.infernix.ponytail.adapterStatus.cursor.scope}" = project-only
+            test -f "$TMPDIR/ponytail-home/AGENTS.md"
+            test "$(grep -Fc '<!-- infernix-ponytail: begin -->' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
+            test "$(grep -Fc '# existing user guidance' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
+            ${pkgs.jq}/bin/jq -e '.hooks.SessionStart | length == 2' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit | length == 1' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.SessionStart[1].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit[0].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            test "$(grep -Fc 'hooks.json:session_start:1:0' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 1
+            test "$(grep -Fc 'hooks.json:user_prompt_submit:0:0' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 1
+            test "$(grep -Ec 'trusted_hash = \"sha256:[0-9a-f]{64}\"' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 2
+            ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart == null' "$TMPDIR/ponytail-home/.codex/hooks.json"
+            ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
+            ${pkgs.jq}/bin/jq -e '.plugin | index("/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs") != null' "$TMPDIR/ponytail-home/.opencode/opencode.json"
+            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
+            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
+            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs
+            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/pi-extension/index.js
+            test -L "$TMPDIR/ponytail-home/.pi/agent/extensions/ponytail"
+            test -L "$TMPDIR/ponytail-home/.gemini/extensions/ponytail"
+            test -L "$TMPDIR/ponytail-home/.openclaw/skills/ponytail"
+            test -L "$TMPDIR/ponytail-home/.codex/plugins/ponytail"
+            test -L "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/local"
+            test -d "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4"
+            test -f "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4/.codex-plugin/plugin.json"
+            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/.codex-plugin/plugin.json"
+            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/skills/ponytail/SKILL.md"
+            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/hooks/claude-codex-hooks.json"
+            grep -Fq '[plugins."ponytail@ponytail"]' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq 'enabled = true' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq '[features]' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq 'plugins = true' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq '[marketplaces.ponytail]' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq 'source_type = "local"' "$TMPDIR/ponytail-home/.codex/config.toml"
+            grep -Fq 'source = "/tmp/infernix-ponytail-fixture"' "$TMPDIR/ponytail-home/.codex/config.toml"
+            touch "$out"
+          '';
+
+          openpencil-mcp = pkgs.runCommand "infernix-openpencil-mcp-check" { } ''
+            test "${openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.command}" = "${openpencilFixturePackage}/bin/openpencil-desktop"
+            test "${builtins.elemAt openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.args 0}" = "--mcp"
+            ${openpencilActivation}
+            ${openpencilForceActivation}
+            ${openpencilOffActivation}
+            ${openpencilMalformedActivation}
+            touch "$out"
+          '';
+
           graphify-acp-provider = pkgs.runCommand "infernix-graphify-acp-provider-check" { } ''
             provider='${builtins.toJSON graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex}'
             printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.capabilities == {"image":true,"sessionConfig":true,"text":true}'
@@ -866,6 +1217,28 @@
               test "$(grep -Fxc '${pkgs.codex}' ${closure}/store-paths)" -eq 1
               touch "$out"
             '';
+
+          claude-code-routing = pkgs.runCommand "infernix-claude-code-routing-check" { } ''
+            providers='${builtins.toJSON claudeCodeRouterConfig.Providers}'
+            opencode='${builtins.toJSON opencodeModelSample.config.programs.opencode.settings.provider}'
+            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e 'map(.name) | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
+            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_base_url == "http://127.0.0.1:3967/v1/chat/completions"'
+            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "deepseek") | .api_key == "$DEEPSEEK_API_KEY"'
+            printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e 'keys | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
+            test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
+            test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"
+            test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}" = "${pkgs.claude-code-router}/bin/ccr start"
+            touch "$out"
+          '';
+
+          codex-provider-closure = pkgs.runCommand "infernix-codex-provider-closure-check" { } ''
+            package=${self.packages.${system}.codex-provider}
+            test -x "$package/bin/infernix-codex-provider"
+            test -f "$package/libexec/infernix-codex-provider/server.mjs"
+            grep -Fq 'const args = ["exec"' "$package/libexec/infernix-codex-provider/server.mjs"
+            ! grep -Eiq 'mcp|acp' "$package/libexec/infernix-codex-provider/server.mjs"
+            touch "$out"
+          '';
 
           graphify-nixos-module =
             if graphifyNixosModuleAvailable

@@ -1,5 +1,10 @@
 [ci]
-runner = "atlas-nix-trusted"
+runner = "codefloe-global"
+provider = "crow"
+platform = "forgejo"
+runtime = "nix"
+workspace = true
+publish_crates = true
 
 [ci.pages]
 repo = "caniko/infernix"

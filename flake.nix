@@ -23,7 +23,7 @@
     };
 
     rs-harbor = {
-      url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+      url = "git+ssh://git@codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=f209ddbca3fdbb0dc31fa3886ccc2ff7369c18ac";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -99,7 +99,7 @@
 
       mkCargoPackageWithCrane = { pkgs, packageName }:
         let
-          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; };
+          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
           inherit (toolchain) craneLib;
           source = ./.;
           src = craneLib.cleanCargoSource source;
@@ -315,7 +315,7 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; };
+          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
           cross = rs-harbor.lib.mkCross { inherit pkgs system; };
         in
         {

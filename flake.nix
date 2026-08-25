@@ -13,12 +13,12 @@
     };
 
     visual-rubric = {
-      url = "git+https://codeberg.org/caniko/visual-rubric.git";
+      url = "git+https://github.com/caniko/visual-rubric.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
     plinth = {
-      url = "git+https://codeberg.org/caniko/plinth.git?ref=refs/heads/trunk";
+      url = "git+https://github.com/caniko/plinth.git?ref=refs/heads/trunk";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -28,12 +28,12 @@
     };
 
     fleetix = {
-      url = "git+https://codeberg.org/caniko/fleetix.git";
+      url = "git+https://github.com/caniko/fleetix.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
     nix-pklx = {
-      url = "git+https://codeberg.org/caniko/nix-pklx.git";
+      url = "git+https://github.com/caniko/nix-pklx.git";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 

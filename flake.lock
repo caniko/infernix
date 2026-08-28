@@ -1368,7 +1368,7 @@
         "lastModified": 1785942123,
         "narHash": "sha256-vQrXcZM9iyb3f24jDjRN/HMduKnv7UCM2BeMYiSAMlk=",
         "ref": "trunk",
-        "rev": "ddf90037b3dc0648365298836b9163af35e4f0ea",
+        "rev": "de6795d347b9bfc43eb792d58a519ab5676582dc",
         "revCount": 68,
         "type": "git",
         "url": "https://codeberg.org/caniko/nix-cache-pin.git"

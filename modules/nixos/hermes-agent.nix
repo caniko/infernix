@@ -175,7 +175,7 @@ let
     lib.mapAttrs
       (name: profile:
         pkgs.writeText "hermes-agent-${name}-config.yaml"
-          (builtins.toJSON (recursiveUpdate baseHermesSettings profile.settingsOverlay)))
+          (builtins.toJSON (recursiveUpdate config.services.hermes-agent.settings profile.settingsOverlay)))
       scheduledCfg.profiles;
   dailySwitches =
     lib.mapAttrsToList

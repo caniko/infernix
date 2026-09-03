@@ -489,6 +489,10 @@
                       };
                     };
                   };
+                  mcpServers.fixture = {
+                    command = "fixture-mcp";
+                    args = [ "--stdio" ];
+                  };
                   scheduledSettings = {
                     enable = true;
                     timeZone = "America/Los_Angeles";
@@ -871,6 +875,8 @@
             catalog = modelCatalogSample;
             endpoint = "atlas-lb";
           };
+          hermesScheduledSwitch = builtins.head (nixpkgs.lib.splitString " "
+            (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart));
         in
         {
           pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" { } ''
@@ -888,6 +894,11 @@
             printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.auxiliary.vision.model == "qwen3-vl-8b"'
             printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.fallback_model[0].provider == "cloud-router"'
             printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'
+            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .mcp_servers.fixture.args == ["--stdio"]'
+            day_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-day-config.yaml' ${pkgs.lib.escapeShellArg hermesScheduledSwitch})"
+            night_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-night-config.yaml' ${pkgs.lib.escapeShellArg hermesScheduledSwitch})"
+            ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .moa.default_preset == "gpt55_mimo"' "$day_config"
+            ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .moa.default_preset == "gpt55_dsflash"' "$night_config"
             test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-day".timerConfig.OnCalendar}" = "*-*-* 09:00:00 America/Los_Angeles"
             test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-night".timerConfig.OnCalendar}" = "*-*-* 17:00:00 America/Los_Angeles"
             case ${pkgs.lib.escapeShellArg (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart)} in

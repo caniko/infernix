@@ -1028,6 +1028,7 @@
             chmod +x "$HOME/bin/claude"
             printf '%s\n' '{"keep":true}' > "$HOME/.claude.json"
             printf '%s\n' '[settings]' 'keep = true' > "$HOME/.codex/config.toml"
+            printf '%s\n' '[mcp_servers.keep]' 'command = "/bin/keep-mcp"' >> "$HOME/.codex/config.toml"
             export PATH="$HOME/bin:$PATH"
             ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
             ${openpencilSample.config.home.activation.infernixOpenPencil.data}
@@ -1036,6 +1037,10 @@
             ${pkgs.jq}/bin/jq -e '.detected | index("claude")' "$HOME/.local/state/infernix/harnesses.json"
             ${pkgs.jq}/bin/jq -e '.unsupported | index("hermes")' "$HOME/.local/state/infernix/harnesses.json"
             grep -Fq 'keep = true' "$HOME/.codex/config.toml"
+            grep -Fq '[mcp_servers.keep]' "$HOME/.codex/config.toml"
+            grep -Fq '[mcp_servers.openpencil]' "$HOME/.codex/config.toml"
+            grep -Fq 'openpencil-desktop' "$HOME/.codex/config.toml"
+            ! grep -Fq '[mcpServers.openpencil]' "$HOME/.codex/config.toml"
             test ! -e "$HOME/.codex/config.toml.bak"
             before="$(sha256sum "$HOME/.claude.json")"
             ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}

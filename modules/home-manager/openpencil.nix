@@ -34,13 +34,19 @@
     else {};
   manifestAdapter = adapter: let
     format = adapter.format or null;
-    root =
+    rawRoot =
       if adapter ? root
       then
         if builtins.isList adapter.root
         then adapter.root
         else [adapter.root]
       else ["mcpServers"];
+    # TOML MCP files use snake_case tables; the manifest default targets JSON
+    # files, so normalize the default (or an explicitly camelCase) root.
+    root =
+      if format == "toml" && rawRoot == ["mcpServers"]
+      then ["mcp_servers"]
+      else rawRoot;
     supported = lib.elem format ["json" "toml"];
   in
     if supported

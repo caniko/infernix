@@ -74,7 +74,13 @@
       units = mkOption {
         type = types.listOf types.str;
         default = ["llama-swap.service"];
-        description = "Systemd units controlled by infernix-nodectl on this node.";
+        description = "Systemd units controlled by infernix-nodectl on this node (lifecycle).";
+      };
+
+      healthUnits = mkOption {
+        type = types.nullOr (types.listOf types.str);
+        default = null;
+        description = "Systemd units required for node /healthz to report healthy. Defaults to `units` when null; set explicitly when some lifecycle units (e.g. optional backends) must not gate node health.";
       };
 
       models = mkOption {
@@ -167,6 +173,7 @@ in {
         host = nodeAddress cfg.localNodeName localNode;
         port = localNode.nodePort;
         units = localNode.units;
+        healthUnits = localNode.healthUnits;
       };
     })
   ];

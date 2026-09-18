@@ -258,6 +258,9 @@
           pkgs = nixpkgs.legacyPackages.${system};
           infernix-lb = mkLbPackage system;
           infernix-workerd = mkWorkerdPackage system;
+          # CUDA redists are unfree: resolve that toolchain from a
+          # dedicated allowUnfree pkgs, never by flipping the shared set.
+          pkgsUnfree = import nixpkgs { inherit system; config.allowUnfree = true; };
           visualRubricPackage =
             if
               builtins.hasAttr "packages" visual-rubric
@@ -291,12 +294,14 @@
             gpuArch = "gfx1100";
             rocmPackages = pkgs.rocmPackages;
           };
+          # CUDA redists are unfree (see pkgsUnfree above).
           colibri-cuda = (import ./lib/colibri-packaging.nix { lib = nixpkgs.lib; }).mkColibriGpu {
             basePackage = colibri.packages.${system}.colibri;
             backend = "cuda";
             gpuArch = "sm_89";
-            cudaPackages = pkgs.cudaPackages;
-            nvccHostCc = pkgs.gcc14;
+            cudaPackages = pkgsUnfree.cudaPackages;
+            symlinkJoin = pkgs.symlinkJoin;
+            nvccHostCc = pkgsUnfree.gcc14;
           };
           graphify =
             graphify.packages.${system}.full

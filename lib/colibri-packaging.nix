@@ -37,6 +37,7 @@ in
   #     or "portable"); ignored for cpu.
   #   rocmPackages: ROCm set providing clr (bin/hipcc, libamdhip64).
   #   cudaPackages: CUDA redist set (cuda_nvcc, cuda_cudart, libcublas).
+  #   symlinkJoin: pkgs.symlinkJoin, for assembling CUDA_HOME.
   #   nvccHostCc: package providing the g++ nvcc drives (CUDA 12.x does
   #     not support gcc 15; the Makefile's NVCC_CCBIN exists for exactly
   #     this, so pass gcc14 rather than -allow-unsupported-compiler).
@@ -46,6 +47,7 @@ in
     , gpuArch ? null
     , rocmPackages ? null
     , cudaPackages ? null
+    , symlinkJoin ? null
     , nvccHostCc ? null
     }:
     throwIfNot (builtins.elem backend backends)
@@ -54,11 +56,11 @@ in
         "infernix colibri packaging: backend '${backend}' needs an explicit gpuArch (e.g. HIP gfx1100, CUDA sm_89)"
         (throwIfNot (backend != "hip" || rocmPackages != null)
           "infernix colibri packaging: backend 'hip' needs rocmPackages (clr)"
-          (throwIfNot (backend != "cuda" || (cudaPackages != null && nvccHostCc != null))
-            "infernix colibri packaging: backend 'cuda' needs cudaPackages and nvccHostCc"
+          (throwIfNot (backend != "cuda" || (cudaPackages != null && symlinkJoin != null && nvccHostCc != null))
+            "infernix colibri packaging: backend 'cuda' needs cudaPackages, symlinkJoin, and nvccHostCc"
             (basePackage.overrideAttrs (prev:
               let
-                cudaHome = prev.cudaHome or (cudaPackages.symlinkJoin {
+                cudaHome = prev.cudaHome or (symlinkJoin {
                   name = "colibri-cuda-home";
                   paths = with cudaPackages; [cuda_nvcc cuda_cudart libcublas];
                 });

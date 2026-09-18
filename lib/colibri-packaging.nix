@@ -35,7 +35,8 @@ in
   #   backend: one of `backends`.
   #   gpuArch: `HIP_ARCH` (e.g. "gfx1100") or `CUDA_ARCH` (e.g. "sm_89"
   #     or "portable"); ignored for cpu.
-  #   rocmPackages: ROCm set providing clr (bin/hipcc, libamdhip64).
+  #   rocmPackages: ROCm set providing clr (bin/hipcc, libamdhip64) and
+  #     rocwmma (matrix-core kernel headers for WMMA-capable archs).
   #   cudaPackages: CUDA redist set (cuda_nvcc, cuda_cudart, libcublas).
   #   symlinkJoin: pkgs.symlinkJoin, for assembling CUDA_HOME.
   #   nvccHostCc: package providing the g++ nvcc drives (CUDA 12.x does
@@ -68,14 +69,19 @@ in
               {
                 pname = "${prev.pname or "colibri"}-${backend}";
                 nativeBuildInputs = (prev.nativeBuildInputs or [])
-                  ++ lib.optionals (backend == "hip") [rocmPackages.clr]
+                  ++ lib.optionals (backend == "hip") [rocmPackages.clr rocmPackages.rocwmma]
                   ++ lib.optionals (backend == "cuda")
                     (with cudaPackages; [cuda_nvcc cuda_cudart libcublas]);
                 # The Makefile links -L$(ROCM_HOME)/lib -lamdhip64 and
                 # -L$(CUDA_HOME)/lib64 -lcudart -lcublas*; NIX_LDFLAGS from
                 # these inputs covers the same dirs if the vars ever drift.
+                # rocwmma rides buildInputs so its headers land on the
+                # include path: WMMA-capable archs (e.g. gfx1100) fail the
+                # build loudly without them (backend_gpu_compat.h), and
+                # compiling them out via -DCOLI_HIP_NO_WMMA would silently
+                # surrender the tensor-core kernels on capable hardware.
                 buildInputs = (prev.buildInputs or [])
-                  ++ lib.optionals (backend == "hip") [rocmPackages.clr]
+                  ++ lib.optionals (backend == "hip") [rocmPackages.clr rocmPackages.rocwmma]
                   ++ lib.optionals (backend == "cuda")
                     (with cudaPackages; [cuda_cudart libcublas]);
               }

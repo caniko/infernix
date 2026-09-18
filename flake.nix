@@ -1211,6 +1211,7 @@
                     backend = "hip";
                     gpuDevices = "0";
                     expertGb = 20;
+                    expertSlotsPerLayer = 256;
                     releaseHost = true;
                     ctxSize = 8192;
                     ngen = 1024;

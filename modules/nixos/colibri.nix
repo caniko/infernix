@@ -123,6 +123,23 @@
         default = 1;
         description = "Concurrent generation slots (upstream range 1-16; families clamp further at launch, loudly).";
       };
+      expertSlotsPerLayer = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 256;
+        description = ''
+          Expert cache slots per layer (--cap). The qwen36 VRAM tier
+          activates ONLY when this equals the model's expert count
+          (cap == n_experts): anything less loads a partial CPU cache and
+          the engine disables the tier loudly
+          ([qtier] cap=N != n_experts=M -> tier disabled), leaving pure
+          CPU inference that VRAM readings alone would misdiagnose as a
+          slow tier. Null omits --cap and takes upstream's legacy default
+          (8 for non-GLM engines: tier always disabled). Required for
+          non-cpu backends (asserted): a gpu backend without an explicit
+          expert count is a misconfiguration, never a default.
+        '';
+      };
       maxQueue = mkOption {
         type = types.ints.unsigned;
         default = 4;
@@ -301,6 +318,8 @@
               "--queue-timeout", str(config["queueTimeout"]),
               "--kv-slots", str(config["kvSlots"]),
           ]
+          if config.get("expertSlotsPerLayer") is not None:
+              argv += ["--cap", str(config["expertSlotsPerLayer"])]
           env = dict(os.environ)
           env["COLI_API_KEY"] = api_key
           os.execve(config["coliBin"], argv, env)
@@ -445,6 +464,7 @@
       inherit (profile) maxQueue;
       inherit (profile) queueTimeout;
       inherit (profile) kvSlots;
+      expertSlotsPerLayer = profile.expertSlotsPerLayer;
       rev = profile.weightsRev;
       repo = profile.weightsRepo;
       files = map (f: f.name) profile.weightsFiles;
@@ -486,6 +506,12 @@
         message = "services.infernix.colibri: every enabled profile's backend must equal the package build flavor (passthru.colibriBackend); a mismatch would silently serve CPU while claiming VRAM";
         ok = cfg.package == null
           || builtins.all (profile: profile.backend == pkgBackend) (builtins.attrValues enabledProfiles);
+      }
+      {
+        message = "services.infernix.colibri: non-cpu backends require expertSlotsPerLayer (the qwen36 VRAM tier activates only at cap == n_experts; without it the engine silently serves CPU)";
+        ok = builtins.all
+          (profile: profile.backend == "cpu" || profile.expertSlotsPerLayer != null)
+          (builtins.attrValues enabledProfiles);
       }
       {
         message = "services.infernix.colibri: only engines with GPU-tier expert execution (${concatStringsSep ", " colibriPackaging.gpuTierEngines}) may use a non-cpu backend -- the GLM engine streams experts from disk, so a gpu build does not make it VRAM inference";

@@ -159,6 +159,20 @@
         type = types.path;
         description = "Raw COLI_API_KEY secret path; loaded as a systemd credential, never on argv.";
       };
+      admissionMarker = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/var/lib/infernix-colibri-kat-coder/admission-approved";
+        description = ''
+          Operator-created flag file the serve unit additionally requires
+          (ANDed with the weights manifest condition). wantedBy=[] does not
+          stop switch-to-configuration from starting new units, so this is
+          the actual manual-start gate: absent marker skips the unit without
+          failing boot or switch. Create it only after the GPU-admission
+          protocol verifies the GPU is drained for this profile; remove it
+          to revoke.
+        '';
+      };
       hfTokenPath = mkOption {
         type = types.nullOr types.path;
         default = null;
@@ -605,7 +619,19 @@ in
           wants = ["network-online.target"];
           # Missing or foreign-revision weights are an operator step, not a
           # boot failure; the entrypoint re-validates the manifest anyway.
-          unitConfig.ConditionPathExists = "${profile.modelDir}/ready.json";
+          # wantedBy=[] does NOT stop switch-to-configuration from starting
+          # a new unit (observed: it starts every unit new in the
+          # generation). admissionMarker is the real manual-start gate: an
+          # operator-created flag the unit requires before it may run at
+          # boot, at switch, or by hand. Absence skips the unit WITHOUT
+          # failing the switch; revoking (rm) re-arms manual control.
+          # Acceptance and GPU-admission protocols create the marker only
+          # after verifying the GPU is drained for this profile.
+          unitConfig.ConditionPathExists = [
+            "${profile.modelDir}/ready.json"
+          ] ++ lib.optionals (profile.admissionMarker != null) [
+            profile.admissionMarker
+          ];
           environment = backendEnv profile;
           serviceConfig =
             {

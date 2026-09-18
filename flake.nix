@@ -1216,6 +1216,7 @@
                     ctxSize = 8192;
                     ngen = 1024;
                     apiKeyFile = "/run/keys/fixture-colibri";
+                    admissionMarker = "/var/lib/infernix-colibri-fixture-qwen36/admission-approved";
                     weightsRepo = "Fixture/qwen36-colibri";
                     weightsRev = "aaaabbbbccccddddeeeeffff0000111122223333";
                     weightsFiles = [
@@ -1303,6 +1304,14 @@
 
           colibri = pkgs.runCommand "infernix-colibri-check" { } ''
             test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriOwnAssertions)}" = "true"
+            # wantedBy=[] does not stop switch-start: the admission marker
+            # condition is the real manual-start gate, ANDed with weights.
+            for cond in ${nixpkgs.lib.escapeShellArgs (nixpkgs.lib.toList colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".unitConfig.ConditionPathExists)}; do
+              case "$cond" in
+                */ready.json|*/admission-approved) ;;
+                *) echo "unexpected start condition: $cond" >&2; exit 1 ;;
+              esac
+            done
             test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.Type}" = "exec"
             case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
               *infernix-colibri-entrypoint*--ctx*8*) ;;

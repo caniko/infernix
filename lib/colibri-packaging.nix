@@ -34,7 +34,8 @@ in
   #   basePackage: inputs.colibri.packages.${system}.colibri (CPU build).
   #   backend: one of `backends`.
   #   gpuArch: `HIP_ARCH` (e.g. "gfx1100") or `CUDA_ARCH` (e.g. "sm_89"
-  #     or "portable"); ignored for cpu.
+  #     or "portable"); ignored for cpu. A single arch only: the HIP flag
+  #     mirror below cannot express the Makefile's multi-arch foreach.
   #   rocmPackages: ROCm set providing clr (bin/hipcc, libamdhip64) and
   #     rocwmma (matrix-core kernel headers for WMMA-capable archs).
   #   cudaPackages: CUDA redist set (cuda_nvcc, cuda_cudart, libcublas).
@@ -53,8 +54,8 @@ in
     }:
     throwIfNot (builtins.elem backend backends)
       "infernix colibri packaging: unknown backend '${backend}' (want one of ${lib.concatStringsSep ", " backends})"
-      (throwIfNot (backend == "cpu" || gpuArch != null)
-        "infernix colibri packaging: backend '${backend}' needs an explicit gpuArch (e.g. HIP gfx1100, CUDA sm_89)"
+      (throwIfNot (backend == "cpu" || (gpuArch != null && builtins.match ".* .*" gpuArch == null))
+        "infernix colibri packaging: backend '${backend}' needs one explicit gpuArch (e.g. HIP gfx1100, CUDA sm_89); multi-arch lists are not mirrored"
         (throwIfNot (backend != "hip" || rocmPackages != null)
           "infernix colibri packaging: backend 'hip' needs rocmPackages (clr)"
           (throwIfNot (backend != "cuda" || (cudaPackages != null && symlinkJoin != null && nvccHostCc != null))
@@ -89,6 +90,13 @@ in
                 HIP = "1";
                 HIP_ARCH = gpuArch;
                 ROCM_HOME = "${rocmPackages.clr}";
+                # hipcc is invoked directly by the Makefile (not via the cc
+                # wrapper), so NIX_CFLAGS_COMPILE -isystem entries never
+                # reach it and buildInputs rocwmma is invisible. HIPCCFLAGS
+                # is `?=` in the Makefile, so this env mirrors its Linux
+                # default for the pinned rev and appends the rocwmma
+                # include dir. Re-verify against the Makefile on rev bumps.
+                HIPCCFLAGS = "-O3 -std=c++17 -x hip --offload-arch=${gpuArch} -Wall -Wextra -fPIE -I${rocmPackages.rocwmma}/include";
               }
               // lib.optionalAttrs (backend == "cuda") {
                 CUDA = "1";

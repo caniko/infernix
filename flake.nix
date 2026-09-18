@@ -46,6 +46,14 @@
 
     rust-overlay.follows = "rs-harbor/rust-overlay";
 
+    # Colibri engine source for the GPU packaging flavors below.
+    # Consumers override the rev (e.g. a fork with unreleased fixes) via
+    # `<consumer>.inputs.infernix.inputs.colibri.follows`.
+    colibri = {
+      url = "github:JustVugg/colibri/f028d26b422144ed4a69ad9aeaee2553ce0f9572";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     hermes-agent = {
       # Temporary fork pin until NousResearch/hermes-agent#75946 lands.
       url = "github:caniko/hermes-agent/9748d68ece1db36ae7116c48e0b74912ba4a99d9";
@@ -80,6 +88,7 @@
     , hermes-agent
     , hermes-webui
     , graphify
+    , colibri
     ,
     }:
     let
@@ -147,6 +156,7 @@
       lib = {
         inherit mkLbPackageForPkgs;
         modelCatalog = import ./lib/model-catalog.nix { lib = nixpkgs.lib; };
+        colibriPackaging = import ./lib/colibri-packaging.nix { lib = nixpkgs.lib; };
         openpencilSupport = true;
       };
 
@@ -271,6 +281,23 @@
           codex-acp = pkgs.callPackage ./packages/codex-acp.nix { };
           codex-provider = pkgs.callPackage ./packages/codex-provider.nix { };
           ponytail = pkgs.callPackage ./packages/ponytail.nix { };
+          # Colibri GPU flavors. Default archs target the first consumer's
+          # hosts (Atlas gfx1100, Nomad sm_89); the lib function takes any
+          # arch, and consumers pass their own pinned toolchains for
+          # cache-pin alignment.
+          colibri-hip = (import ./lib/colibri-packaging.nix { lib = nixpkgs.lib; }).mkColibriGpu {
+            basePackage = colibri.packages.${system}.colibri;
+            backend = "hip";
+            gpuArch = "gfx1100";
+            rocmPackages = pkgs.rocmPackages;
+          };
+          colibri-cuda = (import ./lib/colibri-packaging.nix { lib = nixpkgs.lib; }).mkColibriGpu {
+            basePackage = colibri.packages.${system}.colibri;
+            backend = "cuda";
+            gpuArch = "sm_89";
+            cudaPackages = pkgs.cudaPackages;
+            nvccHostCc = pkgs.gcc14;
+          };
           graphify =
             graphify.packages.${system}.full
               or graphify.packages.${system}.default;
@@ -1151,6 +1178,104 @@
             vendor = "nvidia";
             visibleDevices = [ "0" ];
           };
+          colibriStubPackage = (pkgs.runCommand "colibri-stub" { } ''
+            mkdir -p "$out/bin"
+            printf '#!/bin/sh\nexit 0\n' > "$out/bin/coli"
+            chmod +x "$out/bin/coli"
+          '') // { passthru = { colibriBackend = "hip"; colibriGpuArch = "gfx1100"; }; };
+          colibriSample = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              {
+                system.stateVersion = "24.11";
+                services.infernix.fleet = {
+                  localNodeName = "fixture";
+                  nodes.fixture.healthUnits = [ "llama-swap.service" ];
+                };
+                services.infernix.colibri = {
+                  package = colibriStubPackage;
+                  openFirewallInterfaces = [ "wg-home" ];
+                  profiles.fixture-qwen36 = {
+                    enable = true;
+                    port = 20213;
+                    modelDir = "/data/models/colibri/fixture";
+                    stagingDir = "/data/models/colibri/.staging-fixture";
+                    modelId = "fixture-qwen36-colibri";
+                    engine = "qwen36";
+                    backend = "hip";
+                    gpuDevices = "0";
+                    expertGb = 20;
+                    releaseHost = true;
+                    ctxSize = 8192;
+                    ngen = 1024;
+                    apiKeyFile = "/run/keys/fixture-colibri";
+                    weightsRepo = "Fixture/qwen36-colibri";
+                    weightsRev = "aaaabbbbccccddddeeeeffff0000111122223333";
+                    weightsFiles = [
+                      { name = "model-00000.safetensors"; sizeBytes = 8; }
+                      { name = "tokenizer.json"; }
+                    ];
+                    weightsTotalBytes = 16;
+                  };
+                };
+              }
+            ];
+          };
+          colibriOwnAssertions = colibriSample.config.services.infernix.colibri.evalChecks;
+          # Negative samples: each varies exactly one thing from the green
+          # sample; the module must record a failing assertion, never serve.
+          colibriBadEngine = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              {
+                system.stateVersion = "24.11";
+                services.infernix.fleet = {
+                  localNodeName = "fixture";
+                  nodes.fixture.healthUnits = [ "llama-swap.service" ];
+                };
+                services.infernix.colibri = {
+                  package = colibriStubPackage;
+                  profiles.bad-glm = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36 // {
+                    engine = "glm";
+                  };
+                };
+              }
+            ];
+          };
+          colibriBadPackage = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              {
+                system.stateVersion = "24.11";
+                services.infernix.fleet = {
+                  localNodeName = "fixture";
+                  nodes.fixture.healthUnits = [ "llama-swap.service" ];
+                };
+                services.infernix.colibri = {
+                  package = colibriStubPackage // { passthru = { colibriBackend = "cpu"; colibriGpuArch = null; }; };
+                  profiles.bad-pkg = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36;
+                };
+              }
+            ];
+          };
+          colibriBadHealth = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              {
+                system.stateVersion = "24.11";
+                services.infernix.fleet.localNodeName = "fixture";
+                services.infernix.colibri = {
+                  package = colibriStubPackage;
+                  profiles.bad-health = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36;
+                };
+              }
+            ];
+          };
+          colibriBadAssertions = cfg: cfg.config.services.infernix.colibri.evalChecks;
           hermesScheduledSwitch = builtins.head (nixpkgs.lib.splitString " "
             (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart));
         in
@@ -1165,8 +1290,36 @@
 
           pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" { } ''
             test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
-            test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-embedding-8b"
+            test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-vl-8b"
             test "${pinkRavenWorkloadSample.config.services.pink-raven.settings.PINK_RAVEN_EMBEDDING_TIMEOUT_MS}" = "180000"
+            touch "$out"
+          '';
+
+          colibri = pkgs.runCommand "infernix-colibri-check" { } ''
+            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriOwnAssertions)}" = "true"
+            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.Type}" = "exec"
+            case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
+              *infernix-colibri-entrypoint*--ctx*8*) ;;
+              *) echo "serve unit must exec the manifest-gated entrypoint" >&2; exit 1 ;;
+            esac
+            case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.LoadCredential)} in
+              *coli-api-key:/run/keys/fixture-colibri*) ;;
+              *) echo "serve unit must load the key as a credential" >&2; exit 1 ;;
+            esac
+            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_CUDA}" = "1"
+            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.CUDA_RELEASE_HOST}" = "1"
+            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_GPUS}" = "0"
+            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.CUDA_EXPERT_GB}" = "20"
+            test "${toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.MemorySwapMax}" = "0"
+            test "${colibriSample.config.systemd.services."infernix-colibri-fetch-fixture-qwen36".serviceConfig.Type}" = "oneshot"
+            test "${nixpkgs.lib.boolToString (builtins.elem "infernix-colibri-fixture-qwen36.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "true"
+            test "${nixpkgs.lib.boolToString (builtins.elem 20213 colibriSample.config.networking.firewall.interfaces."wg-home".allowedTCPPorts)}" = "true"
+            # Rejections: GLM engine on a gpu backend, package/profile
+            # backend mismatch, and unpinned healthUnits must each record a
+            # failing module assertion instead of serving.
+            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadEngine))}" = "false"
+            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadPackage))}" = "false"
+            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadHealth))}" = "false"
             touch "$out"
           '';
 

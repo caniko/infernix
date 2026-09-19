@@ -22,8 +22,8 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    rs-harbor = {
-      url = "git+https://github.com/caniko/rs-harbor.git?ref=trunk&rev=7a3328e186258dca31f9801227bc4e6fd8db4f36";
+    harbor-rs = {
+      url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=7a3328e186258dca31f9801227bc4e6fd8db4f36";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -44,7 +44,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    rust-overlay.follows = "rs-harbor/rust-overlay";
+    rust-overlay.follows = "harbor-rs/rust-overlay";
 
     # Colibri engine source for the GPU packaging flavors below.
     # Consumers override the rev (e.g. a fork with unreleased fixes) via
@@ -80,7 +80,7 @@
     , home-manager
     , visual-rubric
     , plinth
-    , rs-harbor
+    , harbor-rs
     , fleetix
     , nix-pklx
     , openpencil
@@ -109,7 +109,7 @@
 
       mkCargoPackageWithCrane = { pkgs, packageName }:
         let
-          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
+          toolchain = harbor-rs.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
           inherit (toolchain) craneLib;
           source = ./.;
           src = craneLib.cleanCargoSource source;
@@ -354,11 +354,11 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          toolchain = rs-harbor.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
-          cross = rs-harbor.lib.mkCross { inherit pkgs system; };
+          toolchain = harbor-rs.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
+          cross = harbor-rs.lib.mkCross { inherit pkgs system; };
         in
         {
-          docs = rs-harbor.lib.mkDocsShell {
+          docs = harbor-rs.lib.mkDocsShell {
             inherit pkgs cross;
             inherit (toolchain) craneLib;
             packages = [ plinth.packages.${system}.plinth-project ];

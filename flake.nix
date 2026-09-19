@@ -23,7 +23,7 @@
     };
 
     rs-harbor = {
-      url = "git+https://github.com/caniko/rs-harbor.git?ref=trunk&rev=c26b735eede8078f795651c4a9cbf0be8733b221";
+      url = "git+https://github.com/caniko/rs-harbor.git?ref=trunk&rev=7a3328e186258dca31f9801227bc4e6fd8db4f36";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 

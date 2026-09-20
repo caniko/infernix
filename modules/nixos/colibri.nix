@@ -111,6 +111,11 @@
         default = false;
         description = "CUDA_RELEASE_HOST=1: GPU-tier experts drop host backing after upload (VRAM as additional pinned capacity at zero RAM cost; the engine rematerializes from disk on CPU-path misses).";
       };
+      strictResidency = mkOption {
+        type = types.bool;
+        default = false;
+        description = "COLI_STRICT_RESIDENCY=1: the qwen36 VRAM tier verifies full expert placement after warmstart and refuses (fatal) instead of serving hybrid inference. Required for non-cpu backends (asserted): without it the engine may silently serve from host RAM while VRAM readings look healthy.";
+      };
       ctxSize = mkOption {
         type = types.ints.positive;
         description = "Server context window (--ctx).";
@@ -180,12 +185,13 @@
         example = ["llama-swap.service"];
         description = ''
           Systemd units that must not be active for this profile to start.
-          Enforced by an ExecCondition guard (fail-closed: unqueryable units
-          refuse the start), so competing GPU backends can never co-run no
-          matter who starts what in which order. Refusal skips the unit
-          without failing boot, switch, or nodectl resume -- nothing is
-          ever stopped or killed. Declare both directions of every
-          exclusive pair.
+          Enforced by an ExecCondition guard (fail-closed: unqueryable or
+          not-loaded units refuse the start, so a typo or renamed peer
+          cannot silently disable exclusion), so competing GPU backends
+          can never co-run no matter who starts what in which order.
+          Refusal skips the unit without failing boot, switch, or nodectl
+          resume -- nothing is ever stopped or killed. Declare both
+          directions of every exclusive pair.
         '';
       };
       hfTokenPath = mkOption {
@@ -412,7 +418,8 @@
       CUDA_RELEASE_HOST = if profile.releaseHost then "1" else "0";
     }
     // optionalAttrs (profile.gpuDevices != null) {COLI_GPUS = profile.gpuDevices;}
-    // optionalAttrs (profile.expertGb != null) {CUDA_EXPERT_GB = toString profile.expertGb;};
+    // optionalAttrs (profile.expertGb != null) {CUDA_EXPERT_GB = toString profile.expertGb;}
+    // optionalAttrs (profile.strictResidency) {COLI_STRICT_RESIDENCY = "1";};
 
   nodeName = if cfg.nodeName != null then cfg.nodeName else config.services.infernix.fleet.localNodeName;
 
@@ -440,6 +447,12 @@
         message = "services.infernix.colibri: only engines with GPU-tier expert execution (${concatStringsSep ", " colibriPackaging.gpuTierEngines}) may use a non-cpu backend -- the GLM engine streams experts from disk, so a gpu build does not make it VRAM inference";
         ok = builtins.all
           (profile: profile.backend == "cpu" || builtins.elem profile.engine colibriPackaging.gpuTierEngines)
+          (builtins.attrValues enabledProfiles);
+      }
+      {
+        message = "services.infernix.colibri: non-cpu backends require strictResidency (COLI_STRICT_RESIDENCY=1 refuses partial placement instead of serving hybrid inference)";
+        ok = builtins.all
+          (profile: profile.backend == "cpu" || profile.strictResidency)
           (builtins.attrValues enabledProfiles);
       }
       {

@@ -9,10 +9,14 @@
   # the unit inactive without failing the job, so switch-to-configuration
   # and nodectl resume stay green.
   #
-  # Fail-closed: an unqueryable unit (D-Bus down, unknown name) refuses
-  # the start. Only `inactive` and `failed` (no live process) permit it;
+  # Fail-closed: an unqueryable unit (D-Bus down) refuses the start, and
+  # so does any unit that is not loaded (not-found, masked, ...): a
+  # nonexistent unit still reports ActiveState=inactive, so an ActiveState
+  # check alone would let a typo or renamed peer silently disable
+  # exclusion. Only `inactive` and `failed` (no live process) permit it;
   # `activating` refuses, closing the concurrent-start race to the
   # residual window where both starters check before either activates.
+  # Named properties (no --value): --value order is not contractual.
   mkExclusiveCondition = pkgs: units:
     if units == [] then [] else
       let
@@ -22,10 +26,24 @@
           text = ''
             set -euo pipefail
             for unit in "$@"; do
-              state="$(systemctl show -p ActiveState --value "$unit" 2>/dev/null)" || {
+              props="$(systemctl show -p LoadState,ActiveState "$unit" 2>/dev/null)" || {
                 echo "exclusive-gpu: cannot query $unit, refusing start" >&2
                 exit 1
               }
+              load="" state=""
+              while IFS="=" read -r name value; do
+                case "$name" in
+                  LoadState) load="$value" ;;
+                  ActiveState) state="$value" ;;
+                esac
+              done <<<"$props"
+              case "$load" in
+                loaded) ;;
+                *)
+                  echo "exclusive-gpu: refusing start, $unit load state is ''${load:-unknown}" >&2
+                  exit 1
+                  ;;
+              esac
               case "$state" in
                 inactive|failed) ;;
                 *)

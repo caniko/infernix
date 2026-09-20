@@ -15,8 +15,13 @@
 # verified; declared sha256 hashes are verified when present (none are
 # currently pinned in the catalog -- pin them from verified out-of-band
 # hashes at rollout). Downloaded hashes are always RECORDED into the
-# manifest. Startup checks sizes only (hashing 23 GB per start is not
-# acceptable); the reuse check compares names+sizes, not hashes.
+# manifest. Reuse stays size-only while the job declares no hashes, but any
+# declared hash is verified against the INSTALLED bytes before the snapshot
+# is accepted: the manifest only records what a past download hashed, which
+# cannot vouch for current disk contents (same-size corruption passes a
+# manifest comparison). Fetch is an operator-driven oneshot, so hashing the
+# payload on hash-declaring runs is acceptable; ordinary service startup
+# remains size-only.
 #
 # Credentials never appear on argv: an optional HF token is rendered into
 # a 0600 curl config file, used, and removed on exit.
@@ -75,6 +80,17 @@ if [ -f "$manifest" ] \
     if [ "$want" != "null" ] && [ "$want" != "$have_size" ]; then
       ok=0
       break
+    fi
+    want_hash=$(jq -r --arg n "$name" '.files[] | select(.name == $n) | .sha256 // empty' "$job")
+    if [ -n "$want_hash" ]; then
+      # Always hash the installed file: a manifest comparison alone trusts
+      # historical metadata over current bytes. Refusal never deletes.
+      actual_hash=$(sha256sum "$final/$name" | awk '{print $1}')
+      if [ "$actual_hash" != "$want_hash" ]; then
+        echo "infernix-colibri-fetch: sha256 mismatch for installed $name" >&2
+        ok=0
+        break
+      fi
     fi
   done < <(jq -r '.files[].name' "$job")
   if [ "$ok" = 1 ]; then

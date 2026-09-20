@@ -263,10 +263,11 @@ in {
       example = ["infernix-colibri-kat-coder.service"];
       description = ''
         Systemd units that must not be active for llama-swap to start.
-        Same fail-closed ExecCondition mechanism as the Colibri profiles:
-        refusal skips the start without failing boot, switch, or nodectl
-        resume, and nothing is ever stopped or killed. Declare both
-        directions of every exclusive pair.
+        Same fail-closed ExecCondition mechanism as the Colibri profiles
+        (unqueryable or not-loaded peers refuse the start): refusal skips
+        the start without failing boot, switch, or nodectl resume, and
+        nothing is ever stopped or killed. Declare both directions of
+        every exclusive pair.
       '';
     };
   };

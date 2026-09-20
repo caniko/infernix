@@ -1213,6 +1213,7 @@
                     expertGb = 20;
                     expertSlotsPerLayer = 256;
                     releaseHost = true;
+                    strictResidency = true;
                     ctxSize = 8192;
                     ngen = 1024;
                     apiKeyFile = "/run/keys/fixture-colibri";
@@ -1282,6 +1283,25 @@
               }
             ];
           };
+          colibriBadStrict = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              {
+                system.stateVersion = "24.11";
+                services.infernix.fleet = {
+                  localNodeName = "fixture";
+                  nodes.fixture.healthUnits = [ "llama-swap.service" ];
+                };
+                services.infernix.colibri = {
+                  package = colibriStubPackage;
+                  profiles.bad-strict = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36 // {
+                    strictResidency = false;
+                  };
+                };
+              }
+            ];
+          };
           colibriBadAssertions = cfg: cfg.config.services.infernix.colibri.evalChecks;
           hermesScheduledSwitch = builtins.head (nixpkgs.lib.splitString " "
             (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart));
@@ -1325,16 +1345,19 @@
             test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.CUDA_RELEASE_HOST}" = "1"
             test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_GPUS}" = "0"
             test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.CUDA_EXPERT_GB}" = "20"
+            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_STRICT_RESIDENCY}" = "1"
             test "${toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.MemorySwapMax}" = "0"
             test "${colibriSample.config.systemd.services."infernix-colibri-fetch-fixture-qwen36".serviceConfig.Type}" = "oneshot"
             test "${nixpkgs.lib.boolToString (builtins.elem "infernix-colibri-fixture-qwen36.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "true"
             test "${nixpkgs.lib.boolToString (builtins.elem 20213 colibriSample.config.networking.firewall.interfaces."wg-home".allowedTCPPorts)}" = "true"
             # Rejections: GLM engine on a gpu backend, package/profile
-            # backend mismatch, and unpinned healthUnits must each record a
-            # failing module assertion instead of serving.
+            # backend mismatch, unpinned healthUnits, and a gpu backend
+            # without strictResidency must each record a failing module
+            # assertion instead of serving.
             test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadEngine))}" = "false"
             test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadPackage))}" = "false"
             test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadHealth))}" = "false"
+            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadStrict))}" = "false"
             touch "$out"
           '';
 

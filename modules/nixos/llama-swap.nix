@@ -256,6 +256,19 @@ in {
       default = true;
       description = "Whether to open firewall ports for llama-swap.";
     };
+
+    exclusiveUnits = mkOption {
+      type = types.listOf types.str;
+      default = [];
+      example = ["infernix-colibri-kat-coder.service"];
+      description = ''
+        Systemd units that must not be active for llama-swap to start.
+        Same fail-closed ExecCondition mechanism as the Colibri profiles:
+        refusal skips the start without failing boot, switch, or nodectl
+        resume, and nothing is ever stopped or killed. Declare both
+        directions of every exclusive pair.
+      '';
+    };
   };
 
   config = mkIf cfg.enable (let
@@ -342,6 +355,7 @@ in {
       })
       // {
         ReadOnlyPaths = [cfg.modelsDir];
+        ExecCondition = (import ../../lib/exclusive-units.nix { inherit lib; }).mkExclusiveCondition pkgs cfg.exclusiveUnits;
       };
 
     # Model download service

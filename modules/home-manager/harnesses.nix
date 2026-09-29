@@ -1,208 +1,104 @@
+# Legacy activation policy translated into Fleetix's standalone MCP catalogue.
 {
   config,
   lib,
-  pkgs,
+  infernixFleetixLib,
   ...
 }: let
   inherit (lib) mkOption types;
-
-  mcpAdapter = types.submodule ({...}: {
-    options = {
-      format = mkOption {
-        type = types.enum ["json" "toml"];
-        description = "File format used by the harness MCP configuration.";
-      };
-      configPath = mkOption {
-        type = types.str;
-        description = "User configuration file that receives MCP registrations.";
-      };
-      root = mkOption {
-        type = types.listOf types.str;
-        default = ["mcpServers"];
-        description = "Nested table path containing MCP server entries.";
-      };
-      serverKey = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Optional per-harness key used for MCP server registration.";
-      };
-    };
-  });
-
-  harness = types.submodule ({name, ...}: {
-    options = {
-      mode = mkOption {
-        type = types.enum ["auto" "force" "off"];
-        default = "auto";
-        description = ''
-          Harness activation policy. `auto` probes the activation PATH,
-          `force` configures the harness without a command probe, and `off`
-          suppresses every integration for this harness.
-        '';
-      };
-      probe.commands = mkOption {
-        type = types.listOf types.str;
-        default = [];
-        description = "Executable names; any command found during activation detects the harness.";
-      };
-      unsupported = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = "Reason this harness has no supported generic file adapter.";
-      };
-      adapters.mcp = mkOption {
-        type = types.nullOr mcpAdapter;
-        default = null;
-        description = "MCP file adapter contributed by an integration module.";
-      };
-    };
-  });
-
-  # These are the command names that are stable enough to probe centrally.
-  # Harnesses without a CLI (or with a product-specific command name) remain
-  # usable through mode = "force" or a consumer-provided probe.commands list.
-  probeDefaults = {
-    claude = ["claude"];
-    codex = ["codex"];
-    gemini = ["gemini"];
-    hermes = ["hermes"];
-    kiro = ["kiro-cli"];
-    opencode = ["opencode"];
-    copilot = ["copilot"];
-  };
-
   cfg = config.services.infernix.harnesses;
-  registryCfg = config.services.infernix.harnessRegistry;
-  registryPlan = {
-    version = 1;
-    stateFile = registryCfg.statusFile;
-    harnesses =
-      lib.mapAttrs (_: value: {
-        inherit (value) mode unsupported;
-        probeCommands = value.probe.commands;
-        adapters = lib.optionalAttrs (value.adapters.mcp != null) {
-          mcp = value.adapters.mcp;
-        };
-      })
-      cfg;
-  };
-  resolver = pkgs.writeText "infernix-harness-resolve.py" ''
-    import json
-    import os
-    import pathlib
-    import shutil
-    import tempfile
-
-
-    def expand_path(value):
-        path = pathlib.Path(os.path.expandvars(os.path.expanduser(value)))
-        return path if path.is_absolute() else pathlib.Path.home() / path
-
-
-    def atomic_json(path, document):
-        path = expand_path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=".infernix-", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w") as handle:
-                json.dump(document, handle, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
-
-
-    plan = json.loads(os.environ["INFERNIX_HARNESS_PLAN"])
-    status = {
-        "version": plan["version"],
-        "active": [],
-        "detected": [],
-        "forced": [],
-        "disabled": [],
-        "skipped": [],
-        "unsupported": [],
-        "failed": [],
-        "harnesses": {},
-    }
-
-    for name, definition in sorted(plan["harnesses"].items()):
-        mode = definition["mode"]
-        commands = definition.get("probeCommands", [])
-        unsupported = definition.get("unsupported")
-        detail = {"mode": mode, "active": False, "commands": commands}
-
-        if mode == "off":
-            status["disabled"].append(name)
-            detail["reason"] = "disabled"
-        elif unsupported:
-            status["unsupported"].append(name)
-            detail["reason"] = unsupported
-        elif mode == "force":
-            status["forced"].append(name)
-            status["active"].append(name)
-            detail["active"] = True
-            detail["reason"] = "forced"
-        else:
-            matches = [command for command in commands if shutil.which(command)]
-            detail["matchedCommands"] = matches
-            if matches:
-                status["detected"].append(name)
-                status["active"].append(name)
-                detail["active"] = True
-                detail["reason"] = "detected"
-            elif commands:
-                status["skipped"].append(name)
-                detail["reason"] = "not-found"
-            else:
-                status["unsupported"].append(name)
-                detail["reason"] = "no-command-probe"
-
-        status["harnesses"][name] = detail
-
-    for key in ("active", "detected", "forced", "disabled", "skipped", "unsupported"):
-        status[key] = sorted(status[key])
-    atomic_json(os.environ["INFERNIX_HARNESS_STATUS"], status)
-  '';
+  catalogue = infernixFleetixLib.mcp.catalogue;
+  hasServers = config.services.infernix.mcp.servers != {};
 in {
   options.services.infernix.harnesses = mkOption {
-    type = types.attrsOf harness;
     default = {};
-    description = ''
-      Harness registry shared by Infernix integrations. Entries are composed
-      by modules; activation probes the current Home Manager profile and PATH
-      instead of guessing from Nix evaluation alone.
-    '';
+    type = types.attrsOf (types.submodule {
+      options = {
+        mode = mkOption {
+          type = types.enum ["auto" "force" "off"];
+          default = "auto";
+        };
+        probe.commands = mkOption {
+          type = types.listOf types.str;
+          default = [];
+        };
+        unsupported = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+        };
+        dialect = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Explicit Fleetix dialect for a custom MCP harness.";
+        };
+        adapters.mcp = mkOption {
+          type = types.nullOr (types.submodule {
+            options = {
+              format = mkOption {type = types.enum ["json" "toml"];};
+              configPath = mkOption {type = types.str;};
+              root = mkOption {
+                type = types.listOf types.str;
+                default = ["mcpServers"];
+              };
+              serverKey = mkOption {
+                type = types.nullOr types.str;
+                default = null;
+              };
+            };
+          });
+          default = null;
+          description = "Deprecated destination override; server rendering is always owned by Fleetix.";
+        };
+      };
+    });
   };
-
   options.services.infernix.harnessRegistry = {
     statusFile = mkOption {
       type = types.str;
-      default = "${config.xdg.stateHome}/infernix/harnesses.json";
-      description = "Activation status file for detected and configured harnesses.";
+      default = config.fleetix.mcp.stateFile;
+      description = "Deprecated; use fleetix.mcp.stateFile for the managed-entry ledger.";
     };
     plan = mkOption {
       type = types.attrs;
       readOnly = true;
-      description = "Declarative harness registry plan before runtime detection.";
     };
   };
-
   config = {
-    services.infernix.harnesses =
-      lib.mapAttrs (_: commands: {
-        probe.commands = lib.mkDefault commands;
-      })
-      probeDefaults;
-    services.infernix.harnessRegistry.plan = registryPlan;
-
-    home.activation.infernixHarnessRegistry = lib.hm.dag.entryAfter ["writeBoundary"] ''
-      export PATH=${lib.escapeShellArg "${config.home.profileDirectory}/bin"}:$PATH
-      INFERNIX_HARNESS_PLAN=${lib.escapeShellArg (builtins.toJSON registryPlan)} \
-        INFERNIX_HARNESS_STATUS=${lib.escapeShellArg registryCfg.statusFile} \
-        ${pkgs.python3}/bin/python3 ${resolver}
-    '';
+    services.infernix.harnesses = lib.genAttrs ["claude" "codex" "gemini" "hermes" "kiro" "opencode" "copilot"] (name: {
+      probe.commands = lib.mkDefault catalogue.${name}.commands;
+    });
+    services.infernix.harnessRegistry.plan = config.fleetix.mcp.manifest;
+    fleetix.mcp.harnesses = lib.mkIf hasServers (lib.mapAttrs (name: harness:
+      {
+        enable = lib.mkDefault (hasServers && harness.mode != "off" && harness.unsupported == null);
+        dialect = lib.mkDefault (
+          if harness.dialect == null
+          then name
+          else harness.dialect
+        );
+        delivery = lib.mkDefault (
+          if name == "hermes"
+          then "export"
+          else "merge"
+        );
+        autoDetect = lib.mkDefault (harness.mode == "auto" && name != "hermes");
+        commands = lib.mkDefault harness.probe.commands;
+      }
+      // lib.optionalAttrs (harness.adapters.mcp != null) {
+        configPath = lib.mkDefault (lib.replaceStrings ["~/"] ["${config.home.homeDirectory}/"] harness.adapters.mcp.configPath);
+        format = lib.mkDefault harness.adapters.mcp.format;
+        root = lib.mkDefault harness.adapters.mcp.root;
+      }) (lib.filterAttrs (name: h: h.unsupported == null && (builtins.hasAttr name catalogue || h.dialect != null)) cfg));
+    assertions = lib.optionals hasServers (lib.concatLists (lib.mapAttrsToList (name: harness: [
+        {
+          assertion = harness.adapters.mcp == null || harness.unsupported != null || builtins.hasAttr name catalogue || harness.dialect != null;
+          message = "Infernix harness '${name}' needs an explicit Fleetix dialect; configure fleetix.mcp.harnesses directly.";
+        }
+        {
+          assertion = harness.adapters.mcp == null || harness.adapters.mcp.serverKey == null;
+          message = "Infernix harness '${name}': adapter-wide serverKey is ambiguous; use services.infernix.mcp.servers.<name>.key.";
+        }
+      ])
+      cfg));
   };
 }

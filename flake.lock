@@ -1937,11 +1937,11 @@
         "rust-overlay": "rust-overlay_2"
       },
       "locked": {
-        "lastModified": 1789821959,
-        "narHash": "sha256-rO6f3GsB4x5RAr0sHc8MeCuv7DCJGJ8T3St4WStxtfc=",
+        "lastModified": 1790712778,
+        "narHash": "sha256-0zOBFDXivohmnQs3VjJGKXOoX6Daw+uHGDLUspgSaWg=",
         "ref": "refs/heads/trunk",
-        "rev": "a396f7e23012fff1f7b08e36709525a832271e45",
-        "revCount": 65,
+        "rev": "e9ad353c80dbe52f3187b117d72b6e69a12f0efa",
+        "revCount": 79,
         "type": "git",
         "url": "https://github.com/caniko/fleetix.git"
       },
@@ -2758,17 +2758,17 @@
         "treefmt-nix": "treefmt-nix_3"
       },
       "locked": {
-        "lastModified": 1789628493,
-        "narHash": "sha256-lSPg9XMHYnlNEGtwwd9T4mYY4QJ2mWSK+nXrvHWl/6E=",
+        "lastModified": 1789897434,
+        "narHash": "sha256-tOPe7vvNHu5h2qjwoogZHQF2fvfffduNBlUu/i9JRtY=",
         "ref": "trunk",
-        "rev": "7a3328e186258dca31f9801227bc4e6fd8db4f36",
-        "revCount": 226,
+        "rev": "ed89d0b13fc61dd1b2217bf4bba97f32cec27ba7",
+        "revCount": 235,
         "type": "git",
         "url": "https://github.com/caniko/harbor-rs.git"
       },
       "original": {
         "ref": "trunk",
-        "rev": "7a3328e186258dca31f9801227bc4e6fd8db4f36",
+        "rev": "ed89d0b13fc61dd1b2217bf4bba97f32cec27ba7",
         "type": "git",
         "url": "https://github.com/caniko/harbor-rs.git"
       }

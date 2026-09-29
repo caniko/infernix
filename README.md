@@ -94,8 +94,10 @@ Home-manager modules (`homeModules.default`):
   profile plus the activation `PATH`; `force` is for GUI or config-only
   clients, and `off` suppresses an integration without removing its package.
   The declarative plan is exposed as
-  `services.infernix.harnessRegistry.plan`, while activation status is written
-  to `$XDG_STATE_HOME/infernix/harnesses.json`.
+  `services.infernix.harnessRegistry.plan`. MCP rendering and reconciliation
+  now belong to Fleetix; ownership is recorded under
+  `$XDG_STATE_HOME/fleetix/mcp.json`, and activation reports configured/skipped
+  harnesses. `harnessRegistry.statusFile` is a deprecated compatibility option.
 
 Infernix owns this external plugin's pinned payload, harness adapters, and
 native hook/plugin installation. Skillnet owns canonical authored skills,
@@ -104,21 +106,20 @@ copy Ponytail into Skillnet or add per-harness installation policy to canix.
 
 ### Harness auto-configuration
 
-Integrations contribute adapters to the shared registry; they do not maintain
-separate lists of every possible client. For example, OpenPencil can be
-enabled with automatic detection:
+The default module imports `fleetix.homeModules.mcp`. The old
+`services.infernix.mcp.servers` registry and harness `auto`/`force`/`off` modes
+are compatibility shims. New integrations use `fleetix.mcp` directly; generic
+adapters are available without enabling OpenPencil:
 
 ```nix
 {
-  imports = [ infernix.homeModules.default infernix.homeModules.openpencil ];
-
-  services.infernix.openpencil.enable = true;
-
-  # Configure a client with no reliable CLI probe.
-  services.infernix.harnesses.antigravity.mode = "force";
-
-  # Keep a detected client out of this integration.
-  services.infernix.harnesses.codex.mode = "off";
+  imports = [ infernix.homeModules.default ];
+  fleetix.mcp = {
+    enable = true;
+    harnesses.codex.enable = true;
+    harnesses.omp.enable = true;
+    servers.graph.url = "http://localhost:8781/mcp";
+  };
 }
 ```
 
@@ -127,16 +128,19 @@ all registered adapters that are detected at activation. A list restricts the
 candidates, while each candidate still follows its registry mode. Missing
 `auto` probes are a successful no-op; they do not create empty client config
 files. Installing a client after activation requires another Home Manager
-switch. Inspect the status JSON when a harness is skipped or unsupported.
+switch. The activation report lists skipped clients. Removing a previously
+configured client prunes its owned entries while preserving unrelated settings.
 
-The generic registry currently supports JSON and TOML MCP files. Nix-native
-clients consume `services.infernix.mcp.resolvedServers` through their own
-Home Manager companion module rather than receiving arbitrary runtime writes.
+Fleetix supports native, managed-entry merge (strict JSON/TOML), and export
+delivery. Nix-native consumers use `fleetix.mcp.rendered` or the pure
+`fleetix.lib.mcp.renderServers` API. Declarative destinations must use native or
+export delivery. See Fleetix's `MCP.md` for capabilities, ownership conflicts,
+secret references, migration adoption and cleanup.
 
 Additional opt-in Home Manager modules:
 
-- **`homeModules.openpencil`** — registers OpenPencil's MCP server and its
-  manifest-provided harness adapters with the shared auto-detection registry.
+- **`homeModules.openpencil`** — registers the legacy OpenPencil MCP server
+  through Fleetix's independent harness catalogue.
 - **`homeModules.opencode`** — writes OpenCode's provider/model settings from
   the shared catalog.
 - **`homeModules.claude-code`** — installs Claude Code and Claude Code Router,

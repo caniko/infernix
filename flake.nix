@@ -74,103 +74,107 @@
     };
   };
 
-  outputs =
-    { self
-    , nixpkgs
-    , home-manager
-    , visual-rubric
-    , plinth
-    , harbor-rs
-    , fleetix
-    , nix-pklx
-    , openpencil
-    , rust-overlay
-    , hermes-agent
-    , hermes-webui
-    , graphify
-    , colibri
-    ,
-    }:
-    let
-      # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
-      # NVIDIA, ROCm on AMD) and llama.cpp/ollama builds whose upstreams
-      # only ship x86_64 in practice. No aarch64-linux consumer exists,
-      # so evaluating aarch64 outputs is dead weight that doubles
-      # `nix flake check` heap for nothing.
-      systems = [ "x86_64-linux" ];
-      packageSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-      ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
-      forAllPackageSystems = nixpkgs.lib.genAttrs packageSystems;
+  outputs = {
+    self,
+    nixpkgs,
+    home-manager,
+    visual-rubric,
+    plinth,
+    harbor-rs,
+    fleetix,
+    nix-pklx,
+    openpencil,
+    rust-overlay,
+    hermes-agent,
+    hermes-webui,
+    graphify,
+    colibri,
+  }: let
+    # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
+    # NVIDIA, ROCm on AMD) and llama.cpp/ollama builds whose upstreams
+    # only ship x86_64 in practice. No aarch64-linux consumer exists,
+    # so evaluating aarch64 outputs is dead weight that doubles
+    # `nix flake check` heap for nothing.
+    systems = ["x86_64-linux"];
+    packageSystems = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
+    forAllSystems = nixpkgs.lib.genAttrs systems;
+    forAllPackageSystems = nixpkgs.lib.genAttrs packageSystems;
 
-      mkLbPackageForPkgs = pkgs: pkgs.callPackage ./packages/infernix-lb.nix { };
+    mkLbPackageForPkgs = pkgs: pkgs.callPackage ./packages/infernix-lb.nix {};
 
-      mkCargoPackageWithCrane = { pkgs, packageName }:
-        let
-          toolchain = harbor-rs.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
-          inherit (toolchain) craneLib;
-          source = ./.;
-          src = craneLib.cleanCargoSource source;
-          commonArgs = {
-            inherit src;
-            rsHarborCargoTomlContents = builtins.readFile ./Cargo.toml;
-            pname = packageName;
-            version = "0.1.0";
-            strictDeps = true;
-            cargoExtraArgs = "-p ${packageName}";
-          };
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-        in
-        craneLib.buildPackage (commonArgs
-          // {
+    mkCargoPackageWithCrane = {
+      pkgs,
+      packageName,
+    }: let
+      toolchain = harbor-rs.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
+      };
+      inherit (toolchain) craneLib;
+      source = ./.;
+      src = craneLib.cleanCargoSource source;
+      commonArgs = {
+        inherit src;
+        rsHarborCargoTomlContents = builtins.readFile ./Cargo.toml;
+        pname = packageName;
+        version = "0.1.0";
+        strictDeps = true;
+        cargoExtraArgs = "-p ${packageName}";
+      };
+      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+    in
+      craneLib.buildPackage (commonArgs
+        // {
           inherit cargoArtifacts;
         });
 
-      mkLbPackageWithCrane = pkgs:
-        mkCargoPackageWithCrane {
-          inherit pkgs;
-          packageName = "infernix-lb";
-        };
-
-      mkWorkerdPackageWithCrane = pkgs:
-        mkCargoPackageWithCrane {
-          inherit pkgs;
-          packageName = "infernix-workerd";
-        };
-
-      mkLbPackage = system:
-        mkLbPackageWithCrane (import nixpkgs {
-          inherit system;
-          overlays = [ rust-overlay.overlays.default ];
-        });
-
-      mkWorkerdPackage = system:
-        mkWorkerdPackageWithCrane (import nixpkgs {
-          inherit system;
-          overlays = [ rust-overlay.overlays.default ];
-        });
-    in
-    {
-      lib = {
-        inherit mkLbPackageForPkgs;
-        modelCatalog = import ./lib/model-catalog.nix { lib = nixpkgs.lib; };
-        colibriPackaging = import ./lib/colibri-packaging.nix { lib = nixpkgs.lib; };
-        openpencilSupport = true;
+    mkLbPackageWithCrane = pkgs:
+      mkCargoPackageWithCrane {
+        inherit pkgs;
+        packageName = "infernix-lb";
       };
 
-      nixosModules = {
+    mkWorkerdPackageWithCrane = pkgs:
+      mkCargoPackageWithCrane {
+        inherit pkgs;
+        packageName = "infernix-workerd";
+      };
+
+    mkLbPackage = system:
+      mkLbPackageWithCrane (import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      });
+
+    mkWorkerdPackage = system:
+      mkWorkerdPackageWithCrane (import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      });
+  in {
+    lib = {
+      inherit mkLbPackageForPkgs;
+      modelCatalog = import ./lib/model-catalog.nix {inherit (nixpkgs) lib;};
+      colibriPackaging = import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;};
+      openpencilSupport = true;
+    };
+
+    nixosModules =
+      {
         visual-rubric = {
-          imports = [ ./modules/nixos/visual-rubric.nix ];
+          imports = [./modules/nixos/visual-rubric.nix];
           _module.args.infernixVisualRubric = visual-rubric;
         };
-        default =
-          { lib
-          , pkgs
-          , ...
-          }: {
-            imports = [
+        default = {
+          lib,
+          pkgs,
+          ...
+        }: {
+          imports =
+            [
               ./modules/nixos
               ./modules/nixos/hermes-dashboard-instances.nix
               # Re-export upstream NixOS modules under the same default import
@@ -178,156 +182,159 @@
               hermes-agent.nixosModules.default
             ]
             ++ lib.optional
-              (hermes-agent.nixosModules ? instances)
-              hermes-agent.nixosModules.instances
+            (hermes-agent.nixosModules ? instances)
+            hermes-agent.nixosModules.instances
             ++ [
               hermes-webui.nixosModules.default
             ]
             ++ lib.optional
-              (graphify ? nixosModules && graphify.nixosModules ? default)
-              graphify.nixosModules.default;
-            # Thread the locked nixos-unstable nixpkgs flake into the module tree
-            # so ollama / llama-cpp / llama-swap can re-instantiate it with the
-            # consumer's own system + config (GPU flags, allowUnfree, etc.).
-            _module.args.infernixBleedingNixpkgs = nixpkgs;
-            _module.args.infernixHermesAgent = hermes-agent;
-            _module.args.infernixHermesWebui = hermes-webui;
-            _module.args.infernixVisualRubric = visual-rubric;
-            _module.args.infernixGraphify = graphify;
-            _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
-            _module.args.infernixSelf = self;
-            _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
-          };
+            (graphify ? nixosModules && graphify.nixosModules ? default)
+            graphify.nixosModules.default;
+          # Thread the locked nixos-unstable nixpkgs flake into the module tree
+          # so ollama / llama-cpp / llama-swap can re-instantiate it with the
+          # consumer's own system + config (GPU flags, allowUnfree, etc.).
+          _module.args.infernixBleedingNixpkgs = nixpkgs;
+          _module.args.infernixHermesAgent = hermes-agent;
+          _module.args.infernixHermesWebui = hermes-webui;
+          _module.args.infernixVisualRubric = visual-rubric;
+          _module.args.infernixGraphify = graphify;
+          _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
+          _module.args.infernixSelf = self;
+          _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
+        };
 
         pink-raven-workload = ./modules/nixos/pink-raven-workload.nix;
       }
       // nixpkgs.lib.optionalAttrs
-        (graphify ? nixosModules && graphify.nixosModules ? default)
-        {
-          graphify = graphify.nixosModules.default;
-        };
-
-      homeModules = {
-        default = { pkgs, ... }: {
-          imports = [ (import ./modules/home-manager) ];
-          _module.args.infernixVisualRubric = visual-rubric;
-          _module.args.infernixGraphify = graphify;
-          _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
-          _module.args.infernixPonytail = self.packages.${pkgs.stdenv.hostPlatform.system}.ponytail;
-        };
-        opencode = {
-          imports = [
-            ./modules/home-manager/model-providers.nix
-            ./modules/home-manager/opencode.nix
-          ];
-        };
-        claude-code = { pkgs, ... }: {
-          imports = [
-            ./modules/home-manager/model-providers.nix
-            ./modules/home-manager/claude-code.nix
-          ];
-          _module.args.infernixCodexProvider = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-provider;
-        };
-        # Opt-in sub-module that writes programs.goose.* from the
-        # services.infernix.goose outputs. Only import for users that also
-        # import goose-hm's HM module.
-        goose = import ./modules/home-manager/goose-programs.nix;
-        # Opt-in sub-module that writes programs.yh.steeds from the
-        # services.infernix.yeehaw outputs. Only import for users that also
-        # import yeeHaw's HM module.
-        yeehaw = import ./modules/home-manager/yeehaw-programs.nix;
-        # Opt-in sub-module that writes programs.visual-rubric.* from the
-        # services.infernix.visual-rubric outputs.
-        visualRubric = import ./modules/home-manager/visual-rubric-programs.nix;
-        # Opt-in sub-module that wires hermes CLI providers from
-        # services.infernix.endpoints. Only import for users that also
-        # configure services.infernix.hermes-agent.
-        hermes-agent = import ./modules/home-manager/hermes-agent-programs.nix;
-        openpencil = { pkgs, ... }: {
-          imports = [
-            ./modules/home-manager/harnesses.nix
-            ./modules/home-manager/mcp.nix
-            ./modules/home-manager/openpencil.nix
-          ];
-          _module.args.infernixOpenPencil = openpencil;
-        };
+      (graphify ? nixosModules && graphify.nixosModules ? default)
+      {
+        graphify = graphify.nixosModules.default;
       };
 
-      packages = forAllPackageSystems (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-          infernix-lb = mkLbPackage system;
-          infernix-workerd = mkWorkerdPackage system;
-          # CUDA redists are unfree: resolve that toolchain from a
-          # dedicated allowUnfree pkgs, never by flipping the shared set.
-          pkgsUnfree = import nixpkgs { inherit system; config.allowUnfree = true; };
-          visualRubricPackage =
-            if
-              builtins.hasAttr "packages" visual-rubric
-              && builtins.hasAttr system visual-rubric.packages
-              && builtins.hasAttr "default" visual-rubric.packages.${system}
-            then visual-rubric.packages.${system}.default
-            else null;
-          website =
-            if system == "x86_64-linux"
-            then
-              plinth.lib.${system}.mkProjectSite
-                {
-                  pname = "infernix-website";
-                  domain = "infernix.tartanoglu.com";
-                  configPath = ./website/plinth-project.toml;
-                }
-            else null;
-        in
-        {
-          inherit infernix-lb infernix-workerd;
-          codex-acp = pkgs.callPackage ./packages/codex-acp.nix { };
-          codex-provider = pkgs.callPackage ./packages/codex-provider.nix { };
-          ponytail = pkgs.callPackage ./packages/ponytail.nix { };
-          # Colibri GPU flavors. Default archs target the first consumer's
-          # hosts (Atlas gfx1100, Nomad sm_89); the lib function takes any
-          # arch, and consumers pass their own pinned toolchains for
-          # cache-pin alignment.
-          colibri-hip = (import ./lib/colibri-packaging.nix { lib = nixpkgs.lib; }).mkColibriGpu {
-            basePackage = colibri.packages.${system}.colibri;
-            backend = "hip";
-            gpuArch = "gfx1100";
-            rocmPackages = pkgs.rocmPackages;
-          };
-          # CUDA redists are unfree (see pkgsUnfree above).
-          colibri-cuda = (import ./lib/colibri-packaging.nix { lib = nixpkgs.lib; }).mkColibriGpu {
-            basePackage = colibri.packages.${system}.colibri;
-            backend = "cuda";
-            gpuArch = "sm_89";
-            cudaPackages = pkgsUnfree.cudaPackages;
-            symlinkJoin = pkgs.symlinkJoin;
-            nvccHostCc = pkgsUnfree.gcc14;
-          };
-          graphify =
-            graphify.packages.${system}.full
-              or graphify.packages.${system}.default;
-          default = infernix-lb;
-        }
-        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
-          website = website;
-          site = website;
-        }
-        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux" && visualRubricPackage != null) {
-          visual-rubric = visualRubricPackage;
-        });
+    homeModules = {
+      default = {pkgs, ...}: {
+        imports = [fleetix.homeModules.mcp (import ./modules/home-manager)];
+        _module.args.infernixFleetixLib = fleetix.lib;
+        _module.args.infernixVisualRubric = visual-rubric;
+        _module.args.infernixGraphify = graphify;
+        _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
+        _module.args.infernixPonytail = self.packages.${pkgs.stdenv.hostPlatform.system}.ponytail;
+      };
+      opencode = {
+        imports = [
+          ./modules/home-manager/model-providers.nix
+          ./modules/home-manager/opencode.nix
+        ];
+      };
+      claude-code = {pkgs, ...}: {
+        imports = [
+          ./modules/home-manager/model-providers.nix
+          ./modules/home-manager/claude-code.nix
+        ];
+        _module.args.infernixCodexProvider = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-provider;
+      };
+      # Opt-in sub-module that writes programs.goose.* from the
+      # services.infernix.goose outputs. Only import for users that also
+      # import goose-hm's HM module.
+      goose = import ./modules/home-manager/goose-programs.nix;
+      # Opt-in sub-module that writes programs.yh.steeds from the
+      # services.infernix.yeehaw outputs. Only import for users that also
+      # import yeeHaw's HM module.
+      yeehaw = import ./modules/home-manager/yeehaw-programs.nix;
+      # Opt-in sub-module that writes programs.visual-rubric.* from the
+      # services.infernix.visual-rubric outputs.
+      visualRubric = import ./modules/home-manager/visual-rubric-programs.nix;
+      # Opt-in sub-module that wires hermes CLI providers from
+      # services.infernix.endpoints. Only import for users that also
+      # configure services.infernix.hermes-agent.
+      hermes-agent = import ./modules/home-manager/hermes-agent-programs.nix;
+      openpencil = { ...}: {
+        imports = [
+          fleetix.homeModules.mcp
+          ./modules/home-manager/harnesses.nix
+          ./modules/home-manager/mcp.nix
+          ./modules/home-manager/openpencil.nix
+        ];
+        _module.args.infernixOpenPencil = openpencil;
+        _module.args.infernixFleetixLib = fleetix.lib;
+      };
+    };
 
-      apps = forAllSystems (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
-          deploy-pages = plinth.lib.${system}.mkDeployPagesApp {
+    packages = forAllPackageSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      infernix-lb = mkLbPackage system;
+      infernix-workerd = mkWorkerdPackage system;
+      # CUDA redists are unfree: resolve that toolchain from a
+      # dedicated allowUnfree pkgs, never by flipping the shared set.
+      pkgsUnfree = import nixpkgs {
+        inherit system;
+        config.allowUnfree = true;
+      };
+      visualRubricPackage =
+        if
+          builtins.hasAttr "packages" visual-rubric
+          && builtins.hasAttr system visual-rubric.packages
+          && builtins.hasAttr "default" visual-rubric.packages.${system}
+        then visual-rubric.packages.${system}.default
+        else null;
+      website =
+        if system == "x86_64-linux"
+        then
+          plinth.lib.${system}.mkProjectSite
+          {
+            pname = "infernix-website";
             domain = "infernix.tartanoglu.com";
-          };
+            configPath = ./website/plinth-project.toml;
+          }
+        else null;
+    in
+      {
+        inherit infernix-lb infernix-workerd;
+        codex-acp = pkgs.callPackage ./packages/codex-acp.nix {};
+        codex-provider = pkgs.callPackage ./packages/codex-provider.nix {};
+        ponytail = pkgs.callPackage ./packages/ponytail.nix {};
+        # Colibri GPU flavors. Default archs target the first consumer's
+        # hosts (Atlas gfx1100, Nomad sm_89); the lib function takes any
+        # arch, and consumers pass their own pinned toolchains for
+        # cache-pin alignment.
+        colibri-hip = (import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;}).mkColibriGpu {
+          basePackage = colibri.packages.${system}.colibri;
+          backend = "hip";
+          gpuArch = "gfx1100";
+          inherit (pkgs) rocmPackages;
+        };
+        # CUDA redists are unfree (see pkgsUnfree above).
+        colibri-cuda = (import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;}).mkColibriGpu {
+          basePackage = colibri.packages.${system}.colibri;
+          backend = "cuda";
+          gpuArch = "sm_89";
+          inherit (pkgsUnfree) cudaPackages;
+          inherit (pkgs) symlinkJoin;
+          nvccHostCc = pkgsUnfree.gcc14;
+        };
+        graphify =
+          graphify.packages.${system}.full
+              or graphify.packages.${system}.default;
+        default = infernix-lb;
+      }
+      // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+        inherit website;
+        site = website;
+      }
+      // nixpkgs.lib.optionalAttrs (system == "x86_64-linux" && visualRubricPackage != null) {
+        visual-rubric = visualRubricPackage;
+      });
 
-          hermes-models-export = {
-            type = "app";
-            program = "${pkgs.writeShellApplication {
+    apps = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      deploy-pages = plinth.lib.${system}.mkDeployPagesApp {
+        domain = "infernix.tartanoglu.com";
+      };
+
+      hermes-models-export = {
+        type = "app";
+        program = "${pkgs.writeShellApplication {
           name = "hermes-models-export";
           runtimeInputs = [
             nix-pklx.packages.${system}.pklx
@@ -343,1299 +350,1328 @@
             echo "Wrote $output from $input"
           '';
         }}/bin/hermes-models-export";
-          };
-        });
+      };
+    });
 
-      formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
+    formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
 
-      devShells = forAllSystems (system:
-        let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ rust-overlay.overlays.default ];
-          };
-          toolchain = harbor-rs.lib.mkToolchain { inherit pkgs; toolchainProfile = "nightly"; };
-          cross = harbor-rs.lib.mkCross { inherit pkgs system; };
-        in
-        {
-          docs = harbor-rs.lib.mkDocsShell {
-            inherit pkgs cross;
-            inherit (toolchain) craneLib;
-            packages = [ plinth.packages.${system}.plinth-project ];
-            extraShellHook = ''
-              echo "Project site: plinth-project serve --config website/plinth-project.toml"
-            '';
-          };
-        });
+    devShells = forAllSystems (system: let
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      };
+      toolchain = harbor-rs.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
+      };
+      cross = harbor-rs.lib.mkCross {inherit pkgs system;};
+    in {
+      docs = harbor-rs.lib.mkDocsShell {
+        inherit pkgs cross;
+        inherit (toolchain) craneLib;
+        packages = [plinth.packages.${system}.plinth-project];
+        extraShellHook = ''
+          echo "Project site: plinth-project serve --config website/plinth-project.toml"
+        '';
+      };
+    });
 
-      checks = forAllSystems (system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-          sample = nixpkgs.lib.nixosSystem {
+    checks = forAllSystems (system: let
+      pkgs = import nixpkgs {inherit system;};
+      claudeCodeSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [
+          self.homeModules.default
+          self.homeModules.claude-code
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+            services.infernix.claude-code.enable = true;
+          }
+        ];
+      };
+      opencodeModelSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [
+          self.homeModules.default
+          self.homeModules.opencode
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+          }
+        ];
+      };
+      claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.xdg.configFile."claude-code-router/config.json".source);
+      graphifyNixosModuleAvailable =
+        graphify ? nixosModules
+        && graphify.nixosModules ? default;
+      graphifyNixosSample =
+        if graphifyNixosModuleAvailable
+        then
+          nixpkgs.lib.nixosSystem
+          {
             inherit system;
             modules = [
               self.nixosModules.default
               {
                 system.stateVersion = "24.11";
+                services.graphify = {
+                  enable = true;
+                  instances.postgresql = {
+                    source.postgresql = {
+                      enable = true;
+                      database = "infernix";
+                    };
+                    extraction.onCalendar = "daily";
+                    server.enable = true;
+                  };
+                };
+              }
+            ];
+          }
+        else null;
+      workloadFabricSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
 
-                services.infernix.gpu = {
-                  vendor = "cpu";
-                  inherit pkgs;
+            services.infernix.workloadFabric = {
+              enable = true;
+              databaseUrl = "postgres:///canix?host=/run/postgresql";
+              workerId = "atlas";
+              capabilities = ["cpu" "semantic"];
+              adapters.graphify = {
+                workload = "graphify";
+                queues = ["code" "semantic"];
+                command = "/bin/canix";
+                args = ["graphify" "run-job"];
+              };
+              profiles.semantic = {
+                routing = {
+                  primary = {
+                    endpoint = "local-lb";
+                    baseUrl = "http://127.0.0.1:8014/v1";
+                    model = "fixture-model";
+                    healthUrl = "http://127.0.0.1:8014/healthz";
+                  };
+                  fallback = {
+                    endpoint = "local-fallback";
+                    baseUrl = "http://127.0.0.1:8015/v1";
+                    model = "fixture-model";
+                    healthUrl = "http://127.0.0.1:8015/healthz";
+                  };
+                  capability = "chat";
+                  timeoutSecs = 42;
+                  retry.maxAttempts = 2;
                 };
+                execution = {
+                  adapter = "graphify-adapter";
+                  queues = ["semantic"];
+                };
+                lease = {
+                  enabled = true;
+                  concurrency = 2;
+                  durationSecs = 90;
+                  heartbeatSecs = 30;
+                  maxAttempts = 3;
+                };
+              };
+            };
+          }
+        ];
+      };
+      hermesAgentSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
 
-                services.infernix.qdrant.enable = true;
-                services.infernix.ollama.enable = true;
-              }
-            ];
-          };
-          claudeCodeSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = [
-              self.homeModules.default
-              self.homeModules.claude-code
-              {
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
+            services.infernix.fleet = {
+              nodes = fleetix.lib.adapters.infernix.mkFleetNodes {
+                topology = {
+                  hosts.atlas = {
+                    network = {
+                      lanIp = "192.168.178.88";
+                      directLinkIp = "10.10.0.1";
+                    };
+                    links.wg-home.address = "10.123.0.5";
+                  };
+                  services.reverseProxyServices = [];
                 };
-                services.infernix.claude-code.enable = true;
-              }
-            ];
-          };
-          opencodeModelSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = [
-              self.homeModules.default
-              self.homeModules.opencode
-              {
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
+                nodes.atlas = {
+                  priority = 30;
+                  models.qwen3-vl-8b = {
+                    name = "qwen3-vl-8b";
+                    capabilities = ["chat"];
+                  };
                 };
-              }
-            ];
-          };
-          claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.xdg.configFile."claude-code-router/config.json".source);
-          graphifyNixosModuleAvailable =
-            graphify ? nixosModules
-            && graphify.nixosModules ? default;
-          graphifyNixosSample =
-            if graphifyNixosModuleAvailable
-            then
-              nixpkgs.lib.nixosSystem
-                {
-                  inherit system;
-                  modules = [
-                    self.nixosModules.default
-                    {
-                      system.stateVersion = "24.11";
-                      services.graphify = {
-                        enable = true;
-                        instances.postgresql = {
-                          source.postgresql = {
-                            enable = true;
-                            database = "infernix";
-                          };
-                          extraction.onCalendar = "daily";
-                          server.enable = true;
-                        };
+              };
+              loadBalancer = {
+                enable = true;
+                host = "192.168.178.31";
+                port = 8014;
+              };
+            };
+
+            services.infernix.hermes-agent = {
+              enable = true;
+              environmentFiles = ["/run/secrets/hermes-env"];
+              modelRouting = {
+                enable = true;
+                profile = {
+                  providers = {
+                    cloud-router = {
+                      urlSource = "cloudRouter";
+                      models = {
+                        "deepseek-v4-flash" = {};
+                        "mimo-v2.5-pro" = {};
                       };
+                    };
+                    local-fleet = {
+                      urlSource = "fleetLoadBalancer";
+                      defaultModel = "qwen3-vl-8b";
+                      models."qwen3-vl-8b".context_length = 4096;
+                    };
+                  };
+                  model = {
+                    default = "gpt-5.5";
+                    provider = "openai-codex";
+                  };
+                  modelAliases."vision-local" = {
+                    model = "qwen3-vl-8b";
+                    provider = "local-fleet";
+                  };
+                  fallbackModel = [
+                    {
+                      model = "deepseek-v4-flash";
+                      provider = "cloud-router";
                     }
                   ];
-                }
-            else null;
-          workloadFabricSample = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-
-                services.infernix.workloadFabric = {
-                  enable = true;
-                  databaseUrl = "postgres:///canix?host=/run/postgresql";
-                  workerId = "atlas";
-                  capabilities = [ "cpu" "semantic" ];
-                  adapters.graphify = {
-                    workload = "graphify";
-                    queues = [ "code" "semantic" ];
-                    command = "/bin/canix";
-                    args = [ "graphify" "run-job" ];
-                  };
-                  profiles.semantic = {
-                    routing = {
-                      primary = {
-                        endpoint = "local-lb";
-                        baseUrl = "http://127.0.0.1:8014/v1";
-                        model = "fixture-model";
-                        healthUrl = "http://127.0.0.1:8014/healthz";
-                      };
-                      fallback = {
-                        endpoint = "local-fallback";
-                        baseUrl = "http://127.0.0.1:8015/v1";
-                        model = "fixture-model";
-                        healthUrl = "http://127.0.0.1:8015/healthz";
-                      };
-                      capability = "chat";
-                      timeoutSecs = 42;
-                      retry.maxAttempts = 2;
+                  auxiliary = {
+                    vision = {
+                      model = "qwen3-vl-8b";
+                      provider = "local-fleet";
                     };
-                    execution = {
-                      adapter = "graphify-adapter";
-                      queues = [ "semantic" ];
-                    };
-                    lease = {
-                      enabled = true;
-                      concurrency = 2;
-                      durationSecs = 90;
-                      heartbeatSecs = 30;
-                      maxAttempts = 3;
+                    compression = {
+                      model = "deepseek-v4-flash";
+                      provider = "cloud-router";
                     };
                   };
                 };
-              }
-            ];
-          };
-          hermesAgentSample = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-
-                services.infernix.fleet = {
-                  nodes = fleetix.lib.adapters.infernix.mkFleetNodes {
-                    topology = {
-                      hosts.atlas = {
-                        network = {
-                          lanIp = "192.168.178.88";
-                          directLinkIp = "10.10.0.1";
-                        };
-                        links.wg-home.address = "10.123.0.5";
-                      };
-                      services.reverseProxyServices = [ ];
-                    };
-                    nodes.atlas = {
-                      priority = 30;
-                      models.qwen3-vl-8b = {
-                        name = "qwen3-vl-8b";
-                        capabilities = [ "chat" ];
-                      };
-                    };
-                  };
-                  loadBalancer = {
-                    enable = true;
-                    host = "192.168.178.31";
-                    port = 8014;
-                  };
-                };
-
-                services.infernix.hermes-agent = {
-                  enable = true;
-                  environmentFiles = [ "/run/secrets/hermes-env" ];
-                  modelRouting = {
-                    enable = true;
-                    profile = {
-                      providers = {
-                        cloud-router = {
-                          urlSource = "cloudRouter";
-                          models = {
-                            "deepseek-v4-flash" = { };
-                            "mimo-v2.5-pro" = { };
-                          };
-                        };
-                        local-fleet = {
-                          urlSource = "fleetLoadBalancer";
-                          defaultModel = "qwen3-vl-8b";
-                          models."qwen3-vl-8b".context_length = 4096;
-                        };
-                      };
-                      model = {
-                        default = "gpt-5.5";
-                        provider = "openai-codex";
-                      };
-                      modelAliases."vision-local" = {
-                        model = "qwen3-vl-8b";
-                        provider = "local-fleet";
-                      };
-                      fallbackModel = [
+              };
+              settings = {
+                toolsets = ["all"];
+                moa = {
+                  default_preset = "gpt55_dsflash";
+                  presets = {
+                    gpt55_dsflash = {
+                      reference_models = [
                         {
                           model = "deepseek-v4-flash";
                           provider = "cloud-router";
                         }
                       ];
-                      auxiliary = {
-                        vision = {
-                          model = "qwen3-vl-8b";
-                          provider = "local-fleet";
-                        };
-                        compression = {
-                          model = "deepseek-v4-flash";
-                          provider = "cloud-router";
-                        };
+                      aggregator = {
+                        model = "gpt-5.5";
+                        provider = "openai-codex";
                       };
+                      enabled = true;
                     };
                   };
-                  settings = {
-                    toolsets = [ "all" ];
-                    moa = {
-                      default_preset = "gpt55_dsflash";
-                      presets = {
-                        gpt55_dsflash = {
-                          reference_models = [
-                            {
-                              model = "deepseek-v4-flash";
-                              provider = "cloud-router";
-                            }
-                          ];
-                          aggregator = {
-                            model = "gpt-5.5";
-                            provider = "openai-codex";
-                          };
-                          enabled = true;
-                        };
-                      };
-                    };
-                  };
-                  mcpServers.fixture = {
-                    command = "fixture-mcp";
-                    args = [ "--stdio" ];
-                  };
-                  scheduledSettings = {
-                    enable = true;
-                    timeZone = "America/Los_Angeles";
-                    restartService = true;
-                    profiles = {
-                      day.settingsOverlay.moa.default_preset = "gpt55_mimo";
-                      night.settingsOverlay.moa.default_preset = "gpt55_dsflash";
-                    };
-                    switches = {
-                      day = {
-                        profile = "day";
-                        onCalendar = "*-*-* 09:00:00";
-                      };
-                      night = {
-                        profile = "night";
-                        onCalendar = "*-*-* 17:00:00";
-                      };
-                    };
-                  };
-                  instances.iris = {
-                    enable = true;
-                    stateDir = "/srv/hermes-iris";
-                    allowedToolsets = [ "web" "vision" ];
-                    readOnlyState = true;
-                    settings.toolsets = [ "all" ];
-                  };
-                };
-
-                services.infernix.hermes-dashboard.instances.iris = {
-                  enable = true;
-                  port = 9120;
-                  stateDir = "/srv/hermes-iris";
-                };
-              }
-            ];
-          };
-          fleetLegacyLanIpSample = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-
-                services.infernix.fleet = {
-                  nodes.atlas = {
-                    lanIp = "192.168.178.88";
-                    models.qwen3-vl-8b = {
-                      name = "qwen3-vl-8b";
-                      capabilities = [ "chat" ];
-                    };
-                  };
-                  loadBalancer.enable = true;
-                };
-              }
-            ];
-          };
-          pinkRavenWorkloadSample = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.pink-raven-workload
-              ({ lib, ... }: {
-                options.services.pink-raven = lib.mkOption {
-                  type = lib.types.attrs;
-                  default = { };
-                  description = "Dummy Pink Raven option tree for workload module checks.";
-                };
-
-                config = {
-                  system.stateVersion = "24.11";
-                  services.infernix.workloads.pinkRaven.enable = true;
-                };
-              })
-            ];
-          };
-          llamaSwapExtraFilesSample = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-
-                services.infernix.gpu = {
-                  vendor = "cpu";
-                  inherit pkgs;
-                };
-
-                services.infernix.llama-swap = {
-                  enable = true;
-                  modelsDir = "/var/lib/infernix-models";
-                  models.test-model = {
-                    repo = "example/main-model";
-                    file = "main.gguf";
-                    ctxSize = 2048;
-                    extraFiles = [
-                      {
-                        repo = "example/main-model";
-                        file = "mmproj-main.gguf";
-                      }
-                    ];
-                  };
-                };
-              }
-            ];
-          };
-          llamaSwapDownloadScript =
-            pkgs.writeText
-              "infernix-download-extra-files-script"
-              llamaSwapExtraFilesSample.config.systemd.services.infernix-download.script;
-          visualRubricDirectSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            extraSpecialArgs = { osConfig = null; };
-            modules = [
-              self.homeModules.default
-              {
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
-                };
-                services.infernix.visual-rubric.enable = true;
-              }
-            ];
-          };
-          visualRubricPipelineSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            extraSpecialArgs = { osConfig = null; };
-            modules = [
-              self.homeModules.default
-              {
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
-                };
-                services.infernix.endpoints.local-lb = {
-                  type = "llama-swap";
-                  url = "http://127.0.0.1:8013";
-                  models.vlm = {
-                    name = "qwen3-vl-8b";
-                    ctxSize = 4096;
-                  };
-                };
-                services.infernix.visual-rubric = {
-                  enable = true;
-                  mode = "pipeline";
-                };
-              }
-            ];
-          };
-          visualRubricDirectConfig =
-            visualRubricDirectSample.config.xdg.configFile."visual-rubric/config.toml".source;
-          visualRubricPipelineConfig =
-            visualRubricPipelineSample.config.xdg.configFile."visual-rubric/config.toml".source;
-          visualRubricDirectPackage =
-            pkgs.lib.findFirst
-              (package: package == visual-rubric.packages.${system}."codex-acp")
-              null
-              visualRubricDirectSample.config.home.packages;
-          visualRubricPipelinePackage =
-            pkgs.lib.findFirst
-              (package: package == visual-rubric.packages.${system}.default)
-              null
-              visualRubricPipelineSample.config.home.packages;
-          graphifyHarnesses = [
-            "agents"
-            "aider"
-            "amp"
-            "antigravity"
-            "claude"
-            "claw"
-            "codebuddy"
-            "codex"
-            "copilot"
-            "cursor"
-            "devin"
-            "droid"
-            "gemini"
-            "hermes"
-            "kilo"
-            "kiro"
-            "kimi"
-            "opencode"
-            "pi"
-            "trae"
-            "trae-cn"
-            "vscode"
-          ];
-          graphifySample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = [
-              self.homeModules.default
-              {
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
-                };
-                services.infernix.endpoints.local = {
-                  type = "llama-swap";
-                  url = "http://127.0.0.1:8013";
-                  healthUrl = "http://127.0.0.1:8013/healthz";
-                  models.dsv4.name = "dsv4";
-                  models.dsv4.capabilities = [ "chat" ];
-                };
-                services.infernix.workloads.semantic = {
-                  routing = {
-                    endpoint = "local";
-                    model = "dsv4";
-                    capability = "chat";
-                  };
-                };
-                services.infernix.graphify = {
-                  enable = true;
-                  workloadProfile = "semantic";
-                };
-              }
-            ];
-          };
-          workloadProfileSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = [
-              self.homeModules.default
-              {
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
-                };
-                services.infernix.endpoints = {
-                  primary = {
-                    type = "llama-swap";
-                    url = "http://127.0.0.1:8014";
-                    healthUrl = "http://127.0.0.1:8014/healthz";
-                    models.semantic = {
-                      name = "fixture-model";
-                      capabilities = [ "chat" ];
-                    };
-                  };
-                  fallback = {
-                    type = "llama-swap";
-                    url = "http://127.0.0.1:8015";
-                    healthUrl = "http://127.0.0.1:8015/healthz";
-                    models.semantic = {
-                      name = "fixture-model";
-                      capabilities = [ "chat" ];
-                    };
-                  };
-                };
-                services.infernix.workloads.semantic = {
-                  routing = {
-                    endpoint = "primary";
-                    model = "semantic";
-                    capability = "chat";
-                    healthAware = true;
-                    timeoutSecs = 42;
-                    retry.maxAttempts = 2;
-                    fallback = {
-                      endpoint = "fallback";
-                      model = "semantic";
-                    };
-                    credentialRef = "opaque-fixture-reference";
-                  };
-                  execution = {
-                    adapter = "fixture-adapter";
-                    queues = [ "semantic" ];
-                  };
-                  lease = {
-                    enabled = true;
-                    concurrency = 2;
-                    durationSecs = 90;
-                    heartbeatSecs = 30;
-                    maxAttempts = 3;
-                  };
-                };
-              }
-            ];
-          };
-          ponytailHarnesses = [
-            "agents"
-            "aider"
-            "amp"
-            "antigravity"
-            "claude"
-            "cline"
-            "claw"
-            "codebuddy"
-            "codewhale"
-            "codex"
-            "copilot"
-            "copilot-cli"
-            "cursor"
-            "devin"
-            "droid"
-            "gemini"
-            "hermes"
-            "jules"
-            "junie"
-            "kilo"
-            "kiro"
-            "kimi"
-            "opencode"
-            "pi"
-            "qoder"
-            "swival"
-            "trae"
-            "trae-cn"
-            "vscode"
-            "windsurf"
-            "zed"
-          ];
-          ponytailSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = [
-              self.homeModules.default
-              {
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
-                };
-                services.infernix.ponytail = {
-                  enable = true;
-                  runtimeDir = "/tmp/infernix-ponytail-fixture";
-                };
-              }
-            ];
-          };
-          ponytailActivation = pkgs.writeShellScript "infernix-ponytail-harness-registration" ''
-            set -eu
-            export HOME="$TMPDIR/ponytail-home"
-            rm -rf "$HOME" /tmp/infernix-ponytail-fixture
-            mkdir -p "$HOME/.opencode" "$HOME/.codex"
-            printf '%s\n' '# existing user guidance' > "$HOME/AGENTS.md"
-            printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}' > "$HOME/.codex/hooks.json"
-            printf '%s\n' '[hooks.state]' > "$HOME/.codex/config.toml"
-            printf '%s\n' '{"plugin":["plugins/graphify.js"]}' > "$HOME/.opencode/opencode.json"
-            ${ponytailSample.config.home.activation.infernixPonytail.data}
-            ${ponytailSample.config.home.activation.infernixPonytail.data}
-          '';
-          graphifyExpectedPackageName =
-            if graphify.packages.${system} ? full
-            then graphify.packages.${system}.full.name
-            else "graphify-with-openai";
-          graphifyAcpSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = [
-              self.homeModules.default
-              {
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
-                };
-                services.infernix.graphify = {
-                  enable = true;
-                  semanticBackend = "acp";
-                };
-              }
-            ];
-          };
-          openpencilFixturePackage = pkgs.runCommand "openpencil-fixture" { } ''
-            mkdir -p "$out/bin" "$out/share/openpencil"
-            printf '#!/bin/sh\n' > "$out/bin/openpencil-desktop"
-            chmod +x "$out/bin/openpencil-desktop"
-            printf '{"version":"fixture","children":[]}\n' > "$out/share/openpencil/default.op"
-          '';
-          openpencilFixture = {
-            lib.integrationManifest = {
-              integration = {
-                packages.prebuiltRuntime = "runtime-prebuilt";
-                executables.desktop = "openpencil-desktop";
-                documentTemplate = "share/openpencil/default.op";
-                harnesses = {
-                  claude = { format = "json"; configPath = "~/.claude.json"; serverKey = "openpencil"; };
-                  codex = { format = "toml"; configPath = "~/.codex/config.toml"; serverKey = "openpencil"; };
-                  hermes = { format = "nix"; configPath = ""; serverKey = "openpencil"; };
                 };
               };
+              mcpServers.fixture = {
+                command = "fixture-mcp";
+                args = ["--stdio"];
+              };
+              scheduledSettings = {
+                enable = true;
+                timeZone = "America/Los_Angeles";
+                restartService = true;
+                profiles = {
+                  day.settingsOverlay.moa.default_preset = "gpt55_mimo";
+                  night.settingsOverlay.moa.default_preset = "gpt55_dsflash";
+                };
+                switches = {
+                  day = {
+                    profile = "day";
+                    onCalendar = "*-*-* 09:00:00";
+                  };
+                  night = {
+                    profile = "night";
+                    onCalendar = "*-*-* 17:00:00";
+                  };
+                };
+              };
+              instances.iris = {
+                enable = true;
+                stateDir = "/srv/hermes-iris";
+                allowedToolsets = ["web" "vision"];
+                readOnlyState = true;
+                settings.toolsets = ["all"];
+              };
             };
-            packages.${system}.runtime-prebuilt = openpencilFixturePackage;
-          };
-          openpencilFixtureModules = [
-            ./modules/home-manager/harnesses.nix
-            ./modules/home-manager/mcp.nix
-            ./modules/home-manager/openpencil.nix
-          ];
-          openpencilSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = openpencilFixtureModules ++ [
-              {
-                _module.args.infernixOpenPencil = openpencilFixture;
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
+
+            services.infernix.hermes-dashboard.instances.iris = {
+              enable = true;
+              port = 9120;
+              stateDir = "/srv/hermes-iris";
+            };
+          }
+        ];
+      };
+      fleetLegacyLanIpSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+
+            services.infernix.fleet = {
+              nodes.atlas = {
+                lanIp = "192.168.178.88";
+                models.qwen3-vl-8b = {
+                  name = "qwen3-vl-8b";
+                  capabilities = ["chat"];
                 };
-                xdg.enable = true;
-                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
-                services.infernix.openpencil = {
-                  enable = true;
-                  document = "/tmp/infernix-openpencil-fixture/agent.op";
-                };
-                services.infernix.mcp.servers.extra = {
-                  command = "/bin/extra-mcp";
-                  key = "extra";
-                  harnesses = [ "claude" ];
-                };
-              }
-            ];
-          };
-          openpencilForceSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = openpencilFixtureModules ++ [
-              {
-                _module.args.infernixOpenPencil = openpencilFixture;
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
-                };
-                xdg.enable = true;
-                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
-                services.infernix.openpencil.enable = true;
-                services.infernix.openpencil.document = "/tmp/infernix-openpencil-force/agent.op";
-                services.infernix.harnesses.codex.mode = "force";
-              }
-            ];
-          };
-          openpencilOffSample = home-manager.lib.homeManagerConfiguration {
-            inherit pkgs;
-            modules = openpencilFixtureModules ++ [
-              {
-                _module.args.infernixOpenPencil = openpencilFixture;
-                home = {
-                  username = "tester";
-                  homeDirectory = "/home/tester";
-                  stateVersion = "24.11";
-                };
-                xdg.enable = true;
-                services.infernix.harnessRegistry.statusFile = "$XDG_STATE_HOME/infernix/harnesses.json";
-                services.infernix.openpencil.enable = true;
-                services.infernix.openpencil.document = "/tmp/infernix-openpencil-off/agent.op";
-                services.infernix.harnesses.claude.mode = "off";
-              }
-            ];
-          };
-          openpencilActivation = pkgs.writeShellScript "infernix-openpencil-activation" ''
-            set -eu
-            export HOME="$TMPDIR/openpencil-home"
-            export XDG_STATE_HOME="$HOME/.local/state"
-            rm -rf "$HOME"
-            rm -rf /tmp/infernix-openpencil-fixture
-            mkdir -p "$HOME/bin" "$HOME/.local/state" "$HOME/.codex"
-            printf '#!/bin/sh\n' > "$HOME/bin/claude"
-            chmod +x "$HOME/bin/claude"
-            printf '%s\n' '{"keep":true}' > "$HOME/.claude.json"
-            printf '%s\n' '[settings]' 'keep = true' > "$HOME/.codex/config.toml"
-            printf '%s\n' '[mcp_servers.keep]' 'command = "/bin/keep-mcp"' >> "$HOME/.codex/config.toml"
-            export PATH="$HOME/bin:$PATH"
-            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
-            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
-            ${openpencilSample.config.home.activation.infernixMcp.data}
-            ${pkgs.jq}/bin/jq -e '.keep == true and .mcpServers.openpencil.command == "${openpencilFixturePackage}/bin/openpencil-desktop" and .mcpServers.extra.command == "/bin/extra-mcp"' "$HOME/.claude.json"
-            ${pkgs.jq}/bin/jq -e '.detected | index("claude")' "$HOME/.local/state/infernix/harnesses.json"
-            ${pkgs.jq}/bin/jq -e '.unsupported | index("hermes")' "$HOME/.local/state/infernix/harnesses.json"
-            grep -Fq 'keep = true' "$HOME/.codex/config.toml"
-            grep -Fq '[mcp_servers.keep]' "$HOME/.codex/config.toml"
-            grep -Fq '[mcp_servers.openpencil]' "$HOME/.codex/config.toml"
-            grep -Fq 'openpencil-desktop' "$HOME/.codex/config.toml"
-            ! grep -Fq '[mcpServers.openpencil]' "$HOME/.codex/config.toml"
-            test ! -e "$HOME/.codex/config.toml.bak"
-            before="$(sha256sum "$HOME/.claude.json")"
-            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
-            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
-            ${openpencilSample.config.home.activation.infernixMcp.data}
-            test "$before" = "$(sha256sum "$HOME/.claude.json")"
-          '';
-          openpencilForceActivation = pkgs.writeShellScript "infernix-openpencil-force-activation" ''
-            set -eu
-            export HOME="$TMPDIR/openpencil-force-home"
-            export XDG_STATE_HOME="$HOME/.local/state"
-            rm -rf "$HOME"
-            rm -rf /tmp/infernix-openpencil-force
-            mkdir -p "$HOME/.local/state"
-            export PATH="${pkgs.coreutils}/bin:$HOME/bin"
-            ${openpencilForceSample.config.home.activation.infernixHarnessRegistry.data}
-            ${openpencilForceSample.config.home.activation.infernixOpenPencil.data}
-            ${openpencilForceSample.config.home.activation.infernixMcp.data}
-            ${pkgs.gnugrep}/bin/grep -Fq 'openpencil-desktop' "$HOME/.codex/config.toml"
-            ${pkgs.jq}/bin/jq -e '.forced | index("codex")' "$HOME/.local/state/infernix/harnesses.json"
-          '';
-          openpencilOffActivation = pkgs.writeShellScript "infernix-openpencil-off-activation" ''
-            set -eu
-            export HOME="$TMPDIR/openpencil-off-home"
-            export XDG_STATE_HOME="$HOME/.local/state"
-            rm -rf "$HOME"
-            rm -rf /tmp/infernix-openpencil-off
-            mkdir -p "$HOME/bin" "$HOME/.local/state"
-            printf '#!/bin/sh\n' > "$HOME/bin/claude"
-            chmod +x "$HOME/bin/claude"
-            export PATH="$HOME/bin:$PATH"
-            ${openpencilOffSample.config.home.activation.infernixHarnessRegistry.data}
-            ${openpencilOffSample.config.home.activation.infernixOpenPencil.data}
-            ${openpencilOffSample.config.home.activation.infernixMcp.data}
-            ${pkgs.jq}/bin/jq -e '.disabled | index("claude")' "$HOME/.local/state/infernix/harnesses.json"
-            test ! -e "$HOME/.claude.json"
-          '';
-          openpencilMalformedActivation = pkgs.writeShellScript "infernix-openpencil-malformed-activation" ''
-            set -eu
-            export HOME="$TMPDIR/openpencil-malformed-home"
-            export XDG_STATE_HOME="$HOME/.local/state"
-            rm -rf "$HOME" /tmp/infernix-openpencil-fixture
-            mkdir -p "$HOME/bin" "$HOME/.local/state"
-            printf '#!/bin/sh\n' > "$HOME/bin/claude"
-            chmod +x "$HOME/bin/claude"
-            printf '%s\n' '{' > "$HOME/.claude.json"
-            export PATH="$HOME/bin:$PATH"
-            ${openpencilSample.config.home.activation.infernixHarnessRegistry.data}
-            ${openpencilSample.config.home.activation.infernixOpenPencil.data}
-            if ( ${openpencilSample.config.home.activation.infernixMcp.data} ); then
-              echo "malformed JSON unexpectedly succeeded" >&2
-              exit 1
-            fi
-            test "$(cat "$HOME/.claude.json")" = "{"
-          '';
-          graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
-            set -eu
-            export HOME="$TMPDIR/graphify-home"
-            mkdir -p "$HOME"
-            ${graphifySample.config.home.activation.infernixGraphify.data}
-          '';
-          modelCatalogSample = {
-            models = {
-              qwen3-vl-8b = {
-                host = "atlas";
-                repo = "Qwen/Qwen3-VL-8B-Instruct-GGUF";
-                file = "Qwen3VL-8B-Instruct-Q8_0.gguf";
-                ctxSize = 4096;
-                ttl = 300;
-                aliases = [ "qwen3-vl" "vlm" ];
-                capabilities = [ "chat" ];
+              };
+              loadBalancer.enable = true;
+            };
+          }
+        ];
+      };
+      pinkRavenWorkloadSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.pink-raven-workload
+          ({lib, ...}: {
+            options.services.pink-raven = lib.mkOption {
+              type = lib.types.attrs;
+              default = {};
+              description = "Dummy Pink Raven option tree for workload module checks.";
+            };
+
+            config = {
+              system.stateVersion = "24.11";
+              services.infernix.workloads.pinkRaven.enable = true;
+            };
+          })
+        ];
+      };
+      llamaSwapExtraFilesSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+
+            services.infernix.gpu = {
+              vendor = "cpu";
+              inherit pkgs;
+            };
+
+            services.infernix.llama-swap = {
+              enable = true;
+              modelsDir = "/var/lib/infernix-models";
+              models.test-model = {
+                repo = "example/main-model";
+                file = "main.gguf";
+                ctxSize = 2048;
                 extraFiles = [
                   {
-                    repo = "Qwen/Qwen3-VL-8B-Instruct-GGUF";
-                    file = "mmproj.gguf";
+                    repo = "example/main-model";
+                    file = "mmproj-main.gguf";
                   }
-                ];
-                extraArgs = [
-                  "--mmproj {modelsDir}/mmproj.gguf"
-                  "--jinja"
                 ];
               };
             };
-            homeManager.endpoints.atlas-lb.models.vlm.model = "qwen3-vl-8b";
-            probes.atlas.chat = [
-              {
+          }
+        ];
+      };
+      llamaSwapDownloadScript =
+        pkgs.writeText
+        "infernix-download-extra-files-script"
+        llamaSwapExtraFilesSample.config.systemd.services.infernix-download.script;
+      visualRubricDirectSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        extraSpecialArgs = {osConfig = null;};
+        modules = [
+          self.homeModules.default
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+            services.infernix.visual-rubric.enable = true;
+          }
+        ];
+      };
+      visualRubricPipelineSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        extraSpecialArgs = {osConfig = null;};
+        modules = [
+          self.homeModules.default
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+            services.infernix.endpoints.local-lb = {
+              type = "llama-swap";
+              url = "http://127.0.0.1:8013";
+              models.vlm = {
                 name = "qwen3-vl-8b";
-                model = "qwen3-vl-8b";
-                maxTokens = 10;
-              }
-            ];
-          };
-          modelCatalogLib = self.lib.modelCatalog;
-          renderedLlamaSwapModels = modelCatalogLib.mkLlamaSwapModels {
-            catalog = modelCatalogSample;
-            host = "atlas";
-            modelsDir = "/models";
-          };
-          renderedFleetModels = modelCatalogLib.mkFleetModels {
-            catalog = modelCatalogSample;
-            host = "atlas";
-          };
-          renderedHmModels = modelCatalogLib.mkHmEndpointModels {
-            catalog = modelCatalogSample;
-            endpoint = "atlas-lb";
-          };
-          nvidiaGpuOverrides = (import ./lib/gpu.nix { lib = nixpkgs.lib; }).systemdGpuOverrides {
-            vendor = "nvidia";
-            visibleDevices = [ "0" ];
-          };
-          colibriStubPackage = (pkgs.runCommand "colibri-stub" { } ''
-            mkdir -p "$out/bin"
-            printf '#!/bin/sh\nexit 0\n' > "$out/bin/coli"
-            chmod +x "$out/bin/coli"
-          '') // { passthru = { colibriBackend = "hip"; colibriGpuArch = "gfx1100"; }; };
-          colibriSample = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-                services.infernix.fleet = {
-                  localNodeName = "fixture";
-                  nodes.fixture.healthUnits = [ "llama-swap.service" ];
-                };
-                services.infernix.colibri = {
-                  package = colibriStubPackage;
-                  openFirewallInterfaces = [ "wg-home" ];
-                  profiles.fixture-qwen36 = {
-                    enable = true;
-                    port = 20213;
-                    modelDir = "/data/models/colibri/fixture";
-                    stagingDir = "/data/models/colibri/.staging-fixture";
-                    modelId = "fixture-qwen36-colibri";
-                    engine = "qwen36";
-                    backend = "hip";
-                    gpuDevices = "0";
-                    expertGb = 20;
-                    expertSlotsPerLayer = 256;
-                    releaseHost = true;
-                    strictResidency = true;
-                    ctxSize = 8192;
-                    ngen = 1024;
-                    apiKeyFile = "/run/keys/fixture-colibri";
-                    admissionMarker = "/var/lib/infernix-colibri-fixture-qwen36/admission-approved";
-                    weightsRepo = "Fixture/qwen36-colibri";
-                    weightsRev = "aaaabbbbccccddddeeeeffff0000111122223333";
-                    weightsFiles = [
-                      { name = "model-00000.safetensors"; sizeBytes = 8; }
-                      { name = "tokenizer.json"; }
-                    ];
-                    weightsTotalBytes = 16;
-                  };
-                };
-              }
-            ];
-          };
-          colibriOwnAssertions = colibriSample.config.services.infernix.colibri.evalChecks;
-          # Negative samples: each varies exactly one thing from the green
-          # sample; the module must record a failing assertion, never serve.
-          colibriBadEngine = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-                services.infernix.fleet = {
-                  localNodeName = "fixture";
-                  nodes.fixture.healthUnits = [ "llama-swap.service" ];
-                };
-                services.infernix.colibri = {
-                  package = colibriStubPackage;
-                  profiles.bad-glm = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36 // {
-                    engine = "glm";
-                  };
-                };
-              }
-            ];
-          };
-          colibriBadPackage = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-                services.infernix.fleet = {
-                  localNodeName = "fixture";
-                  nodes.fixture.healthUnits = [ "llama-swap.service" ];
-                };
-                services.infernix.colibri = {
-                  package = colibriStubPackage // { passthru = { colibriBackend = "cpu"; colibriGpuArch = null; }; };
-                  profiles.bad-pkg = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36;
-                };
-              }
-            ];
-          };
-          colibriBadHealth = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-                services.infernix.fleet.localNodeName = "fixture";
-                services.infernix.colibri = {
-                  package = colibriStubPackage;
-                  profiles.bad-health = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36;
-                };
-              }
-            ];
-          };
-          colibriBadStrict = nixpkgs.lib.nixosSystem {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-                services.infernix.fleet = {
-                  localNodeName = "fixture";
-                  nodes.fixture.healthUnits = [ "llama-swap.service" ];
-                };
-                services.infernix.colibri = {
-                  package = colibriStubPackage;
-                  profiles.bad-strict = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36 // {
-                    strictResidency = false;
-                  };
-                };
-              }
-            ];
-          };
-          colibriBadAssertions = cfg: cfg.config.services.infernix.colibri.evalChecks;
-          hermesScheduledSwitch = builtins.head (nixpkgs.lib.splitString " "
-            (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart));
-        in
-        {
-          nvidia-gpu-systemd-overrides = pkgs.runCommand "infernix-nvidia-gpu-systemd-overrides-check" { } ''
-            test "${nvidiaGpuOverrides.ProcSubset.content}" = all
-            test "${nvidiaGpuOverrides.LimitMEMLOCK}" = infinity
-            test "${nvidiaGpuOverrides.DevicePolicy.content}" = auto
-            test "${builtins.elemAt nvidiaGpuOverrides.Environment 0}" = CUDA_VISIBLE_DEVICES=0
-            touch "$out"
-          '';
-
-          pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" { } ''
-            test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
-            test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-vl-8b"
-            test "${pinkRavenWorkloadSample.config.services.pink-raven.settings.PINK_RAVEN_EMBEDDING_TIMEOUT_MS}" = "180000"
-            touch "$out"
-          '';
-
-          colibri = pkgs.runCommand "infernix-colibri-check" { } ''
-            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriOwnAssertions)}" = "true"
-            # wantedBy=[] does not stop switch-start: the admission marker
-            # condition is the real manual-start gate, ANDed with weights.
-            for cond in ${nixpkgs.lib.escapeShellArgs (nixpkgs.lib.toList colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".unitConfig.ConditionPathExists)}; do
-              case "$cond" in
-                */ready.json|*/admission-approved) ;;
-                *) echo "unexpected start condition: $cond" >&2; exit 1 ;;
-              esac
-            done
-            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.Type}" = "exec"
-            case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
-              *infernix-colibri-entrypoint*--ctx*8*) ;;
-              *) echo "serve unit must exec the manifest-gated entrypoint" >&2; exit 1 ;;
-            esac
-            case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.LoadCredential)} in
-              *coli-api-key:/run/keys/fixture-colibri*) ;;
-              *) echo "serve unit must load the key as a credential" >&2; exit 1 ;;
-            esac
-            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_CUDA}" = "1"
-            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.CUDA_RELEASE_HOST}" = "1"
-            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_GPUS}" = "0"
-            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.CUDA_EXPERT_GB}" = "20"
-            test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_STRICT_RESIDENCY}" = "1"
-            test "${toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.MemorySwapMax}" = "0"
-            test "${colibriSample.config.systemd.services."infernix-colibri-fetch-fixture-qwen36".serviceConfig.Type}" = "oneshot"
-            test "${nixpkgs.lib.boolToString (builtins.elem "infernix-colibri-fixture-qwen36.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "true"
-            test "${nixpkgs.lib.boolToString (builtins.elem 20213 colibriSample.config.networking.firewall.interfaces."wg-home".allowedTCPPorts)}" = "true"
-            # Rejections: GLM engine on a gpu backend, package/profile
-            # backend mismatch, unpinned healthUnits, and a gpu backend
-            # without strictResidency must each record a failing module
-            # assertion instead of serving.
-            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadEngine))}" = "false"
-            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadPackage))}" = "false"
-            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadHealth))}" = "false"
-            test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadStrict))}" = "false"
-            touch "$out"
-          '';
-
-          hermes-agent = pkgs.runCommand "infernix-hermes-agent-check" { } ''
-            settings='${builtins.toJSON hermesAgentSample.config.services.hermes-agent.settings}'
-            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.model.default == "gpt-5.5"'
-            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "local-fleet" and .base_url == "http://192.168.178.31:8014/v1" and .models."qwen3-vl-8b".context_length == 4096)'
-            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "cloud-router" and .base_url == "http://127.0.0.1:2099/v1")'
-            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.auxiliary.vision.model == "qwen3-vl-8b"'
-            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.fallback_model[0].provider == "cloud-router"'
-            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'
-            printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .mcp_servers.fixture.args == ["--stdio"]'
-            day_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-day-config.yaml' ${pkgs.lib.escapeShellArg hermesScheduledSwitch})"
-            night_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-night-config.yaml' ${pkgs.lib.escapeShellArg hermesScheduledSwitch})"
-            ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .moa.default_preset == "gpt55_mimo"' "$day_config"
-            ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .moa.default_preset == "gpt55_dsflash"' "$night_config"
-            test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-day".timerConfig.OnCalendar}" = "*-*-* 09:00:00 America/Los_Angeles"
-            test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-night".timerConfig.OnCalendar}" = "*-*-* 17:00:00 America/Los_Angeles"
-            case ${pkgs.lib.escapeShellArg (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart)} in
-              *"--restart"*) ;;
-              *) echo "day schedule service does not restart hermes-agent" >&2; exit 1 ;;
-            esac
-            test "${hermesAgentSample.config.services.infernix.fleet.nodes.atlas.address}" = "192.168.178.88"
-            test "${hermesAgentSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"
-            test "${fleetLegacyLanIpSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"
-            test "${hermesAgentSample.config.services.hermes-agent.user}" = "hermes"
-            test "${hermesAgentSample.config.services.hermes-agent.group}" = "hermes"
-            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.User}" = "hermes-iris"
-            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.environment.HERMES_HOME}" = "/srv/hermes-iris/.hermes"
-            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.environment.HERMES_ALLOWED_TOOLSETS}" = "web,vision"
-            test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.WorkingDirectory}" = "/srv/hermes-iris/workspace"
-            printf '%s\n' '${builtins.toJSON hermesAgentSample.config.services.hermes-agent.instances.iris.settings}' | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'
-            test "${nixpkgs.lib.boolToString (builtins.elem "/srv/hermes-iris/.hermes/config.yaml" hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.ReadOnlyPaths)}" = "true"
-            test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.serviceConfig.User}" = "hermes-iris"
-            test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.environment.HERMES_HOME}" = "/srv/hermes-iris/.hermes"
-            touch "$out"
-          '';
-
-          visual-rubric-home = pkgs.runCommand "infernix-visual-rubric-home-check" { } ''
-            grep -Fq 'mode = "direct"' ${visualRubricDirectConfig}
-            grep -Fq 'backend = "${visualRubricDirectSample.config.services.infernix.acp.resolvedProviders.codex.command}"' ${visualRubricDirectConfig}
-            grep -Fq 'model = "gpt-5.5"' ${visualRubricDirectConfig}
-            grep -Fq 'effort = "medium"' ${visualRubricDirectConfig}
-            ! grep -Fq '[vision]' ${visualRubricDirectConfig}
-            test "${visualRubricDirectPackage}" = "${visual-rubric.packages.${system}."codex-acp"}"
-
-            grep -Fq 'mode = "pipeline"' ${visualRubricPipelineConfig}
-            grep -Fq 'backend = "opencode"' ${visualRubricPipelineConfig}
-            grep -Fq 'args = [' ${visualRubricPipelineConfig}
-            grep -Fq 'url = "http://127.0.0.1:8013"' ${visualRubricPipelineConfig}
-            grep -Fq 'model = "qwen3-vl-8b"' ${visualRubricPipelineConfig}
-            test "${visualRubricPipelinePackage}" = "${visual-rubric.packages.${system}.default}"
-            touch "$out"
-          '';
-
-          graphify-harness-registration = pkgs.runCommand "infernix-graphify-harness-registration-check" { } ''
-            ${graphifyRegistrationScript}
-            ${graphifyRegistrationScript}
-            expected='${builtins.toJSON graphifyHarnesses}'
-            actual='${builtins.toJSON graphifySample.config.services.infernix.graphify.registeredHarnesses}'
-            test "$actual" = "$expected"
-            test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_BASE_URL}" = "http://127.0.0.1:8013/v1"
-            test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_MODEL}" = "dsv4"
-            test "${graphifySample.config.services.infernix.graphify.package.name}" = "${graphifyExpectedPackageName}"
-            commands='${builtins.toJSON graphifySample.config.services.infernix.graphify.registrationCommands}'
-            printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'length == 22'
-            printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'all(.[]; contains("graphify"))'
-            test -f "$TMPDIR/graphify-home/AGENTS.md"
-            test -f "$TMPDIR/graphify-home/CLAUDE.md"
-            test -f "$TMPDIR/graphify-home/.claude/settings.json"
-            test -f "$TMPDIR/graphify-home/.codex/hooks.json"
-            test -f "$TMPDIR/graphify-home/.gemini/settings.json"
-            test -f "$TMPDIR/graphify-home/.cursor/rules/graphify.mdc"
-            test -f "$TMPDIR/graphify-home/.kilo/kilo.json"
-            test -f "$TMPDIR/graphify-home/.opencode/opencode.json"
-            ${pkgs.jq}/bin/jq -e '.plugin | index("./plugins/graphify.js") != null' "$TMPDIR/graphify-home/.opencode/opencode.json"
-            ${pkgs.jq}/bin/jq -e '.plugin | index("plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
-            ${pkgs.jq}/bin/jq -e '.plugin | index(".opencode/plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
-            test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
-            touch "$out"
-          '';
-
-          ponytail-harness-registration = pkgs.runCommand "infernix-ponytail-harness-registration-check" { } ''
-            ${ponytailActivation}
-            expected='${builtins.toJSON ponytailHarnesses}'
-            actual='${builtins.toJSON ponytailSample.config.services.infernix.ponytail.registeredHarnesses}'
-            test "$actual" = "$expected"
-            test "${ponytailSample.config.services.infernix.ponytail.adapterStatus.codex.mode}" = native
-            test "${ponytailSample.config.services.infernix.ponytail.adapterStatus.cursor.scope}" = project-only
-            test -f "$TMPDIR/ponytail-home/AGENTS.md"
-            test "$(grep -Fc '<!-- infernix-ponytail: begin -->' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
-            test "$(grep -Fc '# existing user guidance' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
-            ${pkgs.jq}/bin/jq -e '.hooks.SessionStart | length == 2' "$TMPDIR/ponytail-home/.codex/hooks.json"
-            ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit | length == 1' "$TMPDIR/ponytail-home/.codex/hooks.json"
-            ${pkgs.jq}/bin/jq -e '.hooks.SessionStart[1].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
-            ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit[0].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
-            test "$(grep -Fc 'hooks.json:session_start:1:0' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 1
-            test "$(grep -Fc 'hooks.json:user_prompt_submit:0:0' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 1
-            test "$(grep -Ec 'trusted_hash = \"sha256:[0-9a-f]{64}\"' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 2
-            ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart == null' "$TMPDIR/ponytail-home/.codex/hooks.json"
-            ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
-            ${pkgs.jq}/bin/jq -e '.plugin | index("/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs") != null' "$TMPDIR/ponytail-home/.opencode/opencode.json"
-            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
-            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
-            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs
-            ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/pi-extension/index.js
-            test -L "$TMPDIR/ponytail-home/.pi/agent/extensions/ponytail"
-            test -L "$TMPDIR/ponytail-home/.gemini/extensions/ponytail"
-            test -L "$TMPDIR/ponytail-home/.openclaw/skills/ponytail"
-            test -L "$TMPDIR/ponytail-home/.codex/plugins/ponytail"
-            test -L "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/local"
-            test -d "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4"
-            test -f "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4/.codex-plugin/plugin.json"
-            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/.codex-plugin/plugin.json"
-            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/skills/ponytail/SKILL.md"
-            test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/hooks/claude-codex-hooks.json"
-            grep -Fq '[plugins."ponytail@ponytail"]' "$TMPDIR/ponytail-home/.codex/config.toml"
-            grep -Fq 'enabled = true' "$TMPDIR/ponytail-home/.codex/config.toml"
-            grep -Fq '[features]' "$TMPDIR/ponytail-home/.codex/config.toml"
-            grep -Fq 'plugins = true' "$TMPDIR/ponytail-home/.codex/config.toml"
-            grep -Fq '[marketplaces.ponytail]' "$TMPDIR/ponytail-home/.codex/config.toml"
-            grep -Fq 'source_type = "local"' "$TMPDIR/ponytail-home/.codex/config.toml"
-            grep -Fq 'source = "/tmp/infernix-ponytail-fixture"' "$TMPDIR/ponytail-home/.codex/config.toml"
-            touch "$out"
-          '';
-
-          openpencil-mcp = pkgs.runCommand "infernix-openpencil-mcp-check" { } ''
-            test "${openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.command}" = "${openpencilFixturePackage}/bin/openpencil-desktop"
-            test "${builtins.elemAt openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.args 0}" = "--mcp"
-            ${openpencilActivation}
-            ${openpencilForceActivation}
-            ${openpencilOffActivation}
-            ${openpencilMalformedActivation}
-            touch "$out"
-          '';
-
-          graphify-acp-provider = pkgs.runCommand "infernix-graphify-acp-provider-check" { } ''
-            provider='${builtins.toJSON graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex}'
-            printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.capabilities == {"image":true,"sessionConfig":true,"text":true}'
-            printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.configOptions == {}'
-            printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.environment.CODEX_HOME == "/home/tester/.codex"'
-            test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_SEMANTIC_BACKEND}" = acp
-            test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_BIN}" = "${graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex.command}"
-            test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_MODEL}" = gpt-5.5
-            test '${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_CONFIG_JSON}' = '{"mode":"read-only"}'
-            test "${graphifyAcpSample.config.services.infernix.graphify.package}" = "${graphify.packages.${system}.acp}"
-            touch "$out"
-          '';
-
-          codex-acp-closure =
-            let
-              closure = pkgs.closureInfo {
-                rootPaths = [ self.packages.${system}.codex-acp ];
+                ctxSize = 4096;
               };
-            in
-            pkgs.runCommand "infernix-codex-acp-closure-check" { } ''
-              package=${self.packages.${system}.codex-acp}
-              test -x "$package/bin/codex-acp"
-              test -f "$package/libexec/codex-acp/index.js"
-              test ! -e "$package/lib/node_modules"
-              test "$(find "$package" -type f | wc -l)" -eq 2
-              test "$(grep -Fxc '${pkgs.codex}' ${closure}/store-paths)" -eq 1
-              touch "$out"
-            '';
-
-          claude-code-routing = pkgs.runCommand "infernix-claude-code-routing-check" { } ''
-            providers='${builtins.toJSON claudeCodeRouterConfig.Providers}'
-            opencode='${builtins.toJSON opencodeModelSample.config.programs.opencode.settings.provider}'
-            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e 'map(.name) | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
-            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_base_url == "http://127.0.0.1:3967/v1/chat/completions"'
-            printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "deepseek") | .api_key == "$DEEPSEEK_API_KEY"'
-            printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e 'keys | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
-            test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
-            test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"
-            test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}" = "${pkgs.claude-code-router}/bin/ccr start"
-            touch "$out"
-          '';
-
-          codex-provider-closure = pkgs.runCommand "infernix-codex-provider-closure-check" { } ''
-            package=${self.packages.${system}.codex-provider}
-            test -x "$package/bin/infernix-codex-provider"
-            test -f "$package/libexec/infernix-codex-provider/server.mjs"
-            grep -Fq 'const args = ["exec"' "$package/libexec/infernix-codex-provider/server.mjs"
-            ! grep -Eiq 'mcp|acp' "$package/libexec/infernix-codex-provider/server.mjs"
-            touch "$out"
-          '';
-
-          graphify-nixos-module =
-            if graphifyNixosModuleAvailable
-            then
-              pkgs.runCommand "infernix-graphify-nixos-module-check" { } ''
-                test "${graphifyNixosSample.config.services.graphify.instances.postgresql.source.postgresql.database}" = infernix
-                test "${graphifyNixosSample.config.services.graphify.package}" = "${graphify.packages.${system}.full}"
-                test "${graphifyNixosSample.config.systemd.services.graphify-postgresql.serviceConfig.User}" = graphify
-                test "${toString graphifyNixosSample.config.systemd.services.graphify-postgresql.serviceConfig.ExecStart}" != ""
-                touch "$out"
-              ''
-            else
-              pkgs.runCommand "infernix-graphify-nixos-module-unavailable" { } ''
-                echo "Graphify input predates nixosModules.default; override or bump it to exercise this check." >&2
-                touch "$out"
-              '';
-
-          workload-fabric = pkgs.runCommand "infernix-workload-fabric-check" { } ''
-            test "${workloadFabricSample.config.services.infernix.workloadFabric.workerId}" = "atlas"
-            case ${pkgs.lib.escapeShellArg (toString workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig.ExecStart)} in
-              *"/bin/infernix-workerd --config"*" worker") ;;
-              *) echo "workerd service does not run the worker command" >&2; exit 1 ;;
-            esac
-            requires='${builtins.toJSON workloadFabricSample.config.systemd.services.infernix-workerd.requires}'
-            printf '%s' "$requires" | ${pkgs.jq}/bin/jq -e 'index("infernix-workload-migrate.service")'
-            queues='${builtins.toJSON workloadFabricSample.config.services.infernix.workloadFabric.adapters.graphify.queues}'
-            printf '%s' "$queues" | ${pkgs.jq}/bin/jq -e '.[0] == "code" and .[1] == "semantic"'
-            grep -Fq 'timeout_secs = 42' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
-            grep -Fq 'heartbeat_secs = 30' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
-            grep -Fq 'health_url = "http://127.0.0.1:8014/healthz"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
-            ! grep -Eiq 'opaque-fixture-reference|prompt|source' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
-            touch "$out"
-          '';
-
-          workload-profile = pkgs.runCommand "infernix-workload-profile-check" { } ''
-            profile='${builtins.toJSON workloadProfileSample.config.services.infernix.resolvedWorkloads.semantic}'
-            printf '%s' "$profile" | ${pkgs.jq}/bin/jq -e '
-              .schemaVersion == 1
-              and .routing.primary.capability == "chat"
-              and .routing.fallback.endpoint == "fallback"
-              and .routing.healthAware == true
-              and .routing.timeoutSecs == 42
-              and .execution.adapter == "fixture-adapter"
-              and .lease.heartbeatSecs == 30
-              and .lease.maxAttempts == 3
-              and .routing.credentialRequired == true
-            '
-            ! printf '%s' "$profile" | ${pkgs.jq}/bin/jq -e 'tostring | test("opaque-fixture-reference|prompt|source")'
-            touch "$out"
-          '';
-
-          hermes-model-routing-sidecar = pkgs.runCommand "infernix-hermes-model-routing-sidecar-check"
+            };
+            services.infernix.visual-rubric = {
+              enable = true;
+              mode = "pipeline";
+            };
+          }
+        ];
+      };
+      visualRubricDirectConfig =
+        visualRubricDirectSample.config.xdg.configFile."visual-rubric/config.toml".source;
+      visualRubricPipelineConfig =
+        visualRubricPipelineSample.config.xdg.configFile."visual-rubric/config.toml".source;
+      visualRubricDirectPackage =
+        pkgs.lib.findFirst
+        (package: package == visual-rubric.packages.${system}."codex-acp")
+        null
+        visualRubricDirectSample.config.home.packages;
+      visualRubricPipelinePackage =
+        pkgs.lib.findFirst
+        (package: package == visual-rubric.packages.${system}.default)
+        null
+        visualRubricPipelineSample.config.home.packages;
+      graphifyHarnesses = [
+        "agents"
+        "aider"
+        "amp"
+        "antigravity"
+        "claude"
+        "claw"
+        "codebuddy"
+        "codex"
+        "copilot"
+        "cursor"
+        "devin"
+        "droid"
+        "gemini"
+        "hermes"
+        "kilo"
+        "kiro"
+        "kimi"
+        "opencode"
+        "pi"
+        "trae"
+        "trae-cn"
+        "vscode"
+      ];
+      graphifySample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [
+          self.homeModules.default
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+            services.infernix.endpoints.local = {
+              type = "llama-swap";
+              url = "http://127.0.0.1:8013";
+              healthUrl = "http://127.0.0.1:8013/healthz";
+              models.dsv4.name = "dsv4";
+              models.dsv4.capabilities = ["chat"];
+            };
+            services.infernix.workloads.semantic = {
+              routing = {
+                endpoint = "local";
+                model = "dsv4";
+                capability = "chat";
+              };
+            };
+            services.infernix.graphify = {
+              enable = true;
+              workloadProfile = "semantic";
+            };
+          }
+        ];
+      };
+      workloadProfileSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [
+          self.homeModules.default
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+            services.infernix.endpoints = {
+              primary = {
+                type = "llama-swap";
+                url = "http://127.0.0.1:8014";
+                healthUrl = "http://127.0.0.1:8014/healthz";
+                models.semantic = {
+                  name = "fixture-model";
+                  capabilities = ["chat"];
+                };
+              };
+              fallback = {
+                type = "llama-swap";
+                url = "http://127.0.0.1:8015";
+                healthUrl = "http://127.0.0.1:8015/healthz";
+                models.semantic = {
+                  name = "fixture-model";
+                  capabilities = ["chat"];
+                };
+              };
+            };
+            services.infernix.workloads.semantic = {
+              routing = {
+                endpoint = "primary";
+                model = "semantic";
+                capability = "chat";
+                healthAware = true;
+                timeoutSecs = 42;
+                retry.maxAttempts = 2;
+                fallback = {
+                  endpoint = "fallback";
+                  model = "semantic";
+                };
+                credentialRef = "opaque-fixture-reference";
+              };
+              execution = {
+                adapter = "fixture-adapter";
+                queues = ["semantic"];
+              };
+              lease = {
+                enabled = true;
+                concurrency = 2;
+                durationSecs = 90;
+                heartbeatSecs = 30;
+                maxAttempts = 3;
+              };
+            };
+          }
+        ];
+      };
+      ponytailHarnesses = [
+        "agents"
+        "aider"
+        "amp"
+        "antigravity"
+        "claude"
+        "cline"
+        "claw"
+        "codebuddy"
+        "codewhale"
+        "codex"
+        "copilot"
+        "copilot-cli"
+        "cursor"
+        "devin"
+        "droid"
+        "gemini"
+        "hermes"
+        "jules"
+        "junie"
+        "kilo"
+        "kiro"
+        "kimi"
+        "opencode"
+        "pi"
+        "qoder"
+        "swival"
+        "trae"
+        "trae-cn"
+        "vscode"
+        "windsurf"
+        "zed"
+      ];
+      ponytailSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [
+          self.homeModules.default
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+            services.infernix.ponytail = {
+              enable = true;
+              runtimeDir = "/tmp/infernix-ponytail-fixture";
+            };
+          }
+        ];
+      };
+      ponytailActivation = pkgs.writeShellScript "infernix-ponytail-harness-registration" ''
+        set -eu
+        export HOME="$TMPDIR/ponytail-home"
+        rm -rf "$HOME" /tmp/infernix-ponytail-fixture
+        mkdir -p "$HOME/.opencode" "$HOME/.codex"
+        printf '%s\n' '# existing user guidance' > "$HOME/AGENTS.md"
+        printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}' > "$HOME/.codex/hooks.json"
+        printf '%s\n' '[hooks.state]' > "$HOME/.codex/config.toml"
+        printf '%s\n' '{"plugin":["plugins/graphify.js"]}' > "$HOME/.opencode/opencode.json"
+        ${ponytailSample.config.home.activation.infernixPonytail.data}
+        ${ponytailSample.config.home.activation.infernixPonytail.data}
+      '';
+      graphifyExpectedPackageName =
+        if graphify.packages.${system} ? full
+        then graphify.packages.${system}.full.name
+        else "graphify-with-openai";
+      graphifyAcpSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [
+          self.homeModules.default
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+            services.infernix.graphify = {
+              enable = true;
+              semanticBackend = "acp";
+            };
+          }
+        ];
+      };
+      openpencilFixturePackage = pkgs.runCommand "openpencil-fixture" {} ''
+        mkdir -p "$out/bin" "$out/share/openpencil"
+        printf '#!/bin/sh\n' > "$out/bin/openpencil-desktop"
+        chmod +x "$out/bin/openpencil-desktop"
+        printf '{"version":"fixture","children":[]}\n' > "$out/share/openpencil/default.op"
+      '';
+      openpencilFixture = {
+        lib.integrationManifest = {
+          integration = {
+            packages.prebuiltRuntime = "runtime-prebuilt";
+            executables.desktop = "openpencil-desktop";
+            documentTemplate = "share/openpencil/default.op";
+            harnesses = {
+              claude = {
+                format = "json";
+                configPath = "~/.claude.json";
+                serverKey = "openpencil";
+              };
+              codex = {
+                format = "toml";
+                configPath = "~/.codex/config.toml";
+                serverKey = "openpencil";
+              };
+              hermes = {
+                format = "nix";
+                configPath = "";
+                serverKey = "openpencil";
+              };
+            };
+          };
+        };
+        packages.${system}.runtime-prebuilt = openpencilFixturePackage;
+      };
+      openpencilFixtureModules = [
+        fleetix.homeModules.mcp
+        {_module.args.infernixFleetixLib = fleetix.lib;}
+        ./modules/home-manager/harnesses.nix
+        ./modules/home-manager/mcp.nix
+        ./modules/home-manager/openpencil.nix
+      ];
+      openpencilSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules =
+          openpencilFixtureModules
+          ++ [
             {
-              SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-              nativeBuildInputs = [
-                nix-pklx.packages.${system}.pklx
-                pkgs.cacert
-                pkgs.diffutils
-                pkgs.jq
-                pkgs.nix
-              ];
-            } ''
-            export NIX_STATE_DIR="$TMPDIR/nix-state"
-            export NIX_LOG_DIR="$TMPDIR/nix-log"
-            export NIX_CONF_DIR="$TMPDIR/nix-conf"
-            mkdir -p "$NIX_STATE_DIR" "$NIX_LOG_DIR" "$NIX_CONF_DIR"
+              _module.args.infernixOpenPencil = openpencilFixture;
+              home = {
+                username = "tester";
+                homeDirectory = "/home/tester";
+                stateVersion = "24.11";
+              };
+              xdg.enable = true;
+              services.infernix.openpencil = {
+                enable = true;
+                document = "/tmp/infernix-openpencil-fixture/agent.op";
+              };
+              services.infernix.mcp.servers.extra = {
+                command = "/bin/extra-mcp";
+                key = "extra";
+                harnesses = ["claude"];
+              };
+            }
+          ];
+      };
+      openpencilForceSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules =
+          openpencilFixtureModules
+          ++ [
+            {
+              _module.args.infernixOpenPencil = openpencilFixture;
+              home = {
+                username = "tester";
+                homeDirectory = "/home/tester";
+                stateVersion = "24.11";
+              };
+              xdg.enable = true;
+              services.infernix.openpencil.enable = true;
+              services.infernix.openpencil.document = "/tmp/infernix-openpencil-force/agent.op";
+              services.infernix.harnesses.codex.mode = "force";
+            }
+          ];
+      };
+      openpencilOffSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules =
+          openpencilFixtureModules
+          ++ [
+            {
+              _module.args.infernixOpenPencil = openpencilFixture;
+              home = {
+                username = "tester";
+                homeDirectory = "/home/tester";
+                stateVersion = "24.11";
+              };
+              xdg.enable = true;
+              services.infernix.openpencil.enable = true;
+              services.infernix.openpencil.document = "/tmp/infernix-openpencil-off/agent.op";
+              services.infernix.harnesses.claude.mode = "off";
+            }
+          ];
+      };
+      reconcileMcp = sample: ''
+        ${pkgs.jq}/bin/jq '.targets |= map(.path |= sub("^/home/tester"; env.HOME))' \
+          ${pkgs.writeText "infernix-mcp-fixture.json" (builtins.toJSON sample.config.fleetix.mcp.manifest)} > "$HOME/mcp-plan.json"
+        ${fleetix.packages.${system}.fleetixCrate}/bin/fleetix mcp \
+          --manifest "$HOME/mcp-plan.json" --state "$HOME/.local/state/fleetix/mcp.json" > "$HOME/mcp-report.json"
+      '';
+      openpencilActivation = pkgs.writeShellScript "infernix-openpencil-activation" ''
+        set -eu
+        export HOME="$TMPDIR/openpencil-home"
+        export XDG_STATE_HOME="$HOME/.local/state"
+        rm -rf "$HOME"
+        rm -rf /tmp/infernix-openpencil-fixture
+        mkdir -p "$HOME/bin" "$HOME/.local/state" "$HOME/.codex"
+        printf '#!/bin/sh\n' > "$HOME/bin/claude"
+        chmod +x "$HOME/bin/claude"
+        cp "$HOME/bin/claude" "$HOME/bin/codex"
+        printf '%s\n' '{"keep":true}' > "$HOME/.claude.json"
+        printf '%s\n' '[settings]' 'keep = true' > "$HOME/.codex/config.toml"
+        printf '%s\n' '[mcp_servers.keep]' 'command = "/bin/keep-mcp"' >> "$HOME/.codex/config.toml"
+        export PATH="$HOME/bin:$PATH"
+        ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+        ${reconcileMcp openpencilSample}
+        ${pkgs.jq}/bin/jq -e '.keep == true and .mcpServers.openpencil.command == "${openpencilFixturePackage}/bin/openpencil-desktop" and .mcpServers.extra.command == "/bin/extra-mcp"' "$HOME/.claude.json"
+        ${pkgs.jq}/bin/jq -e '.configured | index("claude")' "$HOME/mcp-report.json"
+        ${pkgs.jq}/bin/jq -e '.targets | map(.name) | index("hermes") == null' "$HOME/mcp-plan.json"
+        grep -Fq 'keep = true' "$HOME/.codex/config.toml"
+        grep -Fq '[mcp_servers.keep]' "$HOME/.codex/config.toml"
+        grep -Fq '[mcp_servers.openpencil]' "$HOME/.codex/config.toml"
+        grep -Fq 'openpencil-desktop' "$HOME/.codex/config.toml"
+        ! grep -Fq '[mcpServers.openpencil]' "$HOME/.codex/config.toml"
+        test ! -e "$HOME/.codex/config.toml.bak"
+        before="$(sha256sum "$HOME/.claude.json")"
+        ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+        ${reconcileMcp openpencilSample}
+        test "$before" = "$(sha256sum "$HOME/.claude.json")"
+      '';
+      openpencilForceActivation = pkgs.writeShellScript "infernix-openpencil-force-activation" ''
+        set -eu
+        export HOME="$TMPDIR/openpencil-force-home"
+        export XDG_STATE_HOME="$HOME/.local/state"
+        rm -rf "$HOME"
+        rm -rf /tmp/infernix-openpencil-force
+        mkdir -p "$HOME/.local/state"
+        export PATH="${pkgs.coreutils}/bin:$HOME/bin"
+        ${openpencilForceSample.config.home.activation.infernixOpenPencil.data}
+        ${reconcileMcp openpencilForceSample}
+        ${pkgs.gnugrep}/bin/grep -Fq 'openpencil-desktop' "$HOME/.codex/config.toml"
+        ${pkgs.jq}/bin/jq -e '.configured | index("codex")' "$HOME/mcp-report.json"
+      '';
+      openpencilOffActivation = pkgs.writeShellScript "infernix-openpencil-off-activation" ''
+        set -eu
+        export HOME="$TMPDIR/openpencil-off-home"
+        export XDG_STATE_HOME="$HOME/.local/state"
+        rm -rf "$HOME"
+        rm -rf /tmp/infernix-openpencil-off
+        mkdir -p "$HOME/bin" "$HOME/.local/state"
+        printf '#!/bin/sh\n' > "$HOME/bin/claude"
+        chmod +x "$HOME/bin/claude"
+        export PATH="$HOME/bin:$PATH"
+        ${openpencilOffSample.config.home.activation.infernixOpenPencil.data}
+        ${reconcileMcp openpencilOffSample}
+        ${pkgs.jq}/bin/jq -e '.configured | index("claude") == null' "$HOME/mcp-report.json"
+        test ! -e "$HOME/.claude.json"
+      '';
+      openpencilMalformedActivation = pkgs.writeShellScript "infernix-openpencil-malformed-activation" ''
+        set -eu
+        export HOME="$TMPDIR/openpencil-malformed-home"
+        export XDG_STATE_HOME="$HOME/.local/state"
+        rm -rf "$HOME" /tmp/infernix-openpencil-fixture
+        mkdir -p "$HOME/bin" "$HOME/.local/state"
+        printf '#!/bin/sh\n' > "$HOME/bin/claude"
+        chmod +x "$HOME/bin/claude"
+        printf '%s\n' '{' > "$HOME/.claude.json"
+        export PATH="$HOME/bin:$PATH"
+        ${openpencilSample.config.home.activation.infernixOpenPencil.data}
+        if ( ${reconcileMcp openpencilSample} ); then
+          echo "malformed JSON unexpectedly succeeded" >&2
+          exit 1
+        fi
+        test "$(cat "$HOME/.claude.json")" = "{"
+      '';
+      graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
+        set -eu
+        export HOME="$TMPDIR/graphify-home"
+        mkdir -p "$HOME"
+        ${graphifySample.config.home.activation.infernixGraphify.data}
+      '';
+      modelCatalogSample = {
+        models = {
+          qwen3-vl-8b = {
+            host = "atlas";
+            repo = "Qwen/Qwen3-VL-8B-Instruct-GGUF";
+            file = "Qwen3VL-8B-Instruct-Q8_0.gguf";
+            ctxSize = 4096;
+            ttl = 300;
+            aliases = ["qwen3-vl" "vlm"];
+            capabilities = ["chat"];
+            extraFiles = [
+              {
+                repo = "Qwen/Qwen3-VL-8B-Instruct-GGUF";
+                file = "mmproj.gguf";
+              }
+            ];
+            extraArgs = [
+              "--mmproj {modelsDir}/mmproj.gguf"
+              "--jinja"
+            ];
+          };
+        };
+        homeManager.endpoints.atlas-lb.models.vlm.model = "qwen3-vl-8b";
+        probes.atlas.chat = [
+          {
+            name = "qwen3-vl-8b";
+            model = "qwen3-vl-8b";
+            maxTokens = 10;
+          }
+        ];
+      };
+      modelCatalogLib = self.lib.modelCatalog;
+      renderedLlamaSwapModels = modelCatalogLib.mkLlamaSwapModels {
+        catalog = modelCatalogSample;
+        host = "atlas";
+        modelsDir = "/models";
+      };
+      renderedFleetModels = modelCatalogLib.mkFleetModels {
+        catalog = modelCatalogSample;
+        host = "atlas";
+      };
+      renderedHmModels = modelCatalogLib.mkHmEndpointModels {
+        catalog = modelCatalogSample;
+        endpoint = "atlas-lb";
+      };
+      nvidiaGpuOverrides = (import ./lib/gpu.nix {inherit (nixpkgs) lib;}).systemdGpuOverrides {
+        vendor = "nvidia";
+        visibleDevices = ["0"];
+      };
+      colibriStubPackage =
+        (pkgs.runCommand "colibri-stub" {} ''
+          mkdir -p "$out/bin"
+          printf '#!/bin/sh\nexit 0\n' > "$out/bin/coli"
+          chmod +x "$out/bin/coli"
+        '')
+        // {
+          passthru = {
+            colibriBackend = "hip";
+            colibriGpuArch = "gfx1100";
+          };
+        };
+      colibriSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+            services.infernix.fleet = {
+              localNodeName = "fixture";
+              nodes.fixture.healthUnits = ["llama-swap.service"];
+            };
+            services.infernix.colibri = {
+              package = colibriStubPackage;
+              openFirewallInterfaces = ["wg-home"];
+              profiles.fixture-qwen36 = {
+                enable = true;
+                port = 20213;
+                modelDir = "/data/models/colibri/fixture";
+                stagingDir = "/data/models/colibri/.staging-fixture";
+                modelId = "fixture-qwen36-colibri";
+                engine = "qwen36";
+                backend = "hip";
+                gpuDevices = "0";
+                expertGb = 20;
+                expertSlotsPerLayer = 256;
+                releaseHost = true;
+                strictResidency = true;
+                ctxSize = 8192;
+                ngen = 1024;
+                apiKeyFile = "/run/keys/fixture-colibri";
+                admissionMarker = "/var/lib/infernix-colibri-fixture-qwen36/admission-approved";
+                weightsRepo = "Fixture/qwen36-colibri";
+                weightsRev = "aaaabbbbccccddddeeeeffff0000111122223333";
+                weightsFiles = [
+                  {
+                    name = "model-00000.safetensors";
+                    sizeBytes = 8;
+                  }
+                  {name = "tokenizer.json";}
+                ];
+                weightsTotalBytes = 16;
+              };
+            };
+          }
+        ];
+      };
+      colibriOwnAssertions = colibriSample.config.services.infernix.colibri.evalChecks;
+      # Negative samples: each varies exactly one thing from the green
+      # sample; the module must record a failing assertion, never serve.
+      colibriBadEngine = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+            services.infernix.fleet = {
+              localNodeName = "fixture";
+              nodes.fixture.healthUnits = ["llama-swap.service"];
+            };
+            services.infernix.colibri = {
+              package = colibriStubPackage;
+              profiles.bad-glm =
+                colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36
+                // {
+                  engine = "glm";
+                };
+            };
+          }
+        ];
+      };
+      colibriBadPackage = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+            services.infernix.fleet = {
+              localNodeName = "fixture";
+              nodes.fixture.healthUnits = ["llama-swap.service"];
+            };
+            services.infernix.colibri = {
+              package =
+                colibriStubPackage
+                // {
+                  passthru = {
+                    colibriBackend = "cpu";
+                    colibriGpuArch = null;
+                  };
+                };
+              profiles.bad-pkg = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36;
+            };
+          }
+        ];
+      };
+      colibriBadHealth = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+            services.infernix.fleet.localNodeName = "fixture";
+            services.infernix.colibri = {
+              package = colibriStubPackage;
+              profiles.bad-health = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36;
+            };
+          }
+        ];
+      };
+      colibriBadStrict = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+            services.infernix.fleet = {
+              localNodeName = "fixture";
+              nodes.fixture.healthUnits = ["llama-swap.service"];
+            };
+            services.infernix.colibri = {
+              package = colibriStubPackage;
+              profiles.bad-strict =
+                colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36
+                // {
+                  strictResidency = false;
+                };
+            };
+          }
+        ];
+      };
+      colibriBadAssertions = cfg: cfg.config.services.infernix.colibri.evalChecks;
+      hermesScheduledSwitch =
+        builtins.head (nixpkgs.lib.splitString " "
+          (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart));
+    in {
+      nvidia-gpu-systemd-overrides = pkgs.runCommand "infernix-nvidia-gpu-systemd-overrides-check" {} ''
+        test "${nvidiaGpuOverrides.ProcSubset.content}" = all
+        test "${nvidiaGpuOverrides.LimitMEMLOCK}" = infinity
+        test "${nvidiaGpuOverrides.DevicePolicy.content}" = auto
+        test "${builtins.elemAt nvidiaGpuOverrides.Environment 0}" = CUDA_VISIBLE_DEVICES=0
+        touch "$out"
+      '';
 
-            pklx eval ${./lib/hermes/ModelRouting.pkl} -o actual.nix
-            nix-instantiate --eval --json --strict actual.nix | jq -S -c . > actual.json
-            nix-instantiate --eval --json --strict ${./lib/hermes/model-routing.nix} | jq -S -c . > expected.json
-            diff -u actual.json expected.json
+      pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" {} ''
+        test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
+        test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-vl-8b"
+        test "${pinkRavenWorkloadSample.config.services.pink-raven.settings.PINK_RAVEN_EMBEDDING_TIMEOUT_MS}" = "180000"
+        touch "$out"
+      '';
+
+      colibri = pkgs.runCommand "infernix-colibri-check" {} ''
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriOwnAssertions)}" = "true"
+        # wantedBy=[] does not stop switch-start: the admission marker
+        # condition is the real manual-start gate, ANDed with weights.
+        for cond in ${nixpkgs.lib.escapeShellArgs (nixpkgs.lib.toList colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".unitConfig.ConditionPathExists)}; do
+          case "$cond" in
+            */ready.json|*/admission-approved) ;;
+            *) echo "unexpected start condition: $cond" >&2; exit 1 ;;
+          esac
+        done
+        test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.Type}" = "exec"
+        case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
+          *infernix-colibri-entrypoint*--ctx*8*) ;;
+          *) echo "serve unit must exec the manifest-gated entrypoint" >&2; exit 1 ;;
+        esac
+        case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.LoadCredential)} in
+          *coli-api-key:/run/keys/fixture-colibri*) ;;
+          *) echo "serve unit must load the key as a credential" >&2; exit 1 ;;
+        esac
+        test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_CUDA}" = "1"
+        test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.CUDA_RELEASE_HOST}" = "1"
+        test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_GPUS}" = "0"
+        test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.CUDA_EXPERT_GB}" = "20"
+        test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".environment.COLI_STRICT_RESIDENCY}" = "1"
+        test "${toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.MemorySwapMax}" = "0"
+        test "${colibriSample.config.systemd.services."infernix-colibri-fetch-fixture-qwen36".serviceConfig.Type}" = "oneshot"
+        test "${nixpkgs.lib.boolToString (builtins.elem "infernix-colibri-fixture-qwen36.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "true"
+        test "${nixpkgs.lib.boolToString (builtins.elem 20213 colibriSample.config.networking.firewall.interfaces."wg-home".allowedTCPPorts)}" = "true"
+        # Rejections: GLM engine on a gpu backend, package/profile
+        # backend mismatch, unpinned healthUnits, and a gpu backend
+        # without strictResidency must each record a failing module
+        # assertion instead of serving.
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadEngine))}" = "false"
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadPackage))}" = "false"
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadHealth))}" = "false"
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadStrict))}" = "false"
+        touch "$out"
+      '';
+
+      hermes-agent = pkgs.runCommand "infernix-hermes-agent-check" {} ''
+        settings='${builtins.toJSON hermesAgentSample.config.services.hermes-agent.settings}'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.model.default == "gpt-5.5"'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "local-fleet" and .base_url == "http://192.168.178.31:8014/v1" and .models."qwen3-vl-8b".context_length == 4096)'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "cloud-router" and .base_url == "http://127.0.0.1:2099/v1")'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.auxiliary.vision.model == "qwen3-vl-8b"'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.fallback_model[0].provider == "cloud-router"'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .mcp_servers.fixture.args == ["--stdio"]'
+        day_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-day-config.yaml' ${pkgs.lib.escapeShellArg hermesScheduledSwitch})"
+        night_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-night-config.yaml' ${pkgs.lib.escapeShellArg hermesScheduledSwitch})"
+        ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .moa.default_preset == "gpt55_mimo"' "$day_config"
+        ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .moa.default_preset == "gpt55_dsflash"' "$night_config"
+        test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-day".timerConfig.OnCalendar}" = "*-*-* 09:00:00 America/Los_Angeles"
+        test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-night".timerConfig.OnCalendar}" = "*-*-* 17:00:00 America/Los_Angeles"
+        case ${pkgs.lib.escapeShellArg (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart)} in
+          *"--restart"*) ;;
+          *) echo "day schedule service does not restart hermes-agent" >&2; exit 1 ;;
+        esac
+        test "${hermesAgentSample.config.services.infernix.fleet.nodes.atlas.address}" = "192.168.178.88"
+        test "${hermesAgentSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"
+        test "${fleetLegacyLanIpSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"
+        test "${hermesAgentSample.config.services.hermes-agent.user}" = "hermes"
+        test "${hermesAgentSample.config.services.hermes-agent.group}" = "hermes"
+        test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.User}" = "hermes-iris"
+        test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.environment.HERMES_HOME}" = "/srv/hermes-iris/.hermes"
+        test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.environment.HERMES_ALLOWED_TOOLSETS}" = "web,vision"
+        test "${hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.WorkingDirectory}" = "/srv/hermes-iris/workspace"
+        printf '%s\n' '${builtins.toJSON hermesAgentSample.config.services.hermes-agent.instances.iris.settings}' | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'
+        test "${nixpkgs.lib.boolToString (builtins.elem "/srv/hermes-iris/.hermes/config.yaml" hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.ReadOnlyPaths)}" = "true"
+        test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.serviceConfig.User}" = "hermes-iris"
+        test "${hermesAgentSample.config.systemd.services.hermes-dashboard-iris.environment.HERMES_HOME}" = "/srv/hermes-iris/.hermes"
+        touch "$out"
+      '';
+
+      visual-rubric-home = pkgs.runCommand "infernix-visual-rubric-home-check" {} ''
+        grep -Fq 'mode = "direct"' ${visualRubricDirectConfig}
+        grep -Fq 'backend = "${visualRubricDirectSample.config.services.infernix.acp.resolvedProviders.codex.command}"' ${visualRubricDirectConfig}
+        grep -Fq 'model = "gpt-5.5"' ${visualRubricDirectConfig}
+        grep -Fq 'effort = "medium"' ${visualRubricDirectConfig}
+        ! grep -Fq '[vision]' ${visualRubricDirectConfig}
+        test "${visualRubricDirectPackage}" = "${visual-rubric.packages.${system}."codex-acp"}"
+
+        grep -Fq 'mode = "pipeline"' ${visualRubricPipelineConfig}
+        grep -Fq 'backend = "opencode"' ${visualRubricPipelineConfig}
+        grep -Fq 'args = [' ${visualRubricPipelineConfig}
+        grep -Fq 'url = "http://127.0.0.1:8013"' ${visualRubricPipelineConfig}
+        grep -Fq 'model = "qwen3-vl-8b"' ${visualRubricPipelineConfig}
+        test "${visualRubricPipelinePackage}" = "${visual-rubric.packages.${system}.default}"
+        touch "$out"
+      '';
+
+      graphify-harness-registration = pkgs.runCommand "infernix-graphify-harness-registration-check" {} ''
+        ${graphifyRegistrationScript}
+        ${graphifyRegistrationScript}
+        expected='${builtins.toJSON graphifyHarnesses}'
+        actual='${builtins.toJSON graphifySample.config.services.infernix.graphify.registeredHarnesses}'
+        test "$actual" = "$expected"
+        test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_BASE_URL}" = "http://127.0.0.1:8013/v1"
+        test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_MODEL}" = "dsv4"
+        test "${graphifySample.config.services.infernix.graphify.package.name}" = "${graphifyExpectedPackageName}"
+        commands='${builtins.toJSON graphifySample.config.services.infernix.graphify.registrationCommands}'
+        printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'length == 22'
+        printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'all(.[]; contains("graphify"))'
+        test -f "$TMPDIR/graphify-home/AGENTS.md"
+        test -f "$TMPDIR/graphify-home/CLAUDE.md"
+        test -f "$TMPDIR/graphify-home/.claude/settings.json"
+        test -f "$TMPDIR/graphify-home/.codex/hooks.json"
+        test -f "$TMPDIR/graphify-home/.gemini/settings.json"
+        test -f "$TMPDIR/graphify-home/.cursor/rules/graphify.mdc"
+        test -f "$TMPDIR/graphify-home/.kilo/kilo.json"
+        test -f "$TMPDIR/graphify-home/.opencode/opencode.json"
+        ${pkgs.jq}/bin/jq -e '.plugin | index("./plugins/graphify.js") != null' "$TMPDIR/graphify-home/.opencode/opencode.json"
+        ${pkgs.jq}/bin/jq -e '.plugin | index("plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
+        ${pkgs.jq}/bin/jq -e '.plugin | index(".opencode/plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
+        test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
+        touch "$out"
+      '';
+
+      ponytail-harness-registration = pkgs.runCommand "infernix-ponytail-harness-registration-check" {} ''
+        ${ponytailActivation}
+        expected='${builtins.toJSON ponytailHarnesses}'
+        actual='${builtins.toJSON ponytailSample.config.services.infernix.ponytail.registeredHarnesses}'
+        test "$actual" = "$expected"
+        test "${ponytailSample.config.services.infernix.ponytail.adapterStatus.codex.mode}" = native
+        test "${ponytailSample.config.services.infernix.ponytail.adapterStatus.cursor.scope}" = project-only
+        test -f "$TMPDIR/ponytail-home/AGENTS.md"
+        test "$(grep -Fc '<!-- infernix-ponytail: begin -->' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
+        test "$(grep -Fc '# existing user guidance' "$TMPDIR/ponytail-home/AGENTS.md")" -eq 1
+        ${pkgs.jq}/bin/jq -e '.hooks.SessionStart | length == 2' "$TMPDIR/ponytail-home/.codex/hooks.json"
+        ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit | length == 1' "$TMPDIR/ponytail-home/.codex/hooks.json"
+        ${pkgs.jq}/bin/jq -e '.hooks.SessionStart[1].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
+        ${pkgs.jq}/bin/jq -e '.hooks.UserPromptSubmit[0].hooks[0].command | startswith("PLUGIN_DATA=")' "$TMPDIR/ponytail-home/.codex/hooks.json"
+        test "$(grep -Fc 'hooks.json:session_start:1:0' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 1
+        test "$(grep -Fc 'hooks.json:user_prompt_submit:0:0' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 1
+        test "$(grep -Ec 'trusted_hash = \"sha256:[0-9a-f]{64}\"' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 2
+        ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart == null' "$TMPDIR/ponytail-home/.codex/hooks.json"
+        ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
+        ${pkgs.jq}/bin/jq -e '.plugin | index("/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs") != null' "$TMPDIR/ponytail-home/.opencode/opencode.json"
+        ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
+        ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
+        ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs
+        ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/pi-extension/index.js
+        test -L "$TMPDIR/ponytail-home/.pi/agent/extensions/ponytail"
+        test -L "$TMPDIR/ponytail-home/.gemini/extensions/ponytail"
+        test -L "$TMPDIR/ponytail-home/.openclaw/skills/ponytail"
+        test -L "$TMPDIR/ponytail-home/.codex/plugins/ponytail"
+        test -L "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/local"
+        test -d "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4"
+        test -f "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4/.codex-plugin/plugin.json"
+        test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/.codex-plugin/plugin.json"
+        test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/skills/ponytail/SKILL.md"
+        test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/hooks/claude-codex-hooks.json"
+        grep -Fq '[plugins."ponytail@ponytail"]' "$TMPDIR/ponytail-home/.codex/config.toml"
+        grep -Fq 'enabled = true' "$TMPDIR/ponytail-home/.codex/config.toml"
+        grep -Fq '[features]' "$TMPDIR/ponytail-home/.codex/config.toml"
+        grep -Fq 'plugins = true' "$TMPDIR/ponytail-home/.codex/config.toml"
+        grep -Fq '[marketplaces.ponytail]' "$TMPDIR/ponytail-home/.codex/config.toml"
+        grep -Fq 'source_type = "local"' "$TMPDIR/ponytail-home/.codex/config.toml"
+        grep -Fq 'source = "/tmp/infernix-ponytail-fixture"' "$TMPDIR/ponytail-home/.codex/config.toml"
+        touch "$out"
+      '';
+
+      openpencil-mcp = pkgs.runCommand "infernix-openpencil-mcp-check" {} ''
+        test "${openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.command}" = "${openpencilFixturePackage}/bin/openpencil-desktop"
+        test "${builtins.elemAt openpencilSample.config.services.infernix.mcp.resolvedServers.openpencil.args 0}" = "--mcp"
+        ${openpencilActivation}
+        ${openpencilForceActivation}
+        ${openpencilOffActivation}
+        ${openpencilMalformedActivation}
+        touch "$out"
+      '';
+
+      mcp-adapters = assert import ./tests/mcp.nix {
+        inherit pkgs fleetix;
+        homeManager = home-manager;
+      };
+        pkgs.runCommand "infernix-mcp-adapters" {} ''touch $out'';
+
+      graphify-acp-provider = pkgs.runCommand "infernix-graphify-acp-provider-check" {} ''
+        provider='${builtins.toJSON graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex}'
+        printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.capabilities == {"image":true,"sessionConfig":true,"text":true}'
+        printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.configOptions == {}'
+        printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.environment.CODEX_HOME == "/home/tester/.codex"'
+        test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_SEMANTIC_BACKEND}" = acp
+        test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_BIN}" = "${graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex.command}"
+        test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_MODEL}" = gpt-5.5
+        test '${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_CONFIG_JSON}' = '{"mode":"read-only"}'
+        test "${graphifyAcpSample.config.services.infernix.graphify.package}" = "${graphify.packages.${system}.acp}"
+        touch "$out"
+      '';
+
+      codex-acp-closure = let
+        closure = pkgs.closureInfo {
+          rootPaths = [self.packages.${system}.codex-acp];
+        };
+      in
+        pkgs.runCommand "infernix-codex-acp-closure-check" {} ''
+          package=${self.packages.${system}.codex-acp}
+          test -x "$package/bin/codex-acp"
+          test -f "$package/libexec/codex-acp/index.js"
+          test ! -e "$package/lib/node_modules"
+          test "$(find "$package" -type f | wc -l)" -eq 2
+          test "$(grep -Fxc '${pkgs.codex}' ${closure}/store-paths)" -eq 1
+          touch "$out"
+        '';
+
+      claude-code-routing = pkgs.runCommand "infernix-claude-code-routing-check" {} ''
+        providers='${builtins.toJSON claudeCodeRouterConfig.Providers}'
+        opencode='${builtins.toJSON opencodeModelSample.config.programs.opencode.settings.provider}'
+        printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e 'map(.name) | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
+        printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_base_url == "http://127.0.0.1:3967/v1/chat/completions"'
+        printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "deepseek") | .api_key == "$DEEPSEEK_API_KEY"'
+        printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e 'keys | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
+        test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
+        test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"
+        test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}" = "${pkgs.claude-code-router}/bin/ccr start"
+        touch "$out"
+      '';
+
+      codex-provider-closure = pkgs.runCommand "infernix-codex-provider-closure-check" {} ''
+        package=${self.packages.${system}.codex-provider}
+        test -x "$package/bin/infernix-codex-provider"
+        test -f "$package/libexec/infernix-codex-provider/server.mjs"
+        grep -Fq 'const args = ["exec"' "$package/libexec/infernix-codex-provider/server.mjs"
+        ! grep -Eiq 'mcp|acp' "$package/libexec/infernix-codex-provider/server.mjs"
+        touch "$out"
+      '';
+
+      graphify-nixos-module =
+        if graphifyNixosModuleAvailable
+        then
+          pkgs.runCommand "infernix-graphify-nixos-module-check" {} ''
+            test "${graphifyNixosSample.config.services.graphify.instances.postgresql.source.postgresql.database}" = infernix
+            test "${graphifyNixosSample.config.services.graphify.package}" = "${graphify.packages.${system}.full}"
+            test "${graphifyNixosSample.config.systemd.services.graphify-postgresql.serviceConfig.User}" = graphify
+            test "${toString graphifyNixosSample.config.systemd.services.graphify-postgresql.serviceConfig.ExecStart}" != ""
+            touch "$out"
+          ''
+        else
+          pkgs.runCommand "infernix-graphify-nixos-module-unavailable" {} ''
+            echo "Graphify input predates nixosModules.default; override or bump it to exercise this check." >&2
             touch "$out"
           '';
 
-          llama-swap-extra-files = pkgs.runCommand "infernix-llama-swap-extra-files-check" { } ''
-            grep -Fq 'expected_files["main.gguf"]=1' ${llamaSwapDownloadScript}
-            grep -Fq 'expected_files["mmproj-main.gguf"]=1' ${llamaSwapDownloadScript}
-            grep -Fq 'Downloading main.gguf from example/main-model' ${llamaSwapDownloadScript}
-            grep -Fq 'Downloading mmproj-main.gguf from example/main-model' ${llamaSwapDownloadScript}
-            test "${toString (builtins.length llamaSwapExtraFilesSample.config.systemd.services.infernix-download.restartTriggers)}" = "1"
-            touch "$out"
-          '';
+      workload-fabric = pkgs.runCommand "infernix-workload-fabric-check" {} ''
+        test "${workloadFabricSample.config.services.infernix.workloadFabric.workerId}" = "atlas"
+        case ${pkgs.lib.escapeShellArg (toString workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig.ExecStart)} in
+          *"/bin/infernix-workerd --config"*" worker") ;;
+          *) echo "workerd service does not run the worker command" >&2; exit 1 ;;
+        esac
+        requires='${builtins.toJSON workloadFabricSample.config.systemd.services.infernix-workerd.requires}'
+        printf '%s' "$requires" | ${pkgs.jq}/bin/jq -e 'index("infernix-workload-migrate.service")'
+        queues='${builtins.toJSON workloadFabricSample.config.services.infernix.workloadFabric.adapters.graphify.queues}'
+        printf '%s' "$queues" | ${pkgs.jq}/bin/jq -e '.[0] == "code" and .[1] == "semantic"'
+        grep -Fq 'timeout_secs = 42' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'heartbeat_secs = 30' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'health_url = "http://127.0.0.1:8014/healthz"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        ! grep -Eiq 'opaque-fixture-reference|prompt|source' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        touch "$out"
+      '';
 
-          model-catalog = pkgs.runCommand "infernix-model-catalog-check" { } ''
-            test "${renderedLlamaSwapModels.qwen3-vl-8b.repo}" = "Qwen/Qwen3-VL-8B-Instruct-GGUF"
-            test "${builtins.elemAt renderedLlamaSwapModels.qwen3-vl-8b.extraArgs 0}" = "--mmproj /models/mmproj.gguf"
-            test "${renderedFleetModels.qwen3-vl-8b.name}" = "qwen3-vl-8b"
-            test "${builtins.elemAt renderedFleetModels.qwen3-vl-8b.capabilities 0}" = "chat"
-            test "${renderedHmModels.vlm.name}" = "qwen3-vl-8b"
-            test "${toString renderedHmModels.vlm.ctxSize}" = "4096"
-            touch "$out"
-          '';
-        });
-    };
+      workload-profile = pkgs.runCommand "infernix-workload-profile-check" {} ''
+        profile='${builtins.toJSON workloadProfileSample.config.services.infernix.resolvedWorkloads.semantic}'
+        printf '%s' "$profile" | ${pkgs.jq}/bin/jq -e '
+          .schemaVersion == 1
+          and .routing.primary.capability == "chat"
+          and .routing.fallback.endpoint == "fallback"
+          and .routing.healthAware == true
+          and .routing.timeoutSecs == 42
+          and .execution.adapter == "fixture-adapter"
+          and .lease.heartbeatSecs == 30
+          and .lease.maxAttempts == 3
+          and .routing.credentialRequired == true
+        '
+        ! printf '%s' "$profile" | ${pkgs.jq}/bin/jq -e 'tostring | test("opaque-fixture-reference|prompt|source")'
+        touch "$out"
+      '';
+
+      hermes-model-routing-sidecar =
+        pkgs.runCommand "infernix-hermes-model-routing-sidecar-check"
+        {
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+          nativeBuildInputs = [
+            nix-pklx.packages.${system}.pklx
+            pkgs.cacert
+            pkgs.diffutils
+            pkgs.jq
+            pkgs.nix
+          ];
+        } ''
+          export NIX_STATE_DIR="$TMPDIR/nix-state"
+          export NIX_LOG_DIR="$TMPDIR/nix-log"
+          export NIX_CONF_DIR="$TMPDIR/nix-conf"
+          mkdir -p "$NIX_STATE_DIR" "$NIX_LOG_DIR" "$NIX_CONF_DIR"
+
+          pklx eval ${./lib/hermes/ModelRouting.pkl} -o actual.nix
+          nix-instantiate --eval --json --strict actual.nix | jq -S -c . > actual.json
+          nix-instantiate --eval --json --strict ${./lib/hermes/model-routing.nix} | jq -S -c . > expected.json
+          diff -u actual.json expected.json
+          touch "$out"
+        '';
+
+      llama-swap-extra-files = pkgs.runCommand "infernix-llama-swap-extra-files-check" {} ''
+        grep -Fq 'expected_files["main.gguf"]=1' ${llamaSwapDownloadScript}
+        grep -Fq 'expected_files["mmproj-main.gguf"]=1' ${llamaSwapDownloadScript}
+        grep -Fq 'Downloading main.gguf from example/main-model' ${llamaSwapDownloadScript}
+        grep -Fq 'Downloading mmproj-main.gguf from example/main-model' ${llamaSwapDownloadScript}
+        test "${toString (builtins.length llamaSwapExtraFilesSample.config.systemd.services.infernix-download.restartTriggers)}" = "1"
+        touch "$out"
+      '';
+
+      model-catalog = pkgs.runCommand "infernix-model-catalog-check" {} ''
+        test "${renderedLlamaSwapModels.qwen3-vl-8b.repo}" = "Qwen/Qwen3-VL-8B-Instruct-GGUF"
+        test "${builtins.elemAt renderedLlamaSwapModels.qwen3-vl-8b.extraArgs 0}" = "--mmproj /models/mmproj.gguf"
+        test "${renderedFleetModels.qwen3-vl-8b.name}" = "qwen3-vl-8b"
+        test "${builtins.elemAt renderedFleetModels.qwen3-vl-8b.capabilities 0}" = "chat"
+        test "${renderedHmModels.vlm.name}" = "qwen3-vl-8b"
+        test "${toString renderedHmModels.vlm.ctxSize}" = "4096"
+        touch "$out"
+      '';
+    });
+  };
 }

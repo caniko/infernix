@@ -28,39 +28,6 @@
       && systemPackages ? ${manifest.packages.prebuiltRuntime}
     then systemPackages.${manifest.packages.prebuiltRuntime}
     else null;
-  manifestHarnesses =
-    if manifest != null && manifest ? harnesses
-    then manifest.harnesses
-    else {};
-  manifestAdapter = adapter: let
-    format = adapter.format or null;
-    rawRoot =
-      if adapter ? root
-      then
-        if builtins.isList adapter.root
-        then adapter.root
-        else [adapter.root]
-      else ["mcpServers"];
-    # TOML MCP files use snake_case tables; the manifest default targets JSON
-    # files, so normalize the default (or an explicitly camelCase) root.
-    root =
-      if format == "toml" && rawRoot == ["mcpServers"]
-      then ["mcp_servers"]
-      else rawRoot;
-    supported = lib.elem format ["json" "toml"];
-  in
-    if supported
-    then {
-      adapters.mcp = {
-        inherit format root;
-        configPath = adapter.configPath;
-        serverKey = adapter.serverKey or null;
-      };
-    }
-    else {
-      unsupported = "OpenPencil adapter format '${toString format}' is not supported by Infernix's JSON/TOML MCP registry.";
-    };
-  registeredHarnesses = lib.mapAttrs (_: manifestAdapter) manifestHarnesses;
 in {
   options.services.infernix.openpencil = {
     enable = mkEnableOption "OpenPencil MCP integration";
@@ -90,7 +57,7 @@ in {
       default = null;
       description = ''
         Optional harness allowlist. Null lets the registry select every
-        detected OpenPencil adapter; use services.infernix.harnesses.<name>.mode
+        detected Fleetix adapter; use services.infernix.harnesses.<name>.mode
         = "force" for config-only clients.
       '';
     };
@@ -109,14 +76,13 @@ in {
         }
       ]
       ++ lib.optionals (cfg.harnesses != null) (map (name: {
-          assertion = builtins.hasAttr name manifestHarnesses;
-          message = "services.infernix.openpencil.harnesses contains unknown OpenPencil harness '${name}'.";
+          assertion = builtins.hasAttr name config.fleetix.mcp.harnesses;
+          message = "services.infernix.openpencil.harnesses contains unconfigured harness '${name}'.";
         })
         cfg.harnesses);
 
-    services.infernix.harnesses = registeredHarnesses;
     services.infernix.mcp.servers.openpencil = {
-      transport = cfg.transport;
+      inherit (cfg) transport;
       command = "${cfg.package}/bin/${manifest.executables.desktop}";
       args = ["--mcp" cfg.document];
       url = lib.mkIf (cfg.transport == "http") "http://127.0.0.1:${toString cfg.live.port}/mcp";

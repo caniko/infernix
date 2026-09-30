@@ -286,6 +286,9 @@
           cross = rs-harbor.lib.mkCross { inherit pkgs system; };
         in
         {
+          default = toolchain.craneLib.devShell {
+            packages = [ pkgs.pkg-config pkgs.openssl ];
+          };
           docs = rs-harbor.lib.mkDocsShell {
             inherit pkgs cross;
             inherit (toolchain) craneLib;

@@ -6,7 +6,6 @@
     ./acp.nix
     ./harnesses.nix
     ./mcp.nix
-    ./graphify.nix
     ./ponytail.nix
     ./goose.nix
     ./hermes-agent.nix

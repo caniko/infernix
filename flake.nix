@@ -65,13 +65,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.hermes-agent.follows = "hermes-agent";
     };
-
-    # Graphify is exposed through Infernix so every supported agent harness
-    # receives the same registration and package revision.
-    graphify = {
-      url = "github:caniko/graphify/0b1e9723577b35b974eb36441eec47a624ef0082";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs = {
@@ -87,7 +80,6 @@
     rust-overlay,
     hermes-agent,
     hermes-webui,
-    graphify,
     colibri,
   }: let
     # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
@@ -162,61 +154,50 @@
       openpencilSupport = true;
     };
 
-    nixosModules =
-      {
-        visual-rubric = {
-          imports = [./modules/nixos/visual-rubric.nix];
-          _module.args.infernixVisualRubric = visual-rubric;
-        };
-        default = {
-          lib,
-          pkgs,
-          ...
-        }: {
-          imports =
-            [
-              ./modules/nixos
-              ./modules/nixos/hermes-dashboard-instances.nix
-              # Re-export upstream NixOS modules under the same default import
-              # path so consumers get their options for free.
-              hermes-agent.nixosModules.default
-            ]
-            ++ lib.optional
-            (hermes-agent.nixosModules ? instances)
-            hermes-agent.nixosModules.instances
-            ++ [
-              hermes-webui.nixosModules.default
-            ]
-            ++ lib.optional
-            (graphify ? nixosModules && graphify.nixosModules ? default)
-            graphify.nixosModules.default;
-          # Thread the locked nixos-unstable nixpkgs flake into the module tree
-          # so ollama / llama-cpp / llama-swap can re-instantiate it with the
-          # consumer's own system + config (GPU flags, allowUnfree, etc.).
-          _module.args.infernixBleedingNixpkgs = nixpkgs;
-          _module.args.infernixHermesAgent = hermes-agent;
-          _module.args.infernixHermesWebui = hermes-webui;
-          _module.args.infernixVisualRubric = visual-rubric;
-          _module.args.infernixGraphify = graphify;
-          _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
-          _module.args.infernixSelf = self;
-          _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
-        };
-
-        pink-raven-workload = ./modules/nixos/pink-raven-workload.nix;
-      }
-      // nixpkgs.lib.optionalAttrs
-      (graphify ? nixosModules && graphify.nixosModules ? default)
-      {
-        graphify = graphify.nixosModules.default;
+    nixosModules = {
+      visual-rubric = {
+        imports = [./modules/nixos/visual-rubric.nix];
+        _module.args.infernixVisualRubric = visual-rubric;
       };
+      default = {
+        lib,
+        pkgs,
+        ...
+      }: {
+        imports =
+          [
+            ./modules/nixos
+            ./modules/nixos/hermes-dashboard-instances.nix
+            # Re-export upstream NixOS modules under the same default import
+            # path so consumers get their options for free.
+            hermes-agent.nixosModules.default
+          ]
+          ++ lib.optional
+          (hermes-agent.nixosModules ? instances)
+          hermes-agent.nixosModules.instances
+          ++ [
+            hermes-webui.nixosModules.default
+          ];
+        # Thread the locked nixos-unstable nixpkgs flake into the module tree
+        # so ollama / llama-cpp / llama-swap can re-instantiate it with the
+        # consumer's own system + config (GPU flags, allowUnfree, etc.).
+        _module.args.infernixBleedingNixpkgs = nixpkgs;
+        _module.args.infernixHermesAgent = hermes-agent;
+        _module.args.infernixHermesWebui = hermes-webui;
+        _module.args.infernixVisualRubric = visual-rubric;
+        _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
+        _module.args.infernixSelf = self;
+        _module.args.infernixMkLbPackageForPkgs = mkLbPackageForPkgs;
+      };
+
+      pink-raven-workload = ./modules/nixos/pink-raven-workload.nix;
+    };
 
     homeModules = {
       default = {pkgs, ...}: {
         imports = [fleetix.homeModules.mcp (import ./modules/home-manager)];
         _module.args.infernixFleetixLib = fleetix.lib;
         _module.args.infernixVisualRubric = visual-rubric;
-        _module.args.infernixGraphify = graphify;
         _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
         _module.args.infernixPonytail = self.packages.${pkgs.stdenv.hostPlatform.system}.ponytail;
       };
@@ -248,7 +229,7 @@
       # services.infernix.endpoints. Only import for users that also
       # configure services.infernix.hermes-agent.
       hermes-agent = import ./modules/home-manager/hermes-agent-programs.nix;
-      openpencil = { ...}: {
+      openpencil = {...}: {
         imports = [
           fleetix.homeModules.mcp
           ./modules/home-manager/harnesses.nix
@@ -312,9 +293,6 @@
           inherit (pkgs) symlinkJoin;
           nvccHostCc = pkgsUnfree.gcc14;
         };
-        graphify =
-          graphify.packages.${system}.full
-              or graphify.packages.${system}.default;
         default = infernix-lb;
       }
       // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
@@ -408,34 +386,6 @@
         ];
       };
       claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.xdg.configFile."claude-code-router/config.json".source);
-      graphifyNixosModuleAvailable =
-        graphify ? nixosModules
-        && graphify.nixosModules ? default;
-      graphifyNixosSample =
-        if graphifyNixosModuleAvailable
-        then
-          nixpkgs.lib.nixosSystem
-          {
-            inherit system;
-            modules = [
-              self.nixosModules.default
-              {
-                system.stateVersion = "24.11";
-                services.graphify = {
-                  enable = true;
-                  instances.postgresql = {
-                    source.postgresql = {
-                      enable = true;
-                      database = "infernix";
-                    };
-                    extraction.onCalendar = "daily";
-                    server.enable = true;
-                  };
-                };
-              }
-            ];
-          }
-        else null;
       workloadFabricSample = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -448,11 +398,11 @@
               databaseUrl = "postgres:///canix?host=/run/postgresql";
               workerId = "atlas";
               capabilities = ["cpu" "semantic"];
-              adapters.graphify = {
-                workload = "graphify";
+              adapters.fixture = {
+                workload = "fixture";
                 queues = ["code" "semantic"];
                 command = "/bin/canix";
-                args = ["graphify" "run-job"];
+                args = ["fixture" "run-job"];
               };
               profiles.semantic = {
                 routing = {
@@ -473,7 +423,7 @@
                   retry.maxAttempts = 2;
                 };
                 execution = {
-                  adapter = "graphify-adapter";
+                  adapter = "fixture-adapter";
                   queues = ["semantic"];
                 };
                 lease = {
@@ -756,61 +706,6 @@
         (package: package == visual-rubric.packages.${system}.default)
         null
         visualRubricPipelineSample.config.home.packages;
-      graphifyHarnesses = [
-        "agents"
-        "aider"
-        "amp"
-        "antigravity"
-        "claude"
-        "claw"
-        "codebuddy"
-        "codex"
-        "copilot"
-        "cursor"
-        "devin"
-        "droid"
-        "gemini"
-        "hermes"
-        "kilo"
-        "kiro"
-        "kimi"
-        "opencode"
-        "pi"
-        "trae"
-        "trae-cn"
-        "vscode"
-      ];
-      graphifySample = home-manager.lib.homeManagerConfiguration {
-        inherit pkgs;
-        modules = [
-          self.homeModules.default
-          {
-            home = {
-              username = "tester";
-              homeDirectory = "/home/tester";
-              stateVersion = "24.11";
-            };
-            services.infernix.endpoints.local = {
-              type = "llama-swap";
-              url = "http://127.0.0.1:8013";
-              healthUrl = "http://127.0.0.1:8013/healthz";
-              models.dsv4.name = "dsv4";
-              models.dsv4.capabilities = ["chat"];
-            };
-            services.infernix.workloads.semantic = {
-              routing = {
-                endpoint = "local";
-                model = "dsv4";
-                capability = "chat";
-              };
-            };
-            services.infernix.graphify = {
-              enable = true;
-              workloadProfile = "semantic";
-            };
-          }
-        ];
-      };
       workloadProfileSample = home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
         modules = [
@@ -928,31 +823,10 @@
         printf '%s\n' '# existing user guidance' > "$HOME/AGENTS.md"
         printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}' > "$HOME/.codex/hooks.json"
         printf '%s\n' '[hooks.state]' > "$HOME/.codex/config.toml"
-        printf '%s\n' '{"plugin":["plugins/graphify.js"]}' > "$HOME/.opencode/opencode.json"
+        printf '%s\n' '{"plugin":["plugins/existing.js"]}' > "$HOME/.opencode/opencode.json"
         ${ponytailSample.config.home.activation.infernixPonytail.data}
         ${ponytailSample.config.home.activation.infernixPonytail.data}
       '';
-      graphifyExpectedPackageName =
-        if graphify.packages.${system} ? full
-        then graphify.packages.${system}.full.name
-        else "graphify-with-openai";
-      graphifyAcpSample = home-manager.lib.homeManagerConfiguration {
-        inherit pkgs;
-        modules = [
-          self.homeModules.default
-          {
-            home = {
-              username = "tester";
-              homeDirectory = "/home/tester";
-              stateVersion = "24.11";
-            };
-            services.infernix.graphify = {
-              enable = true;
-              semanticBackend = "acp";
-            };
-          }
-        ];
-      };
       openpencilFixturePackage = pkgs.runCommand "openpencil-fixture" {} ''
         mkdir -p "$out/bin" "$out/share/openpencil"
         printf '#!/bin/sh\n' > "$out/bin/openpencil-desktop"
@@ -1136,12 +1010,6 @@
           exit 1
         fi
         test "$(cat "$HOME/.claude.json")" = "{"
-      '';
-      graphifyRegistrationScript = pkgs.writeShellScript "infernix-graphify-harness-registration" ''
-        set -eu
-        export HOME="$TMPDIR/graphify-home"
-        mkdir -p "$HOME"
-        ${graphifySample.config.home.activation.infernixGraphify.data}
       '';
       modelCatalogSample = {
         models = {
@@ -1443,33 +1311,6 @@
         touch "$out"
       '';
 
-      graphify-harness-registration = pkgs.runCommand "infernix-graphify-harness-registration-check" {} ''
-        ${graphifyRegistrationScript}
-        ${graphifyRegistrationScript}
-        expected='${builtins.toJSON graphifyHarnesses}'
-        actual='${builtins.toJSON graphifySample.config.services.infernix.graphify.registeredHarnesses}'
-        test "$actual" = "$expected"
-        test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_BASE_URL}" = "http://127.0.0.1:8013/v1"
-        test "${graphifySample.config.services.infernix.graphify.generatedSettings.OPENAI_MODEL}" = "dsv4"
-        test "${graphifySample.config.services.infernix.graphify.package.name}" = "${graphifyExpectedPackageName}"
-        commands='${builtins.toJSON graphifySample.config.services.infernix.graphify.registrationCommands}'
-        printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'length == 22'
-        printf '%s' "$commands" | ${pkgs.jq}/bin/jq -e 'all(.[]; contains("graphify"))'
-        test -f "$TMPDIR/graphify-home/AGENTS.md"
-        test -f "$TMPDIR/graphify-home/CLAUDE.md"
-        test -f "$TMPDIR/graphify-home/.claude/settings.json"
-        test -f "$TMPDIR/graphify-home/.codex/hooks.json"
-        test -f "$TMPDIR/graphify-home/.gemini/settings.json"
-        test -f "$TMPDIR/graphify-home/.cursor/rules/graphify.mdc"
-        test -f "$TMPDIR/graphify-home/.kilo/kilo.json"
-        test -f "$TMPDIR/graphify-home/.opencode/opencode.json"
-        ${pkgs.jq}/bin/jq -e '.plugin | index("./plugins/graphify.js") != null' "$TMPDIR/graphify-home/.opencode/opencode.json"
-        ${pkgs.jq}/bin/jq -e '.plugin | index("plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
-        ${pkgs.jq}/bin/jq -e '.plugin | index(".opencode/plugins/graphify.js") == null' "$TMPDIR/graphify-home/.opencode/opencode.json"
-        test -f "$TMPDIR/graphify-home/.github/copilot-instructions.md"
-        touch "$out"
-      '';
-
       ponytail-harness-registration = pkgs.runCommand "infernix-ponytail-harness-registration-check" {} ''
         ${ponytailActivation}
         expected='${builtins.toJSON ponytailHarnesses}'
@@ -1530,19 +1371,6 @@
       };
         pkgs.runCommand "infernix-mcp-adapters" {} ''touch $out'';
 
-      graphify-acp-provider = pkgs.runCommand "infernix-graphify-acp-provider-check" {} ''
-        provider='${builtins.toJSON graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex}'
-        printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.capabilities == {"image":true,"sessionConfig":true,"text":true}'
-        printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.configOptions == {}'
-        printf '%s' "$provider" | ${pkgs.jq}/bin/jq -e '.environment.CODEX_HOME == "/home/tester/.codex"'
-        test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_SEMANTIC_BACKEND}" = acp
-        test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_BIN}" = "${graphifyAcpSample.config.services.infernix.acp.resolvedProviders.codex.command}"
-        test "${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_MODEL}" = gpt-5.5
-        test '${graphifyAcpSample.config.services.infernix.graphify.generatedSettings.GRAPHIFY_ACP_CONFIG_JSON}' = '{"mode":"read-only"}'
-        test "${graphifyAcpSample.config.services.infernix.graphify.package}" = "${graphify.packages.${system}.acp}"
-        touch "$out"
-      '';
-
       codex-acp-closure = let
         closure = pkgs.closureInfo {
           rootPaths = [self.packages.${system}.codex-acp];
@@ -1580,22 +1408,6 @@
         touch "$out"
       '';
 
-      graphify-nixos-module =
-        if graphifyNixosModuleAvailable
-        then
-          pkgs.runCommand "infernix-graphify-nixos-module-check" {} ''
-            test "${graphifyNixosSample.config.services.graphify.instances.postgresql.source.postgresql.database}" = infernix
-            test "${graphifyNixosSample.config.services.graphify.package}" = "${graphify.packages.${system}.full}"
-            test "${graphifyNixosSample.config.systemd.services.graphify-postgresql.serviceConfig.User}" = graphify
-            test "${toString graphifyNixosSample.config.systemd.services.graphify-postgresql.serviceConfig.ExecStart}" != ""
-            touch "$out"
-          ''
-        else
-          pkgs.runCommand "infernix-graphify-nixos-module-unavailable" {} ''
-            echo "Graphify input predates nixosModules.default; override or bump it to exercise this check." >&2
-            touch "$out"
-          '';
-
       workload-fabric = pkgs.runCommand "infernix-workload-fabric-check" {} ''
         test "${workloadFabricSample.config.services.infernix.workloadFabric.workerId}" = "atlas"
         case ${pkgs.lib.escapeShellArg (toString workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig.ExecStart)} in
@@ -1604,7 +1416,7 @@
         esac
         requires='${builtins.toJSON workloadFabricSample.config.systemd.services.infernix-workerd.requires}'
         printf '%s' "$requires" | ${pkgs.jq}/bin/jq -e 'index("infernix-workload-migrate.service")'
-        queues='${builtins.toJSON workloadFabricSample.config.services.infernix.workloadFabric.adapters.graphify.queues}'
+        queues='${builtins.toJSON workloadFabricSample.config.services.infernix.workloadFabric.adapters.fixture.queues}'
         printf '%s' "$queues" | ${pkgs.jq}/bin/jq -e '.[0] == "code" and .[1] == "semantic"'
         grep -Fq 'timeout_secs = 42' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         grep -Fq 'heartbeat_secs = 30' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"

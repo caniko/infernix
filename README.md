@@ -74,12 +74,6 @@ Home-manager modules (`homeModules.default`):
   user, writing to `programs.yh.steeds` under `mkIf` still triggers
   type-checking for users who don't import yeeHaw's HM module. Wire it in
   yourself with one line per user — see the snippet below.
-- **`services.infernix.graphify`** — installs the Infernix-owned Graphify
-  package with its OpenAI-compatible semantic extras, resolves the configured
-  endpoint/model, and registers Graphify with every Unix harness supported by
-  the pinned Graphify release. Registration runs idempotently during Home
-  Manager activation; the read-only `registeredHarnesses` and
-  `registrationCommands` options expose the resolved contract.
 - **`services.infernix.ponytail`** — installs the pinned Ponytail runtime and
   wires native hooks/plugins plus instruction and skill fallbacks across the
   union of Ponytail's portability matrix and Infernix's harness registry.
@@ -256,19 +250,6 @@ If you already import Goose's Home Manager module, add
 If you already import yeeHaw's Home Manager module, add
 `infernix.homeModules.yeehaw` to the module list to write
 `programs.yh.steeds` from `services.infernix.yeehaw.generatedSteeds`.
-
-To enable Graphify and its shared harness registration, declare one Infernix
-endpoint and select its model. The default `harnesses` list covers the full
-Unix Graphify target set; override it only for a deliberately narrower
-profile:
-
-```nix
-services.infernix.graphify = {
-  enable = true;
-  endpoint = "local-llama-swap";
-  model = "coder";
-};
-```
 
 To enable Ponytail's shared guidance and harness adapters:
 

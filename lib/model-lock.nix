@@ -4,7 +4,7 @@
 }: {
   command = shared: path: [
     (lib.getExe' pkgs.python3 "python3")
-    (toString ./model-lock.py)
+    "${./model-lock.py}"
     (
       if shared
       then "--shared"

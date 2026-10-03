@@ -447,23 +447,26 @@
             system.stateVersion = "24.11";
 
             services.infernix.fleet = {
-              nodes = fleetix.lib.adapters.infernix.mkFleetNodes {
-                topology = {
-                  hosts.atlas = {
-                    network = {
-                      lanIp = "192.168.178.88";
-                      directLinkIp = "10.10.0.1";
+              nodes.atlas = {
+                # Exercise Fleetix's published address resolver. The old
+                # adapters.infernix API is absent from the locked input.
+                address = fleetix.lib.hosts.resolveHostAddress {
+                  topology = {
+                    hosts.atlas = {
+                      network = {
+                        lanIp = "192.168.178.88";
+                        directLinkIp = "10.10.0.1";
+                      };
+                      links.wg-home.address = "10.123.0.5";
                     };
-                    links.wg-home.address = "10.123.0.5";
                   };
-                  services.reverseProxyServices = [];
+                  hostName = "atlas";
+                  policy = ["lan" "wg-home"];
                 };
-                nodes.atlas = {
-                  priority = 30;
-                  models.qwen3-vl-8b = {
-                    name = "qwen3-vl-8b";
-                    capabilities = ["chat"];
-                  };
+                priority = 30;
+                models.qwen3-vl-8b = {
+                  name = "qwen3-vl-8b";
+                  capabilities = ["chat"];
                 };
               };
               loadBalancer = {

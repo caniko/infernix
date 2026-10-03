@@ -29,30 +29,34 @@
   pkgs,
   ...
 }: let
-  inherit (lib)
+  inherit
+    (lib)
     concatStringsSep
     escapeShellArgs
     filterAttrs
     flip
     getExe'
     mapAttrsToList
-    mapAttrs'
     mkEnableOption
     mkIf
     mkMerge
     mkOption
     nameValuePair
     optionalAttrs
-    optionals
     types
     ;
 
   cfg = config.services.infernix.colibri;
+  modelLock = import ../../lib/model-lock.nix {inherit lib pkgs;};
 
-  colibriPackaging = import ../../lib/colibri-packaging.nix { inherit lib; };
-  exclLib = import ../../lib/exclusive-units.nix { inherit lib; };
+  colibriPackaging = import ../../lib/colibri-packaging.nix {inherit lib;};
+  exclLib = import ../../lib/exclusive-units.nix {inherit lib;};
 
-  profileType = types.submodule ({ name, ... }: {
+  profileType = types.submodule ({
+    name,
+    config,
+    ...
+  }: {
     options = {
       enable = mkEnableOption "Colibri ${name} profile";
       port = mkOption {
@@ -67,6 +71,11 @@
       modelDir = mkOption {
         type = types.path;
         description = "Final model directory published atomically by the fetch unit (must contain ready.json).";
+      };
+      lockPath = mkOption {
+        type = types.str;
+        default = "${toString config.modelDir}.doty-lock";
+        description = "Persistent producer/consumer/cleanup lock beside the snapshot; never unlink.";
       };
       stagingDir = mkOption {
         type = types.path;
@@ -226,7 +235,7 @@
             };
           };
         });
-        default = [ ];
+        default = [];
         description = "Files to fetch (empty = whole revision).";
       };
       weightsTotalBytes = mkOption {
@@ -393,7 +402,7 @@
       inherit (profile) maxQueue;
       inherit (profile) queueTimeout;
       inherit (profile) kvSlots;
-      expertSlotsPerLayer = profile.expertSlotsPerLayer;
+      inherit (profile) expertSlotsPerLayer;
       rev = profile.weightsRev;
       repo = profile.weightsRepo;
       files = map (f: f.name) profile.weightsFiles;
@@ -404,68 +413,80 @@
     pkgs.writeText "infernix-colibri-fetch-${name}.json" (builtins.toJSON {
       repo = profile.weightsRepo;
       rev = profile.weightsRev;
-      files = map (f: ({name = f.name;} // optionalAttrs (f.sizeBytes != null) {sizeBytes = f.sizeBytes;} // optionalAttrs ((f.sha256 or null) != null) {sha256 = f.sha256;})) profile.weightsFiles;
+      files = map (f: ({inherit (f) name;} // optionalAttrs (f.sizeBytes != null) {inherit (f) sizeBytes;} // optionalAttrs ((f.sha256 or null) != null) {inherit (f) sha256;})) profile.weightsFiles;
       totalBytes = profile.weightsTotalBytes;
       stagingDir = toString profile.stagingDir;
-      reserveBytes = profile.reserveBytes;
-      hfTokenPath = profile.hfTokenPath;
+      inherit (profile) reserveBytes;
+      inherit (profile) hfTokenPath;
       publish.finalDir = toString profile.modelDir;
     });
 
   backendEnv = profile:
     optionalAttrs (profile.backend != "cpu") {
       COLI_CUDA = "1";
-      CUDA_RELEASE_HOST = if profile.releaseHost then "1" else "0";
+      CUDA_RELEASE_HOST =
+        if profile.releaseHost
+        then "1"
+        else "0";
     }
     // optionalAttrs (profile.gpuDevices != null) {COLI_GPUS = profile.gpuDevices;}
     // optionalAttrs (profile.expertGb != null) {CUDA_EXPERT_GB = toString profile.expertGb;}
-    // optionalAttrs (profile.strictResidency) {COLI_STRICT_RESIDENCY = "1";};
+    // optionalAttrs profile.strictResidency {COLI_STRICT_RESIDENCY = "1";};
 
-  nodeName = if cfg.nodeName != null then cfg.nodeName else config.services.infernix.fleet.localNodeName;
+  nodeName =
+    if cfg.nodeName != null
+    then cfg.nodeName
+    else config.services.infernix.fleet.localNodeName;
 
-  globalChecks =
-    let
-      pkgBackend = cfg.package.passthru.colibriBackend or "cpu";
-    in
-    [
-      {
-        message = "services.infernix.colibri: enabling any profile requires services.infernix.colibri.package";
-        ok = enabledProfiles == { } || cfg.package != null;
-      }
-      {
-        message = "services.infernix.colibri: every enabled profile's backend must equal the package build flavor (passthru.colibriBackend); a mismatch would silently serve CPU while claiming VRAM";
-        ok = cfg.package == null
-          || builtins.all (profile: profile.backend == pkgBackend) (builtins.attrValues enabledProfiles);
-      }
-      {
-        message = "services.infernix.colibri: non-cpu backends require expertSlotsPerLayer (the qwen36 VRAM tier activates only at cap == n_experts; without it the engine silently serves CPU)";
-        ok = builtins.all
-          (profile: profile.backend == "cpu" || profile.expertSlotsPerLayer != null)
-          (builtins.attrValues enabledProfiles);
-      }
-      {
-        message = "services.infernix.colibri: only engines with GPU-tier expert execution (${concatStringsSep ", " colibriPackaging.gpuTierEngines}) may use a non-cpu backend -- the GLM engine streams experts from disk, so a gpu build does not make it VRAM inference";
-        ok = builtins.all
-          (profile: profile.backend == "cpu" || builtins.elem profile.engine colibriPackaging.gpuTierEngines)
-          (builtins.attrValues enabledProfiles);
-      }
-      {
-        message = "services.infernix.colibri: non-cpu backends require strictResidency (COLI_STRICT_RESIDENCY=1 refuses partial placement instead of serving hybrid inference)";
-        ok = builtins.all
-          (profile: profile.backend == "cpu" || profile.strictResidency)
-          (builtins.attrValues enabledProfiles);
-      }
-      {
-        message = "services.infernix.colibri: at most one heavyweight profile may be enabled (disk/RAM streaming pressure)";
-        ok = builtins.length (builtins.attrValues (filterAttrs (_: profile: profile.enable && profile.heavyweight) cfg.profiles)) <= 1;
-      }
-      {
-        message = "services.infernix.colibri: enabling any profile requires pinning the fleet node's healthUnits explicitly -- a down Colibri must never withdraw working routes by default (null healthUnits gates on every lifecycle unit)";
-        ok = enabledProfiles == { }
-          || (nodeName != null
-            && (config.services.infernix.fleet.nodes.${nodeName}.healthUnits or null) != null);
-      }
-    ];
+  globalChecks = let
+    pkgBackend = cfg.package.passthru.colibriBackend or "cpu";
+  in [
+    {
+      message = "services.infernix.colibri: enabling any profile requires services.infernix.colibri.package";
+      ok = enabledProfiles == {} || cfg.package != null;
+    }
+    {
+      message = "services.infernix.colibri: every enabled profile's backend must equal the package build flavor (passthru.colibriBackend); a mismatch would silently serve CPU while claiming VRAM";
+      ok =
+        cfg.package
+        == null
+        || builtins.all (profile: profile.backend == pkgBackend) (builtins.attrValues enabledProfiles);
+    }
+    {
+      message = "services.infernix.colibri: non-cpu backends require expertSlotsPerLayer (the qwen36 VRAM tier activates only at cap == n_experts; without it the engine silently serves CPU)";
+      ok =
+        builtins.all
+        (profile: profile.backend == "cpu" || profile.expertSlotsPerLayer != null)
+        (builtins.attrValues enabledProfiles);
+    }
+    {
+      message = "services.infernix.colibri: only engines with GPU-tier expert execution (${concatStringsSep ", " colibriPackaging.gpuTierEngines}) may use a non-cpu backend -- the GLM engine streams experts from disk, so a gpu build does not make it VRAM inference";
+      ok =
+        builtins.all
+        (profile: profile.backend == "cpu" || builtins.elem profile.engine colibriPackaging.gpuTierEngines)
+        (builtins.attrValues enabledProfiles);
+    }
+    {
+      message = "services.infernix.colibri: non-cpu backends require strictResidency (COLI_STRICT_RESIDENCY=1 refuses partial placement instead of serving hybrid inference)";
+      ok =
+        builtins.all
+        (profile: profile.backend == "cpu" || profile.strictResidency)
+        (builtins.attrValues enabledProfiles);
+    }
+    {
+      message = "services.infernix.colibri: at most one heavyweight profile may be enabled (disk/RAM streaming pressure)";
+      ok = builtins.length (builtins.attrValues (filterAttrs (_: profile: profile.enable && profile.heavyweight) cfg.profiles)) <= 1;
+    }
+    {
+      message = "services.infernix.colibri: enabling any profile requires pinning the fleet node's healthUnits explicitly -- a down Colibri must never withdraw working routes by default (null healthUnits gates on every lifecycle unit)";
+      ok =
+        enabledProfiles
+        == {}
+        || (nodeName
+          != null
+          && (config.services.infernix.fleet.nodes.${nodeName}.healthUnits or null) != null);
+    }
+  ];
 
   profileChecks = name: profile: [
     {
@@ -479,8 +500,7 @@
   ];
 
   allChecks = globalChecks ++ builtins.concatLists (mapAttrsToList profileChecks cfg.profiles);
-in
-{
+in {
   options.services.infernix.colibri = {
     package = mkOption {
       type = types.nullOr types.package;
@@ -490,8 +510,14 @@ in
     evalChecks = mkOption {
       type = types.listOf (types.submodule {
         options = {
-          message = mkOption { type = types.str; readOnly = true; };
-          ok = mkOption { type = types.bool; readOnly = true; };
+          message = mkOption {
+            type = types.str;
+            readOnly = true;
+          };
+          ok = mkOption {
+            type = types.bool;
+            readOnly = true;
+          };
         };
       });
       readOnly = true;
@@ -505,32 +531,39 @@ in
     };
     openFirewallInterfaces = mkOption {
       type = types.listOf types.str;
-      default = [ ];
+      default = [];
       example = ["wg-home"];
       description = "Network interfaces where enabled profile ports are opened.";
     };
     profiles = mkOption {
       type = types.attrsOf profileType;
-      default = { };
+      default = {};
       description = "Named serve profiles; at most one heavyweight profile may be enabled.";
     };
   };
 
   config = mkMerge [
     {
-      assertions = map (check: { assertion = check.ok; message = check.message; }) cfg.evalChecks;
+      assertions =
+        map (check: {
+          assertion = check.ok;
+          inherit (check) message;
+        })
+        cfg.evalChecks;
     }
 
-    (mkIf (enabledProfiles != { } && nodeName != null) {
+    (mkIf (enabledProfiles != {} && nodeName != null) {
+      systemd.tmpfiles.rules = mapAttrsToList (_: profile: modelLock.anchor profile.lockPath) enabledProfiles;
       # Lifecycle: enabled profiles join nodectl drain/resume. Health is
       # deliberately untouched here (see the assertion above).
       services.infernix.fleet.nodes.${nodeName}.units =
         mapAttrsToList (name: _: "infernix-colibri-${name}.service") enabledProfiles;
 
       networking.firewall.interfaces = builtins.listToAttrs (map
-        (iface: nameValuePair iface {
-          allowedTCPPorts = mapAttrsToList (_: profile: profile.port) enabledProfiles;
-        })
+        (iface:
+          nameValuePair iface {
+            allowedTCPPorts = mapAttrsToList (_: profile: profile.port) enabledProfiles;
+          })
         cfg.openFirewallInterfaces);
 
       systemd.services = mkMerge (flip mapAttrsToList enabledProfiles (name: profile: {
@@ -549,11 +582,13 @@ in
           # failing the switch; revoking (rm) re-arms manual control.
           # Acceptance and GPU-admission protocols create the marker only
           # after verifying the GPU is drained for this profile.
-          unitConfig.ConditionPathExists = [
-            "${profile.modelDir}/ready.json"
-          ] ++ lib.optionals (profile.admissionMarker != null) [
-            profile.admissionMarker
-          ];
+          unitConfig.ConditionPathExists =
+            [
+              "${profile.modelDir}/ready.json"
+            ]
+            ++ lib.optionals (profile.admissionMarker != null) [
+              profile.admissionMarker
+            ];
           environment = backendEnv profile;
           serviceConfig =
             {
@@ -564,7 +599,7 @@ in
               WorkingDirectory = "/var/lib/infernix-colibri-${name}";
               # A list would render as repeated ExecStart directives, which
               # systemd only allows for Type=oneshot: join into one command.
-              ExecStart = escapeShellArgs ["${getExe' pkgs.python3 "python3"}" "${entrypoint}/bin/infernix-colibri-entrypoint" "${serveConfig name profile}"];
+              ExecStart = escapeShellArgs (modelLock.command true profile.lockPath ++ ["${getExe' pkgs.python3 "python3"}" "${entrypoint}/bin/infernix-colibri-entrypoint" "${serveConfig name profile}"]);
               LoadCredential = ["coli-api-key:${profile.apiKeyFile}"];
               Restart = "on-failure";
               RestartSec = "10s";
@@ -586,7 +621,7 @@ in
           # systemd only allows for Type=oneshot: join into one command.
           serviceConfig = {
             Type = "oneshot";
-            ExecStart = escapeShellArgs ["${fetchTool}/bin/infernix-colibri-fetch" "${fetchJob name profile}"];
+            ExecStart = escapeShellArgs (modelLock.command false profile.lockPath ++ ["${fetchTool}/bin/infernix-colibri-fetch" "${fetchJob name profile}"]);
           };
         };
       }));

@@ -2,7 +2,7 @@
 
 <!-- simit:badges:start -->
 
-![CI](https://img.shields.io/badge/CI-managed-2088ff) [![Nix](https://img.shields.io/badge/Nix-managed-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/infernix-lb)
+![CI](https://img.shields.io/badge/CI-managed-2088ff) [![Nix](https://img.shields.io/badge/Nix-drift-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/infernix-lb)
 
 <!-- simit:badges:end -->
 
@@ -47,6 +47,19 @@ NixOS modules (`nixosModules.default`):
   configurations.
 
 ### Inference packages
+
+Model publishers and consumers coordinate through persistent-inode flocks.
+Colibri uses `<modelDir>.doty-lock`; llama-swap uses a directory-wide
+`<modelsDir>.doty-lock`. Systemd tmpfiles provisions readable anchors. Fetch and
+download/autoCleanup hold exclusive locks; Colibri and each llama-server child
+hold shared locks across exec for their entire lifetime. A conflicting operation
+fails without starting its child. Never unlink an anchor to release a lock.
+`lockPath` overrides must also be used by external cleaners. The flake exports
+`lib.modelLocks = true` for downstream capability gating, and
+`lib/model-lock.nix` provides the shared command/anchor API.
+
+Run the native protocol tests with
+`python3 -m unittest discover -s tests -p '*_test.py'`.
 
 infernix uses a single `nixos-unstable` nixpkgs input for all packages,
 including `ollama`, `llama-cpp`, and `llama-swap`. GPU-aware packages are

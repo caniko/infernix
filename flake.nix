@@ -148,6 +148,7 @@
       });
   in {
     lib = {
+      modelLocks = true;
       inherit mkLbPackageForPkgs;
       modelCatalog = import ./lib/model-catalog.nix {inherit (nixpkgs) lib;};
       colibriPackaging = import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;};
@@ -1220,7 +1221,23 @@
         touch "$out"
       '';
 
+      model-lock = pkgs.runCommand "infernix-model-lock-check" {nativeBuildInputs = [pkgs.python3];} ''
+        mkdir -p tests lib
+        cp ${./tests/model_lock_test.py} tests/model_lock_test.py
+        cp ${./lib/model-lock.py} lib/model-lock.py
+        python3 -m unittest discover -s tests -p '*_test.py'
+        touch "$out"
+      '';
+
       colibri = pkgs.runCommand "infernix-colibri-check" {} ''
+        case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
+          *model-lock.py*--shared*) ;;
+          *) echo "serve unit must hold a shared model lock" >&2; exit 1 ;;
+        esac
+        case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fetch-fixture-qwen36".serviceConfig.ExecStart)} in
+          *model-lock.py*--exclusive*) ;;
+          *) echo "fetch unit must hold an exclusive model lock" >&2; exit 1 ;;
+        esac
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriOwnAssertions)}" = "true"
         # wantedBy=[] does not stop switch-start: the admission marker
         # condition is the real manual-start gate, ANDed with weights.
@@ -1467,6 +1484,12 @@
         '';
 
       llama-swap-extra-files = pkgs.runCommand "infernix-llama-swap-extra-files-check" {} ''
+        case ${nixpkgs.lib.escapeShellArg llamaSwapExtraFilesSample.config.services.llama-swap.settings.models.test-model.cmd} in
+          *model-lock.py*--shared*) ;;
+          *) echo "llama-server must hold a shared model lock" >&2; exit 1 ;;
+        esac
+        grep -Fq ${nixpkgs.lib.escapeShellArg "exec 9<>${nixpkgs.lib.escapeShellArg llamaSwapExtraFilesSample.config.services.infernix.llama-swap.lockPath}"} ${llamaSwapDownloadScript}
+        grep -Fq 'flock --exclusive --nonblock 9' ${llamaSwapDownloadScript}
         grep -Fq 'expected_files["main.gguf"]=1' ${llamaSwapDownloadScript}
         grep -Fq 'expected_files["mmproj-main.gguf"]=1' ${llamaSwapDownloadScript}
         grep -Fq 'Downloading main.gguf from example/main-model' ${llamaSwapDownloadScript}

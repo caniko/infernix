@@ -1219,7 +1219,8 @@
 
       pink-raven-workload = pkgs.runCommand "infernix-pink-raven-workload-check" {} ''
         test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingBackend}" = "http"
-        test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-vl-8b"
+        test "${pinkRavenWorkloadSample.config.services.pink-raven.embeddingModel}" = "qwen3-embedding-8b"
+        test "${pinkRavenWorkloadSample.config.services.pink-raven.captionModel}" = "qwen3-vl-8b"
         test "${pinkRavenWorkloadSample.config.services.pink-raven.settings.PINK_RAVEN_EMBEDDING_TIMEOUT_MS}" = "180000"
         touch "$out"
       '';

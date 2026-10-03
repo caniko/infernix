@@ -18,7 +18,7 @@ def acquire(path, shared=False):
         if not stat.S_ISDIR(parent.lstat().st_mode):
             raise ValueError(f"model lock ancestor is not a real directory: {parent}")
     flags = os.O_RDONLY if shared else os.O_RDWR | os.O_CREAT
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o644)
     try:
         meta = os.fstat(fd)
         if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_uid not in (0, path.parent.stat().st_uid):

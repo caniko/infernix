@@ -1,5 +1,6 @@
 """Native lock protocol tests; no model downloads or service activation."""
 import fcntl
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,7 +15,7 @@ class ModelLockTest(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(LOCK), "--shared" if shared else "--exclusive",
              str(path), "--", sys.executable, "-c", "print('executed')"],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=5,
         )
 
     def test_readers_share_and_block_publishers(self):
@@ -55,6 +56,25 @@ class ModelLockTest(unittest.TestCase):
             target.touch()
             path.symlink_to(target)
             result = self.run_locked(path)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("executed", result.stdout)
+
+    def test_fifo_anchor_is_rejected_without_blocking_or_running_child(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "model.doty-lock"
+            os.mkfifo(path)
+            for shared in (True, False):
+                result = self.run_locked(path, shared)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("untrusted model lock", result.stderr)
+                self.assertNotIn("executed", result.stdout)
+
+    def test_hardlinked_anchor_is_rejected_without_running_child(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "model.doty-lock"
+            path.touch()
+            os.link(path, Path(root) / "alias")
+            result = self.run_locked(path, True)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("executed", result.stdout)
 

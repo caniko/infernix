@@ -19,7 +19,7 @@
 
     plinth = {
       url = "git+https://github.com/caniko/plinth.git?ref=refs/heads/trunk";
-      inputs.nixpkgs.follows = "nixpkgs";
+      # Plinth pins nixpkgs to its Cargo.lock's Dioxus CLI contract.
     };
 
     harbor-rs = {
@@ -1229,7 +1229,7 @@
         touch "$out"
       '';
 
-      colibri = pkgs.runCommand "infernix-colibri-check" {} ''
+      colibri = pkgs.runCommand "infernix-colibri-check" {nativeBuildInputs = [pkgs.python3];} ''
         case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
           *model-lock.py*--shared*) ;;
           *) echo "serve unit must hold a shared model lock" >&2; exit 1 ;;
@@ -1248,10 +1248,7 @@
           esac
         done
         test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.Type}" = "exec"
-        case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
-          *infernix-colibri-entrypoint*--ctx*8*) ;;
-          *) echo "serve unit must exec the manifest-gated entrypoint" >&2; exit 1 ;;
-        esac
+        python3 ${./tests/colibri_launcher.py} ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)}
         case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.LoadCredential)} in
           *coli-api-key:/run/keys/fixture-colibri*) ;;
           *) echo "serve unit must load the key as a credential" >&2; exit 1 ;;

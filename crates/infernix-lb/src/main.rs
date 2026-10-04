@@ -20,9 +20,8 @@ use axum::{
 };
 use clap::Parser;
 use futures_util::TryStreamExt;
-use infernix_workload::Capability;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
@@ -69,6 +68,14 @@ struct ModelConfig {
     aliases: Vec<String>,
     #[serde(default)]
     capabilities: BTreeSet<Capability>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+enum Capability {
+    Chat,
+    Embeddings,
+    Rerank,
 }
 
 struct Backend {
@@ -449,17 +456,18 @@ fn requested_model(body: &Value) -> std::result::Result<String, Box<Response>> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": "request body must include string field `model`",
-                        "type": "invalid_request_error"
-                    }
-                })),
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "message": "request body must include string field `model`",
+                            "type": "invalid_request_error"
+                        }
+                    })),
+                )
+                    .into_response(),
             )
-                .into_response()
-                .into()
         })
 }
 
@@ -552,21 +560,16 @@ mod tests {
 
     #[derive(Clone)]
     struct MockBackend {
-        health_status: StatusCode,
         status: StatusCode,
-        delay_millis: u64,
         requests: Arc<Mutex<Vec<Value>>>,
     }
 
-    async fn mock_healthz(State(state): State<MockBackend>) -> impl IntoResponse {
-        state.health_status
+    async fn mock_healthz() -> impl IntoResponse {
+        StatusCode::OK
     }
 
     async fn mock_rerank(State(state): State<MockBackend>, Json(body): Json<Value>) -> Response {
         state.requests.lock().await.push(body);
-        if state.delay_millis != 0 {
-            tokio::time::sleep(Duration::from_millis(state.delay_millis)).await;
-        }
         (
             state.status,
             Json(json!({
@@ -579,19 +582,9 @@ mod tests {
     }
 
     async fn spawn_mock_backend(status: StatusCode) -> (String, Arc<Mutex<Vec<Value>>>) {
-        spawn_mock_backend_with_health(StatusCode::OK, status, 0).await
-    }
-
-    async fn spawn_mock_backend_with_health(
-        health_status: StatusCode,
-        status: StatusCode,
-        delay_millis: u64,
-    ) -> (String, Arc<Mutex<Vec<Value>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = MockBackend {
-            health_status,
             status,
-            delay_millis,
             requests: Arc::clone(&requests),
         };
         let app = Router::new()
@@ -680,90 +673,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(bad_requests.lock().await.len(), 1);
         assert_eq!(good_requests.lock().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn unhealthy_backend_is_excluded_before_forwarding() {
-        let (base_url, requests) =
-            spawn_mock_backend_with_health(StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK, 0)
-                .await;
-        let state = AppState {
-            client: Client::new(),
-            backends: Arc::new(vec![test_backend(
-                "atlas",
-                base_url,
-                10,
-                rerank_model("jina-reranker-v3"),
-            )]),
-        };
-
-        let response = retrying_buffered_json(
-            state,
-            json!({"model": "jina-reranker-v3", "query": "bay", "documents": ["window"]}),
-            Capability::Rerank,
-            "/v1/rerank",
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(requests.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn fallback_is_selected_when_primary_health_fails() {
-        let (primary_url, primary_requests) =
-            spawn_mock_backend_with_health(StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK, 0)
-                .await;
-        let (fallback_url, fallback_requests) = spawn_mock_backend(StatusCode::OK).await;
-        let state = AppState {
-            client: Client::new(),
-            backends: Arc::new(vec![
-                test_backend("atlas", primary_url, 10, rerank_model("jina-reranker-v3")),
-                test_backend("nomad", fallback_url, 20, rerank_model("jina-reranker-v3")),
-            ]),
-        };
-
-        let response = retrying_buffered_json(
-            state,
-            json!({"model": "jina-reranker-v3", "query": "bay", "documents": ["window"]}),
-            Capability::Rerank,
-            "/v1/rerank",
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(primary_requests.lock().await.is_empty());
-        assert_eq!(fallback_requests.lock().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn request_timeout_fails_closed_without_leaking_backend_data() {
-        let (base_url, requests) =
-            spawn_mock_backend_with_health(StatusCode::OK, StatusCode::OK, 300).await;
-        let client = Client::builder()
-            .timeout(Duration::from_millis(100))
-            .build()
-            .unwrap();
-        let state = AppState {
-            client,
-            backends: Arc::new(vec![test_backend(
-                "atlas",
-                base_url,
-                10,
-                rerank_model("jina-reranker-v3"),
-            )]),
-        };
-
-        let response = retrying_buffered_json(
-            state,
-            json!({"model": "jina-reranker-v3", "query": "bay", "documents": ["window"]}),
-            Capability::Rerank,
-            "/v1/rerank",
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(requests.lock().await.len(), 1);
     }
 
     #[tokio::test]

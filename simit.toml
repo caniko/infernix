@@ -4,6 +4,17 @@ provider = "actions"
 platform = "github"
 runtime = "nix"
 workspace = true
+publish_crates = true
+all_features = false
+nix_builds = [".#checks.x86_64-linux.model-lock", ".#checks.x86_64-linux.colibri", ".#checks.x86_64-linux.llama-swap-extra-files"]
+
+[ci.nix_build]
+capture_results = true
+timeout_minutes = 120
+max_parallel = 2
+max_jobs = 1
+cores = 2
+artifact_retention_days = 30
 
 [ci.pages]
 repo = "caniko/infernix"

@@ -5,6 +5,7 @@
   ...
 }: let
   cfg = config.services.infernix.modelProviders;
+  useCodex = config.programs.opencode.enable && cfg.providers ? codex;
   opencodeWrapper = pkgs.writeShellApplication {
     name = "opencode";
     text = ''
@@ -49,7 +50,7 @@
     models = lib.mapAttrs toModel value.models;
   };
 in {
-  services.infernix.modelProviders.codexProviderEnable = lib.mkDefault (cfg.providers ? codex);
+  services.infernix.modelProviders.codexProviderEnable = lib.mkDefault useCodex;
   programs.opencode = {
     enable = lib.mkDefault true;
     package = lib.mkDefault pkgs.opencode;
@@ -67,5 +68,5 @@ in {
       provider = lib.mapAttrs toProvider cfg.providers;
     };
   };
-  home.packages = lib.optional (cfg.providers ? codex) (lib.hiPrio opencodeWrapper);
+  home.packages = lib.optional useCodex (lib.hiPrio opencodeWrapper);
 }

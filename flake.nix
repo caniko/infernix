@@ -286,6 +286,9 @@
           cross = rs-harbor.lib.mkCross { inherit pkgs system; };
         in
         {
+          default = toolchain.craneLib.devShell {
+            packages = [ pkgs.pkg-config pkgs.openssl ];
+          };
           docs = rs-harbor.lib.mkDocsShell {
             inherit pkgs cross;
             inherit (toolchain) craneLib;
@@ -373,23 +376,26 @@
                 system.stateVersion = "24.11";
 
                 services.infernix.fleet = {
-                  nodes = fleetix.lib.adapters.infernix.mkFleetNodes {
-                    topology = {
-                      hosts.atlas = {
-                        network = {
-                          lanIp = "192.168.178.88";
-                          directLinkIp = "10.10.0.1";
+                  nodes.atlas = {
+                    address = fleetix.lib.hosts.resolveHostAddress {
+                      hostName = "atlas";
+                      policy = [ "lan" "direct-link" "wg-home" ];
+                      topology = {
+                        hosts.atlas = {
+                          network = {
+                            lanIp = "192.168.178.88";
+                            directLinkIp = "10.10.0.1";
+                          };
+                          links.wg-home.address = "10.123.0.5";
                         };
-                        links.wg-home.address = "10.123.0.5";
                       };
-                      services.reverseProxyServices = [ ];
                     };
-                    nodes.atlas = {
-                      priority = 30;
-                      models.qwen3-vl-8b = {
-                        name = "qwen3-vl-8b";
-                        capabilities = [ "chat" ];
-                      };
+                    modelPort = 8013;
+                    nodePort = 8020;
+                    priority = 30;
+                    models.qwen3-vl-8b = {
+                      name = "qwen3-vl-8b";
+                      capabilities = [ "chat" ];
                     };
                   };
                   loadBalancer = {

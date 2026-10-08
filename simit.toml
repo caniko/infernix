@@ -4,6 +4,7 @@ provider = "actions"
 platform = "github"
 runtime = "nix"
 workspace = true
+all_features = false
 
 [ci.pages]
 repo = "caniko/infernix"

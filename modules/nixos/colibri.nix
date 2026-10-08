@@ -194,13 +194,12 @@
         example = ["llama-swap.service"];
         description = ''
           Systemd units that must not be active for this profile to start.
-          Enforced by an ExecCondition guard (fail-closed: unqueryable or
-          not-loaded units refuse the start, so a typo or renamed peer
-          cannot silently disable exclusion), so competing GPU backends
-          can never co-run no matter who starts what in which order.
-          Refusal skips the unit without failing boot, switch, or nodectl
-          resume -- nothing is ever stopped or killed. Declare both
-          directions of every exclusive pair.
+          A fail-closed ExecCondition refuses unqueryable, not-loaded or
+          active peers. Atomic pair locks are held across exec for the
+          serving process lifetime, so simultaneous starts cannot co-run.
+          A lost admission race exits with non-restarting status 78;
+          nothing is ever stopped or killed. Declare both directions of
+          every exclusive pair using canonical .service unit names.
         '';
       };
       hfTokenPath = mkOption {
@@ -560,7 +559,9 @@ in {
     }
 
     (mkIf (enabledProfiles != {} && nodeName != null) {
-      systemd.tmpfiles.rules = mapAttrsToList (_: profile: modelLock.anchor profile.lockPath) enabledProfiles;
+      systemd.tmpfiles.rules =
+        mapAttrsToList (_: profile: modelLock.anchor profile.lockPath) enabledProfiles
+        ++ builtins.concatLists (mapAttrsToList (name: profile: exclLib.anchors "infernix-colibri-${name}.service" profile.exclusiveUnits) enabledProfiles);
       # Lifecycle: enabled profiles join nodectl drain/resume. Health is
       # deliberately untouched here (see the assertion above).
       services.infernix.fleet.nodes.${nodeName}.units =
@@ -606,7 +607,9 @@ in {
               WorkingDirectory = "/var/lib/infernix-colibri-${name}";
               # A list would render as repeated ExecStart directives, which
               # systemd only allows for Type=oneshot: join into one command.
-              ExecStart = escapeShellArgs (modelLock.command true profile.lockPath ++ ["${getExe' pkgs.python3 "python3"}" "${entrypoint}/bin/infernix-colibri-entrypoint" "${serveConfig name profile}"]);
+              ExecStart =
+                escapeShellArgs (exclLib.command pkgs "infernix-colibri-${name}.service" profile.exclusiveUnits
+                  ++ modelLock.command true profile.lockPath ++ ["${getExe' pkgs.python3 "python3"}" "${entrypoint}/bin/infernix-colibri-entrypoint" "${serveConfig name profile}"]);
               LoadCredential = ["coli-api-key:${profile.apiKeyFile}"];
               Restart = "on-failure";
               RestartPreventExitStatus = [78];

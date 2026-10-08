@@ -21,6 +21,7 @@
     ;
   cfg = config.services.infernix.llama-swap;
   modelLock = import ../../lib/model-lock.nix {inherit lib pkgs;};
+  exclLib = import ../../lib/exclusive-units.nix {inherit lib;};
 
   # NB: gpuCfg, llama-cpp, llama-server, mkModelCmd, and downloadFiles all
   # depend on services.infernix.gpu.* (which is null when nothing's enabled)
@@ -269,11 +270,11 @@ in {
       example = ["infernix-colibri-kat-coder.service"];
       description = ''
         Systemd units that must not be active for llama-swap to start.
-        Same fail-closed ExecCondition mechanism as the Colibri profiles
-        (unqueryable or not-loaded peers refuse the start): refusal skips
-        the start without failing boot, switch, or nodectl resume, and
-        nothing is ever stopped or killed. Declare both directions of
-        every exclusive pair.
+        The same fail-closed peer-state check and process-lifetime atomic
+        pair locks as Colibri refuse competing starts. A lost admission
+        race exits with non-restarting status 78. Nothing is ever stopped
+        or killed. Declare both directions of every exclusive pair using
+        canonical .service unit names.
       '';
     };
   };
@@ -335,10 +336,20 @@ in {
     expectedFilesManifest =
       pkgs.writeText "infernix-expected-model-files" "${concatStringsSep "\n" expectedFiles}\n";
   in {
-    systemd.tmpfiles.rules = [modelLock.anchor cfg.lockPath];
+    systemd.tmpfiles.rules =
+      [modelLock.anchor cfg.lockPath]
+      ++ exclLib.anchors "llama-swap.service" cfg.exclusiveUnits;
     services.llama-swap = {
       enable = true;
-      package = bleedingPkgs.llama-swap;
+      # Retain the upstream module's listen/config/TLS arguments and unit
+      # hardening. exec keeps the pair leases in the serving process.
+      package =
+        if cfg.exclusiveUnits == []
+        then bleedingPkgs.llama-swap
+        else
+          pkgs.writeShellScriptBin "llama-swap" ''
+            exec ${lib.escapeShellArgs (exclLib.command pkgs "llama-swap.service" cfg.exclusiveUnits)} ${getExe bleedingPkgs.llama-swap} "$@"
+          '';
       listenAddress = cfg.host;
       inherit (cfg) port;
 
@@ -364,7 +375,8 @@ in {
       })
       // {
         ReadOnlyPaths = [cfg.modelsDir];
-        ExecCondition = (import ../../lib/exclusive-units.nix {inherit lib;}).mkExclusiveCondition pkgs cfg.exclusiveUnits;
+        ExecCondition = exclLib.mkExclusiveCondition pkgs cfg.exclusiveUnits;
+        RestartPreventExitStatus = lib.optional (cfg.exclusiveUnits != []) 78;
       };
 
     # Model download service

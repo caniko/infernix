@@ -1131,6 +1131,14 @@
       colibriEmptyInventory = colibriSample.extendModules {
         modules = [{services.infernix.colibri.profiles.fixture-qwen36.weightsFiles = nixpkgs.lib.mkForce [];}];
       };
+      colibriExclusiveSample = colibriSample.extendModules {
+        modules = [{services.infernix.colibri.profiles.fixture-qwen36.exclusiveUnits = ["llama-swap.service"];}];
+      };
+      llamaSwapExclusiveSample = llamaSwapExtraFilesSample.extendModules {
+        modules = [{services.infernix.llama-swap.exclusiveUnits = ["infernix-colibri-fixture-qwen36.service"];}];
+      };
+      exclusiveLib = import ./lib/exclusive-units.nix {inherit (nixpkgs) lib;};
+      exclusivePairLock = builtins.head (exclusiveLib.pairLocks "llama-swap.service" ["infernix-colibri-fixture-qwen36.service"]);
       # Negative samples: each varies exactly one thing from the green
       # sample; the module must record a failing assertion, never serve.
       colibriBadEngine = nixpkgs.lib.nixosSystem {
@@ -1239,6 +1247,27 @@
         cp ${./tests/model_lock_test.py} tests/model_lock_test.py
         cp ${./lib/model-lock.py} lib/model-lock.py
         python3 -m unittest discover -s tests -p '*_test.py'
+        touch "$out"
+      '';
+
+      gpu-admission = pkgs.runCommand "infernix-gpu-admission-check" {nativeBuildInputs = [pkgs.python3];} ''
+        mkdir -p tests lib
+        cp ${./tests/gpu_admission_test.py} tests/gpu_admission_test.py
+        cp ${./lib/gpu-admission.py} lib/gpu-admission.py
+        python3 -m unittest discover -s tests -p '*_test.py'
+        # Rendered peers must use the same persistent anchor, while model
+        # snapshot leases remain a separate lock in the Colibri command.
+        test '${builtins.head (exclusiveLib.pairLocks "infernix-colibri-fixture-qwen36.service" ["llama-swap.service"])}' = '${exclusivePairLock}'
+        case ${nixpkgs.lib.escapeShellArg (toString colibriExclusiveSample.config.systemd.services.infernix-colibri-fixture-qwen36.serviceConfig.ExecStart)} in
+          *gpu-admission.py*${exclusivePairLock}*model-lock.py*--shared*) ;;
+          *) echo 'Colibri lost atomic GPU admission or its model lease' >&2; exit 1 ;;
+        esac
+        grep -Fq '${exclusivePairLock}' ${llamaSwapExclusiveSample.config.services.llama-swap.package}/bin/llama-swap
+        test '${builtins.toJSON llamaSwapExclusiveSample.config.systemd.services.llama-swap.serviceConfig.RestartPreventExitStatus}' = '[78]'
+        test '${builtins.toJSON colibriExclusiveSample.config.systemd.services.infernix-colibri-fixture-qwen36.serviceConfig.RestartPreventExitStatus}' = '[78]'
+        test '${nixpkgs.lib.boolToString (builtins.elem "f ${exclusivePairLock} 0644 root root - -" llamaSwapExclusiveSample.config.systemd.tmpfiles.rules)}' = true
+        test '${nixpkgs.lib.boolToString (builtins.elem "f ${exclusivePairLock} 0644 root root - -" colibriExclusiveSample.config.systemd.tmpfiles.rules)}' = true
+        python3 ${./tests/colibri_launcher.py} ${nixpkgs.lib.escapeShellArg (toString colibriExclusiveSample.config.systemd.services.infernix-colibri-fixture-qwen36.serviceConfig.ExecStart)}
         touch "$out"
       '';
 

@@ -1,4 +1,5 @@
 """Exercise the rendered serve command, including its lock and JSON launch gate."""
+import fcntl
 import json
 import os
 import shlex
@@ -8,6 +9,10 @@ import tempfile
 from pathlib import Path
 
 command = shlex.split(sys.argv[1])
+gpu_command = []
+if command[1].endswith("/gpu-admission.py"):
+    boundary = command.index("--") + 1
+    gpu_command, command = command[:boundary], command[boundary:]
 assert command[2] == "--shared" and command[4] == "--", command
 assert command[6].endswith("/bin/infernix-colibri-entrypoint"), command
 config = json.loads(Path(command[7]).read_text())
@@ -18,6 +23,13 @@ with tempfile.TemporaryDirectory() as root:
     lock = root / "model.doty-lock"
     lock.touch(mode=0o644)
     command[3] = str(lock)
+    gpu_locks = []
+    for index, arg in enumerate(gpu_command):
+        if arg == "--lock":
+            gpu_lock = root / f"gpu-{len(gpu_locks)}.lock"
+            gpu_lock.touch(mode=0o644)
+            gpu_command[index + 1] = str(gpu_lock)
+            gpu_locks.append(gpu_lock)
     config["modelDir"] = str(root / "model")
     model = Path(config["modelDir"])
     model.mkdir()
@@ -29,13 +41,14 @@ with tempfile.TemporaryDirectory() as root:
     stub.write_text(
         f"#!{sys.executable}\n"
         "import fcntl, json, os, sys\n"
-        "with open(os.environ['TEST_LOCK'], 'rb') as handle:\n"
-        "    try:\n"
-        "        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
-        "    except BlockingIOError:\n"
-        "        pass\n"
-        "    else:\n"
-        "        raise SystemExit('serving child lost shared lock')\n"
+        "for path in [os.environ['TEST_LOCK'], *json.loads(os.environ['TEST_GPU_LOCKS'])]:\n"
+        "    with open(path, 'rb') as handle:\n"
+        "        try:\n"
+        "            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "        except BlockingIOError:\n"
+        "            pass\n"
+        "        else:\n"
+        "            raise SystemExit('serving child lost a model or GPU lock')\n"
         "print(json.dumps({'argv': sys.argv[1:], 'key': os.environ['COLI_API_KEY']}))\n"
     )
     stub.chmod(0o755)
@@ -46,10 +59,19 @@ with tempfile.TemporaryDirectory() as root:
     credentials = root / "credentials"
     credentials.mkdir()
     (credentials / "coli-api-key").write_text("fixture-key\n")
-    env = dict(os.environ, CREDENTIALS_DIRECTORY=str(credentials), TEST_LOCK=str(lock))
+    env = dict(os.environ, CREDENTIALS_DIRECTORY=str(credentials), TEST_LOCK=str(lock),
+               TEST_GPU_LOCKS=json.dumps([str(path) for path in gpu_locks]))
 
     def launch():
-        return subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+        return subprocess.run(gpu_command + command, env=env, capture_output=True,
+                              text=True, check=False, timeout=10)
+
+    if gpu_locks:
+        with gpu_locks[0].open("rb") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            busy = launch()
+            assert busy.returncode == 78 and "exclusive-gpu: refusing start" in busy.stderr, busy.stderr
+            assert not busy.stdout and "missing ready manifest" not in busy.stderr
 
     missing = launch()
     assert missing.returncode == 78 and "missing ready manifest" in missing.stderr, (missing.stdout, missing.stderr)

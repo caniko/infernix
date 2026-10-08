@@ -337,7 +337,7 @@ in {
       pkgs.writeText "infernix-expected-model-files" "${concatStringsSep "\n" expectedFiles}\n";
   in {
     systemd.tmpfiles.rules =
-      [modelLock.anchor cfg.lockPath]
+      [(modelLock.anchor cfg.lockPath)]
       ++ exclLib.anchors "llama-swap.service" cfg.exclusiveUnits;
     services.llama-swap = {
       enable = true;

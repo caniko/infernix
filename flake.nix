@@ -837,6 +837,34 @@
         ${ponytailSample.config.home.activation.infernixPonytail.data}
         ${ponytailSample.config.home.activation.infernixPonytail.data}
       '';
+      mkPonytailSelection = name: harnesses:
+        home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeModules.default
+            {
+              home = {
+                username = "tester";
+                homeDirectory = "/home/tester";
+                stateVersion = "24.11";
+              };
+              services.infernix.ponytail = {
+                enable = true;
+                inherit harnesses;
+                runtimeDir = "/tmp/infernix-ponytail-selection-${name}";
+                subagentMatcher = "fixture-matcher";
+              };
+            }
+          ];
+        };
+      ponytailCodexOnly = mkPonytailSelection "codex" ["codex"];
+      ponytailOpenCodeOnly = mkPonytailSelection "opencode" ["opencode"];
+      ponytailEmpty = mkPonytailSelection "empty" [];
+      ponytailSelectionScript = name: sample:
+        pkgs.writeShellScript "ponytail-selection-${name}" ''
+          set -eu
+          ${(sample.config.home.activation.infernixPonytail or {data = "";}).data}
+        '';
       openpencilFixturePackage = pkgs.runCommand "openpencil-fixture" {} ''
         mkdir -p "$out/bin" "$out/share/openpencil"
         printf '#!/bin/sh\n' > "$out/bin/openpencil-desktop"
@@ -1370,7 +1398,13 @@
         touch "$out"
       '';
 
-      ponytail-harness-registration = pkgs.runCommand "infernix-ponytail-harness-registration-check" {} ''
+      ponytail-harness-registration = pkgs.runCommand "infernix-ponytail-harness-registration-check" {nativeBuildInputs = [pkgs.python3];} ''
+        python3 ${./tests/ponytail_selection.py} \
+          ${ponytailSelectionScript "codex" ponytailCodexOnly} \
+          ${ponytailSelectionScript "opencode" ponytailOpenCodeOnly} \
+          ${ponytailSelectionScript "empty" ponytailEmpty}
+        test '${nixpkgs.lib.boolToString (ponytailEmpty.config.home.activation ? infernixPonytail)}' = false
+        test '${nixpkgs.lib.boolToString (ponytailCodexOnly.config.home.sessionVariables ? PONYTAIL_SUBAGENT_MATCHER)}' = false
         ${ponytailActivation}
         expected='${builtins.toJSON ponytailHarnesses}'
         actual='${builtins.toJSON ponytailSample.config.services.infernix.ponytail.registeredHarnesses}'

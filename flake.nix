@@ -345,6 +345,9 @@
       };
       cross = harbor-rs.lib.mkCross {inherit pkgs system;};
     in {
+      default = toolchain.craneLib.devShell {
+        packages = [pkgs.pkg-config pkgs.openssl];
+      };
       docs = harbor-rs.lib.mkDocsShell {
         inherit pkgs cross;
         inherit (toolchain) craneLib;
@@ -461,8 +464,10 @@
                     };
                   };
                   hostName = "atlas";
-                  policy = ["lan" "wg-home"];
+                  policy = ["lan" "direct-link" "wg-home"];
                 };
+                modelPort = 8013;
+                nodePort = 8020;
                 priority = 30;
                 models.qwen3-vl-8b = {
                   name = "qwen3-vl-8b";

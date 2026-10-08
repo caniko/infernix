@@ -1492,7 +1492,7 @@
         test '${claudeCodeSample.config.home.homeDirectory}/${claudeCodeSample.config.home.file.infernix-claude-router-config.target}' = '/home/tester/.local/state/infernix/claude-router/.claude-code-router/config.json'
         test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
         test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"
-        grep -Fq 'exec ${pkgs.claude-code-router}/bin/ccr serve --no-open' '${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}'
+        grep -Fq 'exec ${pkgs.claude-code-router}/bin/ccr start' '${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}'
         test '${opencodeModelSample.config.systemd.user.services.infernix-codex-provider.Service.UMask}' = '0077'
         CCR_PATH=${pkgs.claude-code-router}/bin/ccr \
           CCR_CONFIG_TEMPLATE=${claudeCodeSample.config.home.file.infernix-claude-router-config.source} \

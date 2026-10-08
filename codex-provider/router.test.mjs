@@ -19,7 +19,7 @@ test("the pinned CCR authenticates with the private runtime key, never a public 
   mkdirSync(join(home, ".claude-code-router"), { mode: 0o700 });
   writeFileSync(join(home, ".claude-code-router", "config.json"), JSON.stringify(config), { mode: 0o600 });
   const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), XDG_DATA_HOME: join(home, ".local/share"), INFERNIX_CODEX_PROVIDER_API_KEY: key };
-  const child = spawn(process.env.CCR_PATH, ["serve", "--no-open"], { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.env.CCR_PATH, ["start"], { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   child.stdout.on("data", (chunk) => { output += chunk; });
   child.stderr.on("data", (chunk) => { output += chunk; });
@@ -41,6 +41,8 @@ test("the pinned CCR authenticates with the private runtime key, never a public 
       }
     }
     assert.ok(ready, `CCR did not listen: ${output}`);
+    const serverPid = Number(readFileSync(join(home, ".claude-code-router", ".claude-code-router.pid"), "utf8").trim());
+    assert.equal(serverPid, child.pid, "the supervised CCR process must own the listener, without a background child");
     for (const token of [null, "infernix-local", "$INFERNIX_CODEX_PROVIDER_API_KEY", "b".repeat(64)]) {
       // Valid JSON ensures the authorization middleware, not a parse failure,
       // rejects the unauthenticated request.

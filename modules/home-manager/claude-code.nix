@@ -26,7 +26,8 @@
       export HOME=${lib.escapeShellArg routerHome}
       export XDG_CONFIG_HOME="$HOME/.config"
       export XDG_DATA_HOME="$HOME/.local/share"
-      exec ${cfg.routerPackage}/bin/ccr serve --no-open
+      # The pinned CCR 2.0.0 start command runs the listener in this process.
+      exec ${cfg.routerPackage}/bin/ccr start
     '';
   };
   claudeWrapper = pkgs.writeShellApplication {

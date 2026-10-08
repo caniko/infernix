@@ -52,7 +52,7 @@ with tempfile.TemporaryDirectory() as root:
         return subprocess.run(command, env=env, capture_output=True, text=True, check=False)
 
     missing = launch()
-    assert missing.returncode != 0 and "missing ready manifest" in missing.stderr, (missing.stdout, missing.stderr)
+    assert missing.returncode == 78 and "missing ready manifest" in missing.stderr, (missing.stdout, missing.stderr)
     manifest = {
         "rev": "wrong-revision",
         "repo": config["repo"],
@@ -61,7 +61,7 @@ with tempfile.TemporaryDirectory() as root:
     ready = model / "ready.json"
     ready.write_text(json.dumps(manifest))
     wrong = launch()
-    assert wrong.returncode != 0 and "rev mismatch" in wrong.stderr, (wrong.stdout, wrong.stderr)
+    assert wrong.returncode == 78 and "rev mismatch" in wrong.stderr, (wrong.stdout, wrong.stderr)
     manifest["rev"] = config["rev"]
     ready.write_text(json.dumps(manifest))
     served = launch()

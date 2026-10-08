@@ -5,6 +5,14 @@
   ...
 }: let
   cfg = config.services.infernix.modelProviders;
+  # CCR selectors use provider,model; OpenCode uses provider/model. Replace
+  # only the selector separator, preserving slashes inside model IDs.
+  modelRef = selector: let
+    parts = lib.splitString "," selector;
+  in
+    if builtins.length parts == 2
+    then "${builtins.head parts}/${builtins.elemAt parts 1}"
+    else selector;
 
   toModel = _id: value:
     {
@@ -34,13 +42,13 @@ in {
     enable = lib.mkDefault true;
     package = lib.mkDefault pkgs.opencode;
     settings = {
-      model = cfg.routes.default;
-      small_model = cfg.routes.background;
+      model = modelRef cfg.routes.default;
+      small_model = modelRef cfg.routes.background;
       agent = {
-        build.model = cfg.routes.background;
-        plan.model = cfg.routes.think;
+        build.model = modelRef cfg.routes.background;
+        plan.model = modelRef cfg.routes.think;
         general = {
-          model = cfg.routes.default;
+          model = modelRef cfg.routes.default;
           variant = "medium";
         };
       };

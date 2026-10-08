@@ -18,7 +18,7 @@
     text = ''
       headers="X-Infernix-Cwd: ''${PWD}"
       if [ -n "''${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then
-        headers="''${ANTHROPIC_CUSTOM_HEADERS}, ''${headers}"
+        headers="''${ANTHROPIC_CUSTOM_HEADERS}"$'\n'"''${headers}"
       fi
       export ANTHROPIC_CUSTOM_HEADERS="$headers"
       exec ${lib.getExe claude} "$@"
@@ -100,7 +100,7 @@ in {
       CODEX_HOME = "${config.home.homeDirectory}/.codex";
     };
 
-    xdg.configFile."claude-code-router/config.json" = {
+    home.file.".claude-code-router/config.json" = {
       force = true;
       text = builtins.toJSON routerConfig;
     };
@@ -129,7 +129,7 @@ in {
         After = ["infernix-codex-provider.service"];
       };
       Service = {
-        ExecStart = "${cfg.routerPackage}/bin/ccr start";
+        ExecStart = "${cfg.routerPackage}/bin/ccr serve --no-open";
         Restart = "on-failure";
         Environment = ["HOME=${config.home.homeDirectory}"];
       };

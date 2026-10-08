@@ -127,11 +127,12 @@ rm -rf "$staging"
 mkdir -p "$staging"
 while IFS= read -r name; do
   case "$name" in
-    ""|"../"*|*/../*|/*)
+    ""|".."|"../"*|*/../*|*/..|/*)
       echo "infernix-colibri-fetch: refusing unsafe file name: $name" >&2
       exit 1
       ;;
   esac
+  mkdir -p "$(dirname "$staging/$name")"
   want=$(jq -r --arg n "$name" '.files[] | select(.name == $n) | .sizeBytes // empty' "$job")
   want_hash=$(jq -r --arg n "$name" '.files[] | select(.name == $n) | .sha256 // empty' "$job")
   echo "infernix-colibri-fetch: downloading $name"

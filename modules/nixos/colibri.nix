@@ -236,7 +236,7 @@
           };
         });
         default = [];
-        description = "Files to fetch (empty = whole revision).";
+        description = "Exact nonempty inventory of repo-relative files to fetch. Every enabled profile must declare it; whole-revision fetching is unsupported.";
       };
       weightsTotalBytes = mkOption {
         type = types.nullOr types.ints.positive;
@@ -281,7 +281,10 @@
 
 
       def fail(message):
-          raise SystemExit("infernix-colibri-entrypoint: %s" % message)
+          print("infernix-colibri-entrypoint: %s" % message, file=sys.stderr)
+          # EX_CONFIG marks an operator-action launch gate. Native serving
+          # failures still use the ordinary restart policy after exec.
+          raise SystemExit(78)
 
 
       def main():
@@ -490,6 +493,10 @@
 
   profileChecks = name: profile: [
     {
+      message = "services.infernix.colibri.profiles.${name}.weightsFiles must declare a nonempty exact inventory; whole-revision fetching is unsupported";
+      ok = !profile.enable || profile.weightsFiles != [];
+    }
+    {
       message = "services.infernix.colibri.profiles.${name}.queueTimeout must stay under the 120s gateway per-target timeout";
       ok = profile.queueTimeout < 120;
     }
@@ -602,6 +609,7 @@ in {
               ExecStart = escapeShellArgs (modelLock.command true profile.lockPath ++ ["${getExe' pkgs.python3 "python3"}" "${entrypoint}/bin/infernix-colibri-entrypoint" "${serveConfig name profile}"]);
               LoadCredential = ["coli-api-key:${profile.apiKeyFile}"];
               Restart = "on-failure";
+              RestartPreventExitStatus = [78];
               RestartSec = "10s";
               TimeoutStartSec = "15min";
               NoNewPrivileges = true;

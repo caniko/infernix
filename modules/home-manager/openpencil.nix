@@ -101,6 +101,7 @@ in {
       Service = {
         ExecStart = "${cfg.package}/bin/${manifest.executables.desktop} --live-mcp ${toString cfg.live.port} ${cfg.document}";
         Restart = "on-failure";
+        Environment = lib.mapAttrsToList (name: value: lib.escapeShellArg "${name}=${value}") cfg.environment;
       };
       Install.WantedBy = ["default.target"];
     };

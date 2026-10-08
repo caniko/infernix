@@ -389,7 +389,7 @@
           }
         ];
       };
-      claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.xdg.configFile."claude-code-router/config.json".source);
+      claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.home.file.".claude-code-router/config.json".source);
       workloadFabricSample = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -1127,6 +1127,9 @@
         ];
       };
       colibriOwnAssertions = colibriSample.config.services.infernix.colibri.evalChecks;
+      colibriEmptyInventory = colibriSample.extendModules {
+        modules = [{services.infernix.colibri.profiles.fixture-qwen36.weightsFiles = nixpkgs.lib.mkForce [];}];
+      };
       # Negative samples: each varies exactly one thing from the green
       # sample; the module must record a failing assertion, never serve.
       colibriBadEngine = nixpkgs.lib.nixosSystem {
@@ -1238,7 +1241,8 @@
         touch "$out"
       '';
 
-      colibri = pkgs.runCommand "infernix-colibri-check" {nativeBuildInputs = [pkgs.python3];} ''
+      colibri = pkgs.runCommand "infernix-colibri-check" {nativeBuildInputs = [pkgs.python3 pkgs.bash pkgs.curl pkgs.jq pkgs.coreutils pkgs.gawk];} ''
+        python3 ${./tests/colibri_fetch_test.py} ${./lib/colibri-fetch.sh}
         case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
           *model-lock.py*--shared*) ;;
           *) echo "serve unit must hold a shared model lock" >&2; exit 1 ;;
@@ -1257,6 +1261,7 @@
           esac
         done
         test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.Type}" = "exec"
+        test '${builtins.toJSON colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.RestartPreventExitStatus}' = '[78]'
         python3 ${./tests/colibri_launcher.py} ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)}
         case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.LoadCredential)} in
           *coli-api-key:/run/keys/fixture-colibri*) ;;
@@ -1279,6 +1284,7 @@
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadPackage))}" = "false"
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadHealth))}" = "false"
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadStrict))}" = "false"
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriEmptyInventory.config.services.infernix.colibri.evalChecks)}" = "false"
         touch "$out"
       '';
 
@@ -1418,7 +1424,11 @@
         printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e 'keys | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
         test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
         test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"
-        test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}" = "${pkgs.claude-code-router}/bin/ccr start"
+        test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}" = "${pkgs.claude-code-router}/bin/ccr serve --no-open"
+        defaults='${builtins.toJSON {
+          inherit (opencodeModelSample.config.programs.opencode.settings) model small_model agent;
+        }}'
+        printf '%s' "$defaults" | ${pkgs.jq}/bin/jq -e '[.model, .small_model, .agent.build.model, .agent.plan.model, .agent.general.model] | all(.[]; contains("/") and (contains(",") | not))'
         touch "$out"
       '';
 

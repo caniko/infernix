@@ -10,7 +10,8 @@ from pathlib import Path
 
 command = shlex.split(sys.argv[1])
 gpu_command = []
-if command[1].endswith("/gpu-admission.py"):
+# Nix store source basenames include a hash prefix before gpu-admission.py.
+if Path(command[1]).name.endswith("gpu-admission.py"):
     boundary = command.index("--") + 1
     gpu_command, command = command[:boundary], command[boundary:]
 assert command[2] == "--shared" and command[4] == "--", command

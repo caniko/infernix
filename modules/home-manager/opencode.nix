@@ -5,6 +5,17 @@
   ...
 }: let
   cfg = config.services.infernix.modelProviders;
+  opencodeWrapper = pkgs.writeShellApplication {
+    name = "opencode";
+    text = ''
+      ${import ../../lib/codex-credentials.nix {
+        inherit lib;
+        package = cfg.codexProviderPackage;
+        keyFile = cfg.codexProviderKeyFile;
+      }}
+      exec ${lib.getExe config.programs.opencode.package} "$@"
+    '';
+  };
   # CCR selectors use provider,model; OpenCode uses provider/model. Replace
   # only the selector separator, preserving slashes inside model IDs.
   modelRef = selector: let
@@ -17,15 +28,15 @@
   toModel = _id: value:
     {
       name = value.name or value.id;
-      id = value.id;
+      inherit (value) id;
       tool_call = value.tool_call or true;
     }
-    // lib.optionalAttrs (value ? reasoning) {reasoning = value.reasoning;}
-    // lib.optionalAttrs (value ? limit) {limit = value.limit;};
+    // lib.optionalAttrs (value ? reasoning) {inherit (value) reasoning;}
+    // lib.optionalAttrs (value ? limit) {inherit (value) limit;};
 
   toProvider = _name: value: {
     npm = "@ai-sdk/openai-compatible";
-    name = value.name;
+    inherit (value) name;
     options = {
       baseURL = value.baseUrl;
       apiKey =
@@ -38,6 +49,7 @@
     models = lib.mapAttrs toModel value.models;
   };
 in {
+  services.infernix.modelProviders.codexProviderEnable = lib.mkDefault (cfg.providers ? codex);
   programs.opencode = {
     enable = lib.mkDefault true;
     package = lib.mkDefault pkgs.opencode;
@@ -55,4 +67,5 @@ in {
       provider = lib.mapAttrs toProvider cfg.providers;
     };
   };
+  home.packages = lib.optional (cfg.providers ? codex) (lib.hiPrio opencodeWrapper);
 }

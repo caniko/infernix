@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { readKeyFile } from "./credentials.mjs";
 
 const port = process.env.INFERNIX_CODEX_PROVIDER_PORT ? Number(process.env.INFERNIX_CODEX_PROVIDER_PORT) : null;
 const host = process.env.INFERNIX_CODEX_PROVIDER_HOST ?? "127.0.0.1";
@@ -118,7 +120,7 @@ async function readBody(request, response) {
   }
 }
 
-async function handle(request, response) {
+async function handle(request, response, execute) {
   if (request.method === "GET" && request.url === "/v1/models") {
     return json(response, 200, { object: "list", data: models.map((id) => ({ id, object: "model", owned_by: "codex-cli" })) });
   }
@@ -131,7 +133,7 @@ async function handle(request, response) {
   try {
     const requestedModel = typeof body.model === "string" ? body.model : "default";
     const model = requestedModel.includes(",") ? requestedModel.split(",").pop() : requestedModel;
-    const text = await runCodex({ model, prompt: promptFromMessages(body.messages), cwd: requestCwd(request) });
+    const text = await execute({ model, prompt: promptFromMessages(body.messages), cwd: requestCwd(request) });
     const result = completion(text, model);
     if (!body.stream) return json(response, 200, result);
     response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -148,6 +150,28 @@ function selfTest() {
   assert.equal(parseCodexJsonl("not-json\n"), "");
 }
 
-if (process.argv.includes("--self-test")) selfTest();
-else if (port == null) throw new Error("INFERNIX_CODEX_PROVIDER_PORT is required");
-else createServer((request, response) => handle(request, response).catch((error) => json(response, 500, { error: { message: error.message } }))).listen(port, host);
+export function createProviderServer({ key, execute = runCodex }) {
+  if (typeof key !== "string" || !/^[a-f0-9]{64}$/.test(key)) throw new Error("a private Codex provider credential is required");
+  const digest = (value) => createHash("sha256").update(value).digest();
+  const expected = digest(`Bearer ${key}`);
+  return createServer((request, response) => {
+    // Loopback TCP is shared by local accounts. Reject before reading the body
+    // or inspecting the caller-selected workspace, including on discovery.
+    const authorization = request.headers.authorization;
+    if (typeof authorization !== "string" || !timingSafeEqual(expected, digest(authorization))) {
+      response.setHeader("connection", "close");
+      response.setHeader("www-authenticate", "Bearer");
+      return json(response, 401, { error: { message: "invalid provider credential", type: "authentication_error" } });
+    }
+    handle(request, response, execute).catch((error) => json(response, 500, { error: { message: error.message } }));
+  });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (process.argv.includes("--self-test")) selfTest();
+  else {
+    if (port == null) throw new Error("INFERNIX_CODEX_PROVIDER_PORT is required");
+    if (!process.env.INFERNIX_CODEX_PROVIDER_KEY_FILE) throw new Error("INFERNIX_CODEX_PROVIDER_KEY_FILE is required");
+    createProviderServer({ key: readKeyFile(process.env.INFERNIX_CODEX_PROVIDER_KEY_FILE) }).listen(port, host);
+  }
+}

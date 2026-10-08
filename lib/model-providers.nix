@@ -1,4 +1,4 @@
-{lib}: let
+_: let
   codexProviderPort = 3967;
   deepseekModel = id: {
     inherit id;
@@ -25,8 +25,8 @@
     inherit id name reasoning;
     tool_call = true;
     limit = {
-      context = context;
-      output = output;
+      inherit context;
+      inherit output;
     };
   };
 in {
@@ -114,7 +114,7 @@ in {
       name = "Codex CLI";
       protocol = "openai-chat";
       baseUrl = "http://127.0.0.1:${toString codexProviderPort}/v1";
-      apiKey = "infernix-local";
+      apiKeyEnv = "INFERNIX_CODEX_PROVIDER_API_KEY";
       models = {
         default = model {
           id = "default";

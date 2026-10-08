@@ -11,13 +11,18 @@ pkgs.stdenvNoCC.mkDerivation {
   nativeBuildInputs = [pkgs.makeWrapper];
 
   doCheck = true;
-  checkPhase = "${pkgs.nodejs}/bin/node server.mjs --self-test";
+  checkPhase = ''
+    ${pkgs.nodejs}/bin/node server.mjs --self-test
+    ${pkgs.nodejs}/bin/node --test server.test.mjs
+  '';
 
   installPhase = ''
     mkdir -p $out/libexec/infernix-codex-provider $out/bin
-    cp server.mjs $out/libexec/infernix-codex-provider/server.mjs
+    cp server.mjs credentials.mjs $out/libexec/infernix-codex-provider/
     makeWrapper ${pkgs.nodejs}/bin/node $out/bin/infernix-codex-provider \
       --add-flags "$out/libexec/infernix-codex-provider/server.mjs"
+    makeWrapper ${pkgs.nodejs}/bin/node $out/bin/infernix-codex-credentials \
+      --add-flags "$out/libexec/infernix-codex-provider/credentials.mjs"
   '';
 
   meta = {

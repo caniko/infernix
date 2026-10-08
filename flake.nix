@@ -202,11 +202,12 @@
         _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
         _module.args.infernixPonytail = self.packages.${pkgs.stdenv.hostPlatform.system}.ponytail;
       };
-      opencode = {
+      opencode = {pkgs, ...}: {
         imports = [
           ./modules/home-manager/model-providers.nix
           ./modules/home-manager/opencode.nix
         ];
+        _module.args.infernixCodexProvider = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-provider;
       };
       claude-code = {pkgs, ...}: {
         imports = [
@@ -389,7 +390,7 @@
           }
         ];
       };
-      claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.home.file.".claude-code-router/config.json".source);
+      claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.home.file.infernix-claude-router-config.source);
       workloadFabricSample = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -1421,10 +1422,18 @@
         printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e 'map(.name) | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
         printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_base_url == "http://127.0.0.1:3967/v1/chat/completions"'
         printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "deepseek") | .api_key == "$DEEPSEEK_API_KEY"'
+        printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_key == "$INFERNIX_CODEX_PROVIDER_API_KEY"'
         printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e 'keys | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
+        printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e '.codex.options.apiKey == "{env:INFERNIX_CODEX_PROVIDER_API_KEY}"'
+        test '${claudeCodeRouterConfig.APIKEY}' = '$INFERNIX_CODEX_PROVIDER_API_KEY'
+        test '${claudeCodeSample.config.home.file.infernix-claude-router-config.target}' = '/home/tester/.local/state/infernix/claude-router/.claude-code-router/config.json'
         test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
         test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"
-        test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}" = "${pkgs.claude-code-router}/bin/ccr serve --no-open"
+        grep -Fq 'exec ${pkgs.claude-code-router}/bin/ccr serve --no-open' '${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}'
+        test '${opencodeModelSample.config.systemd.user.services.infernix-codex-provider.Service.UMask}' = '0077'
+        CCR_PATH=${pkgs.claude-code-router}/bin/ccr \
+          CCR_CONFIG_TEMPLATE=${claudeCodeSample.config.home.file.infernix-claude-router-config.source} \
+          ${pkgs.nodejs}/bin/node --test ${./codex-provider/router.test.mjs}
         defaults='${builtins.toJSON {
           inherit (opencodeModelSample.config.programs.opencode.settings) model small_model agent;
         }}'

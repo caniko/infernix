@@ -9,13 +9,31 @@
   cfg = config.services.infernix.claude-code;
   providers = config.services.infernix.modelProviders.providers;
   routes = config.services.infernix.modelProviders.routes;
-  codexProviderPort = config.services.infernix.modelProviders.codexProviderPort;
+  keyFile = config.services.infernix.modelProviders.codexProviderKeyFile;
   codexProvider = providers.codex;
   claude = cfg.package;
   codexBridge = cfg.codexProviderPackage;
+  loadCredential = import ../../lib/codex-credentials.nix {
+    inherit lib keyFile;
+    package = codexBridge;
+  };
+  # Dedicated state avoids reusing old router databases with public local keys.
+  routerHome = "${builtins.dirOf keyFile}/claude-router";
+  routerWrapper = pkgs.writeShellApplication {
+    name = "infernix-claude-router";
+    text = ''
+      ${loadCredential}
+      export HOME=${lib.escapeShellArg routerHome}
+      export XDG_CONFIG_HOME="$HOME/.config"
+      export XDG_DATA_HOME="$HOME/.local/share"
+      exec ${cfg.routerPackage}/bin/ccr serve --no-open
+    '';
+  };
   claudeWrapper = pkgs.writeShellApplication {
     name = "claude";
     text = ''
+      ${loadCredential}
+      export ANTHROPIC_AUTH_TOKEN="$INFERNIX_CODEX_PROVIDER_API_KEY"
       headers="X-Infernix-Cwd: ''${PWD}"
       if [ -n "''${ANTHROPIC_CUSTOM_HEADERS:-}" ]; then
         headers="''${ANTHROPIC_CUSTOM_HEADERS}"$'\n'"''${headers}"
@@ -36,7 +54,7 @@
   };
 
   routerConfig = {
-    APIKEY = cfg.apiKey;
+    APIKEY = "$INFERNIX_CODEX_PROVIDER_API_KEY";
     HOST = "127.0.0.1";
     PORT = cfg.routerPort;
     LOG = false;
@@ -72,12 +90,6 @@ in {
       default = 3456;
       description = "Loopback port for Claude Code Router.";
     };
-
-    apiKey = mkOption {
-      type = types.str;
-      default = "infernix-local";
-      description = "Local bearer token shared by Claude Code and the router.";
-    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -94,32 +106,20 @@ in {
 
     home.packages = [claudeWrapper cfg.routerPackage codexBridge];
 
+    services.infernix.modelProviders = {
+      codexProviderEnable = true;
+      codexProviderPackage = lib.mkDefault codexBridge;
+    };
+
     home.sessionVariables = {
       ANTHROPIC_BASE_URL = "http://127.0.0.1:${toString cfg.routerPort}";
-      ANTHROPIC_AUTH_TOKEN = cfg.apiKey;
       CODEX_HOME = "${config.home.homeDirectory}/.codex";
     };
 
-    home.file.".claude-code-router/config.json" = {
+    home.file.infernix-claude-router-config = {
+      target = "${routerHome}/.claude-code-router/config.json";
       force = true;
       text = builtins.toJSON routerConfig;
-    };
-
-    systemd.user.services.infernix-codex-provider = {
-      Unit = {
-        Description = "Infernix direct Codex CLI provider";
-      };
-      Service = {
-        ExecStart = "${codexBridge}/bin/infernix-codex-provider";
-        Restart = "on-failure";
-        Environment = [
-          "CODEX_HOME=${config.home.homeDirectory}/.codex"
-          "CODEX_PATH=${lib.getExe pkgs.codex}"
-          "INFERNIX_CODEX_PROVIDER_PORT=${toString codexProviderPort}"
-          "INFERNIX_CODEX_MODELS=${builtins.concatStringsSep "," (builtins.attrNames codexProvider.models)}"
-        ];
-      };
-      Install.WantedBy = ["default.target"];
     };
 
     systemd.user.services.claude-code-router = {
@@ -129,9 +129,9 @@ in {
         After = ["infernix-codex-provider.service"];
       };
       Service = {
-        ExecStart = "${cfg.routerPackage}/bin/ccr serve --no-open";
+        ExecStart = lib.getExe routerWrapper;
         Restart = "on-failure";
-        Environment = ["HOME=${config.home.homeDirectory}"];
+        UMask = "0077";
       };
       Install.WantedBy = ["default.target"];
     };

@@ -153,6 +153,16 @@ Additional opt-in Home Manager modules:
 - **`homeModules.claude-code`** — installs Claude Code and Claude Code Router,
   starts the loopback gateway, and exposes Codex through `/model codex,default`.
   The Codex provider runs `codex exec` directly; it does not use MCP or ACP.
+  Both clients use a private per-user credential created during Home Manager
+  activation at `$XDG_STATE_HOME/infernix/codex-provider.key` (directory `0700`,
+  file `0600`). The launchers read it at runtime; no credential value is written
+  to the Nix store or session-variable configuration. The provider authenticates
+  every request before reading its body or workspace header. Claude's router uses
+  the same credential and dedicated state beside the key, so old public local
+  keys are not inherited. `services.infernix.modelProviders.codexProviderKeyFile`
+  selects another private key file; the former plaintext `claude-code.apiKey`
+  option is replaced by this runtime-file contract. OpenCode alone also starts
+  the authenticated Codex provider when its catalog includes Codex.
 - **`homeModules.goose`** — writes `programs.goose.*` from the generated
   `services.infernix.goose.*` outputs for users that also import a Goose
   Home Manager module.

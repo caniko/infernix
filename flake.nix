@@ -1489,7 +1489,7 @@
         printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e 'keys | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
         printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e '.codex.options.apiKey == "{env:INFERNIX_CODEX_PROVIDER_API_KEY}"'
         test '${claudeCodeRouterConfig.APIKEY}' = '$INFERNIX_CODEX_PROVIDER_API_KEY'
-        test '${claudeCodeSample.config.home.file.infernix-claude-router-config.target}' = '/home/tester/.local/state/infernix/claude-router/.claude-code-router/config.json'
+        test '${claudeCodeSample.config.home.homeDirectory}/${claudeCodeSample.config.home.file.infernix-claude-router-config.target}' = '/home/tester/.local/state/infernix/claude-router/.claude-code-router/config.json'
         test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
         test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"
         grep -Fq 'exec ${pkgs.claude-code-router}/bin/ccr serve --no-open' '${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}'

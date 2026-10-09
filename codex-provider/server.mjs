@@ -60,22 +60,26 @@ function requestCwd(request) {
   return cwd;
 }
 
-function runCodex({ model, prompt, cwd }) {
+export function runCodex({ model, prompt, cwd }, { command = codexPath } = {}) {
   const args = ["exec", "--json", "--skip-git-repo-check", "--ask-for-approval", "never", "--sandbox", "workspace-write", "--cd", cwd];
   if (model && model !== "default") args.push("--model", model);
-  args.push(prompt);
+  // Prompts can exceed execve's per-argument limit and contain private data.
+  // Codex's '-' positional prompt reads the pipe, keeping content out of argv.
+  args.push("-");
 
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(codexPath, args, {
+    const child = spawn(command, args, {
       cwd,
       env: { ...process.env, CODEX_PATH: codexPath },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);
+    child.stdin.on("error", reject);
+    child.stdin.end(prompt);
     child.on("close", (code) => {
       const text = parseCodexJsonl(stdout);
       if (code !== 0) reject(new Error(stderr.trim() || `codex exited with status ${code}`));

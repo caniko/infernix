@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ensureKeyFile, readKeyFile } from "./credentials.mjs";
-import { createProviderServer } from "./server.mjs";
+import { createProviderServer, runCodex } from "./server.mjs";
 
 test("credential creation is private, persistent and rejects unsafe files", () => {
   const directory = mkdtempSync(join(tmpdir(), "infernix-auth-"));
@@ -72,4 +72,29 @@ test("HTTP authentication precedes body parsing, CWD access and Codex execution"
 test("a credential is mandatory before opening a listener", () => {
   assert.throws(() => createProviderServer({}), /credential/);
   assert.throws(() => createProviderServer({ key: "infernix-local" }), /credential/);
+});
+
+test("Codex receives large private prompts through stdin, never argv", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "infernix-stdin-"));
+  try {
+    const command = join(directory, "codex-fixture");
+    writeFileSync(command, `#!${process.execPath}
+const fs = require("node:fs");
+const result = { args: process.argv.slice(2), prompt: fs.readFileSync(0, "utf8") };
+console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(result) } }));
+`, { mode: 0o700 });
+    const prompt = "private prompt\n" + "large UTF-8 input: 🌱\n".repeat(20000);
+    assert.ok(Buffer.byteLength(prompt) > 128 * 1024);
+    const result = JSON.parse(await runCodex({ model: "fixture-model", prompt, cwd: directory }, { command }));
+    assert.equal(result.prompt, prompt);
+    assert.equal(result.args.at(-1), "-");
+    assert.ok(!result.args.some((argument) => argument.includes("private prompt")));
+    assert.ok(result.args.includes("fixture-model"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Codex spawn failures reject without an unhandled stdin error", async () => {
+  await assert.rejects(runCodex({ model: "default", prompt: "private", cwd: process.cwd() }, { command: "/missing/infernix-codex-fixture" }));
 });

@@ -235,7 +235,7 @@
           };
         });
         default = [];
-        description = "Exact nonempty inventory of repo-relative files to fetch. Every enabled profile must declare it; whole-revision fetching is unsupported.";
+        description = "Exact nonempty inventory of unique repo-relative files to fetch. Every enabled profile must declare it; whole-revision fetching is unsupported.";
       };
       weightsTotalBytes = mkOption {
         type = types.nullOr types.ints.positive;
@@ -492,8 +492,18 @@
 
   profileChecks = name: profile: [
     {
+      message = "services.infernix.colibri.profiles.${name}.weightsRev must be a full 40-character hexadecimal commit SHA; mutable branches, tags and abbreviated hashes are unsupported";
+      ok = !profile.enable || builtins.match "[0-9a-fA-F]{40}" profile.weightsRev != null;
+    }
+    {
       message = "services.infernix.colibri.profiles.${name}.weightsFiles must declare a nonempty exact inventory; whole-revision fetching is unsupported";
       ok = !profile.enable || profile.weightsFiles != [];
+    }
+    {
+      message = "services.infernix.colibri.profiles.${name}.weightsFiles must declare each file name exactly once";
+      ok = !profile.enable || let
+        names = map (file: file.name) profile.weightsFiles;
+      in builtins.length names == builtins.length (lib.unique names);
     }
     {
       message = "services.infernix.colibri.profiles.${name}.queueTimeout must stay under the 120s gateway per-target timeout";

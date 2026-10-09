@@ -13,6 +13,7 @@
     (toString path)
     "--"
   ];
-  # f creates the inode once. Consumers open it read-only under ProtectSystem.
+  # f creates missing parents (root/0755) and the inode once. Consumers open
+  # it read-only under ProtectSystem; tmpfiles must never truncate or unlink it.
   anchor = path: "f ${toString path} 0644 root root - -";
 }

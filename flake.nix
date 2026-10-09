@@ -146,6 +146,21 @@
         inherit system;
         overlays = [rust-overlay.overlays.default];
       });
+
+    mkTreefmt = system: let
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      };
+      toolchain = harbor-rs.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
+      };
+    in
+      harbor-rs.inputs.treefmt-nix.lib.evalModule pkgs (import ./nix/treefmt.nix {
+        inherit harbor-rs;
+        rustfmtPackage = toolchain.rustToolchain;
+      });
   in {
     lib = {
       modelLocks = true;
@@ -333,7 +348,7 @@
       };
     });
 
-    formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
+    formatter = forAllSystems (system: (mkTreefmt system).config.build.wrapper);
 
     devShells = forAllSystems (system: let
       pkgs = import nixpkgs {
@@ -1159,6 +1174,33 @@
       colibriEmptyInventory = colibriSample.extendModules {
         modules = [{services.infernix.colibri.profiles.fixture-qwen36.weightsFiles = nixpkgs.lib.mkForce [];}];
       };
+      colibriBadRevision = revision:
+        colibriSample.extendModules {
+          modules = [{services.infernix.colibri.profiles.fixture-qwen36.weightsRev = nixpkgs.lib.mkForce revision;}];
+        };
+      colibriDuplicateInventory = colibriSample.extendModules {
+        modules = [{
+          services.infernix.colibri.profiles.fixture-qwen36.weightsFiles = nixpkgs.lib.mkForce [
+            {name = "model.safetensors";}
+            {name = "model.safetensors"; sizeBytes = 8;}
+          ];
+        }];
+      };
+      llamaSwapFreshLockSample = llamaSwapExtraFilesSample.extendModules {
+        modules = [{services.infernix.llama-swap.modelsDir = nixpkgs.lib.mkForce "/new/nested/models";}];
+      };
+      llamaSwapCustomLockSample = llamaSwapFreshLockSample.extendModules {
+        modules = [{services.infernix.llama-swap.lockPath = nixpkgs.lib.mkForce "/custom/deep/models.doty-lock";}];
+      };
+      modelLockParentFixtures = map (sample: let
+        lockPath = sample.config.services.infernix.llama-swap.lockPath;
+        rules = builtins.filter (rule: nixpkgs.lib.hasInfix (builtins.dirOf lockPath) rule) sample.config.systemd.tmpfiles.rules;
+      in {
+        inherit lockPath;
+        # Alternate-root tests retain production paths/modes, using the
+        # sandbox's own uid/gid instead of trying to chown files to root.
+        rules = map (nixpkgs.lib.replaceStrings [" root root "] [" - - "]) rules;
+      }) [llamaSwapFreshLockSample llamaSwapCustomLockSample];
       colibriExclusiveSample = colibriSample.extendModules {
         modules = [{services.infernix.colibri.profiles.fixture-qwen36.exclusiveUnits = ["llama-swap.service"];}];
       };
@@ -1254,6 +1296,8 @@
         builtins.head (nixpkgs.lib.splitString " "
           (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart));
     in {
+      formatting = (mkTreefmt system).config.build.check self;
+
       nvidia-gpu-systemd-overrides = pkgs.runCommand "infernix-nvidia-gpu-systemd-overrides-check" {} ''
         test "${nvidiaGpuOverrides.ProcSubset.content}" = all
         test "${nvidiaGpuOverrides.LimitMEMLOCK}" = infinity
@@ -1270,11 +1314,21 @@
         touch "$out"
       '';
 
-      model-lock = pkgs.runCommand "infernix-model-lock-check" {nativeBuildInputs = [pkgs.python3];} ''
+      model-lock = pkgs.runCommand "infernix-model-lock-check" {nativeBuildInputs = [pkgs.python3 pkgs.systemd];} ''
         mkdir -p tests lib
         cp ${./tests/model_lock_test.py} tests/model_lock_test.py
         cp ${./lib/model-lock.py} lib/model-lock.py
         python3 -m unittest discover -s tests -p '*_test.py'
+        ${nixpkgs.lib.concatMapStringsSep "\n" (fixture: ''
+          root="$TMPDIR/${builtins.hashString "sha256" fixture.lockPath}"
+          mkdir -p "$root"
+          systemd-tmpfiles --create --root="$root" --inline ${nixpkgs.lib.escapeShellArgs fixture.rules}
+          test -f "$root${fixture.lockPath}"
+          inode="$(stat -c %i "$root${fixture.lockPath}")"
+          python3 lib/model-lock.py --shared "$root${fixture.lockPath}" -- true
+          systemd-tmpfiles --create --root="$root" --inline ${nixpkgs.lib.escapeShellArgs fixture.rules}
+          test "$(stat -c %i "$root${fixture.lockPath}")" = "$inode"
+        '') modelLockParentFixtures}
         touch "$out"
       '';
 
@@ -1343,6 +1397,10 @@
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadHealth))}" = "false"
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadAssertions colibriBadStrict))}" = "false"
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriEmptyInventory.config.services.infernix.colibri.evalChecks)}" = "false"
+        ${nixpkgs.lib.concatMapStringsSep "\n" (revision: ''
+          test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadRevision revision).config.services.infernix.colibri.evalChecks)}" = "false"
+        '') ["main" "v1.0" "deadbeef" "${builtins.substring 0 39 colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36.weightsRev}"]}
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriDuplicateInventory.config.services.infernix.colibri.evalChecks)}" = "false"
         touch "$out"
       '';
 

@@ -401,6 +401,10 @@ in
           message = "services.infernix.workloadFabric.profiles.${name}.execution.queues requires an adapter.";
         }
         {
+          assertion = profile.execution.adapter == null || profile.execution.queues != [ ];
+          message = "services.infernix.workloadFabric.profiles.${name}.execution.adapter requires an execution queue.";
+        }
+        {
           assertion = !profile.lease.enabled || profile.execution.adapter != null;
           message = "services.infernix.workloadFabric.profiles.${name}.lease.enabled requires an execution adapter.";
         }

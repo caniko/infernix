@@ -251,12 +251,11 @@ let
       ${pkgs.systemd}/bin/systemctl try-restart hermes-agent.service
     fi
   '';
-  bootstrapHermesSchedule = pkgs.writeShellScript "hermes-agent-scheduled-settings-bootstrap" ''
+  reconcileHermesSchedule = pkgs.writeShellScript "hermes-agent-scheduled-settings-reconcile" ''
     set -eu
 
-    now_h="$(TZ=${lib.escapeShellArg scheduledCfg.timeZone} ${pkgs.coreutils}/bin/date +%H)"
-    now_m="$(TZ=${lib.escapeShellArg scheduledCfg.timeZone} ${pkgs.coreutils}/bin/date +%M)"
-    now_s="$(TZ=${lib.escapeShellArg scheduledCfg.timeZone} ${pkgs.coreutils}/bin/date +%S)"
+    now="$(TZ=${lib.escapeShellArg scheduledCfg.timeZone} ${pkgs.coreutils}/bin/date +%H:%M:%S)"
+    IFS=: read -r now_h now_m now_s <<< "$now"
     now_seconds=$((10#$now_h * 3600 + 10#$now_m * 60 + 10#$now_s))
     profile=${lib.escapeShellArg (if lastDailySwitch == null then "" else lastDailySwitch.profile)}
 
@@ -271,7 +270,7 @@ let
       exit 1
     fi
 
-    exec ${switchHermesSchedule} "$profile" --no-restart
+    exec ${switchHermesSchedule} "$profile" "$@"
   '';
 in
 {
@@ -601,7 +600,7 @@ in
               wantedBy = [ "multi-user.target" ];
               serviceConfig = {
                 Type = "oneshot";
-                ExecStart = "${bootstrapHermesSchedule}";
+                ExecStart = "${reconcileHermesSchedule} --no-restart";
               };
             };
 
@@ -609,17 +608,15 @@ in
               after = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
               requires = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
             };
-          }
-          // lib.mapAttrs'
-            (name: switch:
-              lib.nameValuePair "hermes-agent-scheduled-settings-${name}" {
-                description = "Switch Hermes settings profile to ${switch.profile}";
-                serviceConfig = {
-                  Type = "oneshot";
-                  ExecStart = "${switchHermesSchedule} ${lib.escapeShellArg switch.profile} --restart";
-                };
-              })
-            scheduledCfg.switches;
+            hermes-agent-scheduled-settings = {
+              description = "Reconcile current Hermes settings profile";
+              after = [ "hermes-agent-scheduled-settings-bootstrap.service" ];
+              serviceConfig = {
+                Type = "oneshot";
+                ExecStart = "${reconcileHermesSchedule} --restart";
+              };
+            };
+          };
 
         systemd.timers = lib.mapAttrs'
           (name: switch:
@@ -628,8 +625,10 @@ in
               wantedBy = [ "timers.target" ];
               timerConfig = {
                 OnCalendar = "${switch.onCalendar} ${scheduledCfg.timeZone}";
+                # Missed transitions coalesce and select the current profile,
+                # rather than replaying an overdue profile-specific action.
+                Unit = "hermes-agent-scheduled-settings.service";
                 Persistent = true;
-                Unit = "hermes-agent-scheduled-settings-${name}.service";
               };
             })
           scheduledCfg.switches;

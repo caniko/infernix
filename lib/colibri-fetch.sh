@@ -65,6 +65,16 @@ if [ -n "$token_path" ]; then
 fi
 
 file_count=$(jq '.files | length' "$job")
+# Validate the entire inventory before reuse or destructive staging cleanup.
+# Snapshot metadata is owned by the fetcher, never by downloaded weights.
+while IFS= read -r name; do
+  case "$name" in
+    ""|"."|".."|"./"*|"../"*|*/./*|*/../*|*/.|*/..|/*|ready.json|ready.json/*|.entries.jsonl|.entries.jsonl/*)
+      echo "infernix-colibri-fetch: refusing unsafe or reserved file name: $name" >&2
+      exit 1
+      ;;
+  esac
+done < <(jq -r '.files[].name' "$job")
 if [ -f "$manifest" ] \
   && [ "$(jq -r '.rev' "$manifest")" = "$rev" ] \
   && [ "$(jq -r '.repo' "$manifest")" = "$repo" ] \
@@ -117,21 +127,16 @@ fi
 need=$budget
 if [ "$need" -eq 0 ]; then need=$declared; fi
 mkdir -p "$(dirname "$staging")"
+# Reclaim interrupted downloads before measuring space for their replacement.
+rm -rf "$staging"
 free=$(df --output=avail -B1 "$(dirname "$staging")" | tail -1 | tr -d ' ')
 if [ "$free" -lt $((need + reserve)) ]; then
   echo "infernix-colibri-fetch: insufficient space: need $need payload + $reserve reserve, have $free free" >&2
   exit 1
 fi
 
-rm -rf "$staging"
 mkdir -p "$staging"
 while IFS= read -r name; do
-  case "$name" in
-    ""|".."|"../"*|*/../*|*/..|/*)
-      echo "infernix-colibri-fetch: refusing unsafe file name: $name" >&2
-      exit 1
-      ;;
-  esac
   mkdir -p "$(dirname "$staging/$name")"
   want=$(jq -r --arg n "$name" '.files[] | select(.name == $n) | .sizeBytes // empty' "$job")
   want_hash=$(jq -r --arg n "$name" '.files[] | select(.name == $n) | .sha256 // empty' "$job")

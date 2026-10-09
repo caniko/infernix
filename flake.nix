@@ -676,6 +676,14 @@
         pkgs.writeText
         "infernix-download-extra-files-script"
         llamaSwapExtraFilesSample.config.systemd.services.infernix-download.script;
+      workloadFabricNoQueue = workloadFabricSample.extendModules {
+        modules = [{
+          services.infernix.workloadFabric.profiles.semantic = {
+            execution.queues = nixpkgs.lib.mkForce [];
+            lease.enabled = nixpkgs.lib.mkForce false;
+          };
+        }];
+      };
       visualRubricDirectSample = home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
         extraSpecialArgs = {osConfig = null;};
@@ -1186,6 +1194,24 @@
           ];
         }];
       };
+      colibriReservedInventory = file:
+        colibriSample.extendModules {
+          modules = [{services.infernix.colibri.profiles.fixture-qwen36.weightsFiles = nixpkgs.lib.mkForce [{name = file;}];}];
+        };
+      colibriSocketSample = bind: port: enabled:
+        colibriSample.extendModules {
+          modules = [{services.infernix.colibri.profiles = {
+            fixture-qwen36.bind = nixpkgs.lib.mkForce "127.0.0.1";
+            fixture-qwen36.heavyweight = nixpkgs.lib.mkForce false;
+            second = colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36 // {
+              enable = enabled;
+              heavyweight = false;
+              inherit bind port;
+              modelDir = "/data/models/colibri/second";
+              stagingDir = "/data/models/colibri/.staging-second";
+            };
+          };}];
+        };
       llamaSwapFreshLockSample = llamaSwapExtraFilesSample.extendModules {
         modules = [{services.infernix.llama-swap.modelsDir = nixpkgs.lib.mkForce "/new/nested/models";}];
       };
@@ -1292,9 +1318,9 @@
         ];
       };
       colibriBadAssertions = cfg: cfg.config.services.infernix.colibri.evalChecks;
-      hermesScheduledSwitch =
+      hermesScheduledReconcile =
         builtins.head (nixpkgs.lib.splitString " "
-          (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart));
+          (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings".serviceConfig.ExecStart));
     in {
       formatting = (mkTreefmt system).config.build.check self;
 
@@ -1322,11 +1348,11 @@
         ${nixpkgs.lib.concatMapStringsSep "\n" (fixture: ''
           root="$TMPDIR/${builtins.hashString "sha256" fixture.lockPath}"
           mkdir -p "$root"
-          systemd-tmpfiles --create --root="$root" --inline ${nixpkgs.lib.escapeShellArgs fixture.rules}
+          printf '%s\n' ${nixpkgs.lib.escapeShellArgs fixture.rules} | systemd-tmpfiles --create --root="$root" -
           test -f "$root${fixture.lockPath}"
           inode="$(stat -c %i "$root${fixture.lockPath}")"
           python3 lib/model-lock.py --shared "$root${fixture.lockPath}" -- true
-          systemd-tmpfiles --create --root="$root" --inline ${nixpkgs.lib.escapeShellArgs fixture.rules}
+          printf '%s\n' ${nixpkgs.lib.escapeShellArgs fixture.rules} | systemd-tmpfiles --create --root="$root" -
           test "$(stat -c %i "$root${fixture.lockPath}")" = "$inode"
         '') modelLockParentFixtures}
         touch "$out"
@@ -1401,6 +1427,15 @@
           test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriBadRevision revision).config.services.infernix.colibri.evalChecks)}" = "false"
         '') ["main" "v1.0" "deadbeef" "${builtins.substring 0 39 colibriSample.config.services.infernix.colibri.profiles.fixture-qwen36.weightsRev}"]}
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriDuplicateInventory.config.services.infernix.colibri.evalChecks)}" = "false"
+        ${nixpkgs.lib.concatMapStringsSep "\n" (file: ''
+          test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriReservedInventory file).config.services.infernix.colibri.evalChecks)}" = "false"
+        '') ["ready.json" ".entries.jsonl" "ready.json/child" "./ready.json"]}
+        ${nixpkgs.lib.concatMapStringsSep "\n" (bind: ''
+          test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriSocketSample bind 20213 true).config.services.infernix.colibri.evalChecks)}" = "false"
+        '') ["127.0.0.1" "0.0.0.0" "::"]}
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriSocketSample "127.0.0.2" 20213 true).config.services.infernix.colibri.evalChecks)}" = "true"
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriSocketSample "127.0.0.1" 20214 true).config.services.infernix.colibri.evalChecks)}" = "true"
+        test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) (colibriSocketSample "127.0.0.1" 20213 false).config.services.infernix.colibri.evalChecks)}" = "true"
         touch "$out"
       '';
 
@@ -1413,13 +1448,19 @@
         printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.fallback_model[0].provider == "cloud-router"'
         printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'
         printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .mcp_servers.fixture.args == ["--stdio"]'
-        day_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-day-config.yaml' ${pkgs.lib.escapeShellArg hermesScheduledSwitch})"
-        night_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-night-config.yaml' ${pkgs.lib.escapeShellArg hermesScheduledSwitch})"
+        switch_script="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-scheduled-settings-switch' ${pkgs.lib.escapeShellArg hermesScheduledReconcile})"
+        day_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-day-config.yaml' "$switch_script")"
+        night_config="$(${pkgs.gnugrep}/bin/grep -oE '/nix/store/[a-z0-9]{32}-hermes-agent-night-config.yaml' "$switch_script")"
         ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .moa.default_preset == "gpt55_mimo"' "$day_config"
         ${pkgs.jq}/bin/jq -e '.mcp_servers.fixture.command == "fixture-mcp" and .moa.default_preset == "gpt55_dsflash"' "$night_config"
         test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-day".timerConfig.OnCalendar}" = "*-*-* 09:00:00 America/Los_Angeles"
         test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-night".timerConfig.OnCalendar}" = "*-*-* 17:00:00 America/Los_Angeles"
-        case ${pkgs.lib.escapeShellArg (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart)} in
+        test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-day".timerConfig.Unit}" = "hermes-agent-scheduled-settings.service"
+        test "${hermesAgentSample.config.systemd.timers."hermes-agent-scheduled-settings-night".timerConfig.Unit}" = "hermes-agent-scheduled-settings.service"
+        ${pkgs.python3}/bin/python3 ${./tests/hermes_schedule.py} \
+          ${nixpkgs.lib.escapeShellArg hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings".serviceConfig.ExecStart} \
+          ${pkgs.coreutils}/bin/date
+        case ${pkgs.lib.escapeShellArg (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings".serviceConfig.ExecStart)} in
           *"--restart"*) ;;
           *) echo "day schedule service does not restart hermes-agent" >&2; exit 1 ;;
         esac
@@ -1572,6 +1613,7 @@
       '';
 
       workload-fabric = pkgs.runCommand "infernix-workload-fabric-check" {} ''
+        test '${nixpkgs.lib.boolToString (builtins.all (check: check.assertion) (builtins.filter (check: nixpkgs.lib.hasPrefix "services.infernix.workloadFabric" check.message) workloadFabricNoQueue.config.assertions))}' = 'false'
         test "${workloadFabricSample.config.services.infernix.workloadFabric.workerId}" = "atlas"
         case ${pkgs.lib.escapeShellArg (toString workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig.ExecStart)} in
           *"/bin/infernix-workerd --config"*" worker") ;;

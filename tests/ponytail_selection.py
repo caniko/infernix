@@ -70,6 +70,20 @@ for harness, activation in zip(("codex", "opencode", "empty"), sys.argv[1:], str
         elif harness == "opencode":
             plugins = json.loads((home / ".config/opencode/opencode.json").read_text())["plugin"]
             assert len(plugins) == 2 and "keep-me" in plugins
+            config = home / ".config/opencode/opencode.json"
+            managed = root / "managed-opencode.json"
+            managed.write_text('{"plugin":["declarative-plugin"]}\n')
+            config.unlink()
+            config.symlink_to(managed)
+            target = os.readlink(config)
+            rejected = subprocess.run([activation], env=env, timeout=60)
+            assert rejected.returncode != 0
+            assert config.is_symlink() and os.readlink(config) == target
+            assert managed.read_text() == '{"plugin":["declarative-plugin"]}\n'
+            managed.unlink()
+            rejected = subprocess.run([activation], env=env, timeout=60)
+            assert rejected.returncode != 0
+            assert config.is_symlink() and os.readlink(config) == target
         else:
             assert not Path("/tmp/infernix-ponytail-selection-empty").exists()
 

@@ -442,7 +442,17 @@
 
   globalChecks = let
     pkgBackend = cfg.package.passthru.colibriBackend or "cpu";
+    sockets = mapAttrsToList (name: profile: {inherit name; inherit (profile) bind port;}) enabledProfiles;
+    socketConflict = a: b:
+      a.port == b.port
+      && (a.bind == b.bind || builtins.elem a.bind ["0.0.0.0" "::"] || builtins.elem b.bind ["0.0.0.0" "::"]);
   in [
+    {
+      message = "services.infernix.colibri: enabled profiles must not share conflicting listen sockets (including wildcard binds)";
+      ok = builtins.all
+        (a: builtins.all (b: a.name == b.name || !(socketConflict a b)) sockets)
+        sockets;
+    }
     {
       message = "services.infernix.colibri: enabling any profile requires services.infernix.colibri.package";
       ok = enabledProfiles == {} || cfg.package != null;
@@ -507,6 +517,15 @@
           names = map (file: file.name) profile.weightsFiles;
         in
           builtins.length names == builtins.length (lib.unique names));
+    }
+    {
+      message = "services.infernix.colibri.profiles.${name}.weightsFiles must use repository-relative paths without '.'/'..' or root fetcher metadata names";
+      ok = !profile.enable || builtins.all (file: let
+        components = lib.splitString "/" file.name;
+      in
+        file.name != "" && !(lib.hasPrefix "/" file.name)
+        && !(builtins.elem "." components) && !(builtins.elem ".." components)
+        && !(builtins.elem (builtins.head components) ["ready.json" ".entries.jsonl"])) profile.weightsFiles;
     }
     {
       message = "services.infernix.colibri.profiles.${name}.queueTimeout must stay under the 120s gateway per-target timeout";

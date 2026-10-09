@@ -7,6 +7,7 @@ workspace = true
 publish_crates = true
 all_features = false
 nix_builds = [".#checks.x86_64-linux.model-lock", ".#checks.x86_64-linux.colibri", ".#checks.x86_64-linux.llama-swap-extra-files"]
+publish_strategy = "coordinated"
 
 [ci.nix_build]
 capture_results = true

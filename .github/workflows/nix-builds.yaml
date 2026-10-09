@@ -25,6 +25,10 @@ jobs:
           - ".#checks.x86_64-linux.model-lock"
           - ".#checks.x86_64-linux.colibri"
           - ".#checks.x86_64-linux.llama-swap-extra-files"
+          - ".#checks.x86_64-linux.hermes-agent"
+          - ".#checks.x86_64-linux.ponytail-harness-registration"
+          - ".#checks.x86_64-linux.workload-fabric"
+          - ".#codex-provider"
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:

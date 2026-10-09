@@ -1613,7 +1613,9 @@
       '';
 
       workload-fabric = pkgs.runCommand "infernix-workload-fabric-check" {} ''
-        test '${nixpkgs.lib.boolToString (builtins.all (check: check.assertion) (builtins.filter (check: nixpkgs.lib.hasPrefix "services.infernix.workloadFabric" check.message) workloadFabricNoQueue.config.assertions))}' = 'false'
+        # NixOS messages may refer to failure-only data. Inspect a message
+        # only after its assertion fails, and require this specific rejection.
+        test '${nixpkgs.lib.boolToString (builtins.any (check: !check.assertion && check.message == "services.infernix.workloadFabric.profiles.semantic.execution.adapter requires an execution queue.") workloadFabricNoQueue.config.assertions)}' = 'true'
         test "${workloadFabricSample.config.services.infernix.workloadFabric.workerId}" = "atlas"
         case ${pkgs.lib.escapeShellArg (toString workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig.ExecStart)} in
           *"/bin/infernix-workerd --config"*" worker") ;;

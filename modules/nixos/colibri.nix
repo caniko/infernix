@@ -501,9 +501,12 @@
     }
     {
       message = "services.infernix.colibri.profiles.${name}.weightsFiles must declare each file name exactly once";
-      ok = !profile.enable || let
-        names = map (file: file.name) profile.weightsFiles;
-      in builtins.length names == builtins.length (lib.unique names);
+      ok =
+        !profile.enable
+        || (let
+          names = map (file: file.name) profile.weightsFiles;
+        in
+          builtins.length names == builtins.length (lib.unique names));
     }
     {
       message = "services.infernix.colibri.profiles.${name}.queueTimeout must stay under the 120s gateway per-target timeout";

@@ -46,7 +46,7 @@ export function parseCodexJsonl(stdout) {
       continue;
     }
     const item = event.item ?? event;
-    if ((event.type === "item.completed" || item.type === "agent_message") && item.text) {
+    if (event.type === "item.completed" && item.type === "agent_message" && typeof item.text === "string") {
       messages.push(item.text);
     }
   }
@@ -75,6 +75,9 @@ export function runCodex({ model, prompt, cwd }, { command = codexPath } = {}) {
     });
     let stdout = "";
     let stderr = "";
+    // Preserve UTF-8 sequences when the pipe splits a multibyte character.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", reject);

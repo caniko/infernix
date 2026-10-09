@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ensureKeyFile, readKeyFile } from "./credentials.mjs";
-import { createProviderServer, runCodex } from "./server.mjs";
+import { createProviderServer, parseCodexJsonl, runCodex } from "./server.mjs";
 
 test("credential creation is private, persistent and rejects unsafe files", () => {
   const directory = mkdtempSync(join(tmpdir(), "infernix-auth-"));
@@ -97,4 +97,32 @@ console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_messag
 
 test("Codex spawn failures reject without an unhandled stdin error", async () => {
   await assert.rejects(runCodex({ model: "default", prompt: "private", cwd: process.cwd() }, { command: "/missing/infernix-codex-fixture" }));
+});
+
+test("only completed agent messages become provider responses", () => {
+  const events = [
+    { type: "item.completed", item: { type: "reasoning", text: "private reasoning" } },
+    { type: "item.completed", item: { type: "command_execution", text: "tool output" } },
+    { type: "item.updated", item: { type: "agent_message", text: "partial answer" } },
+    { type: "item.completed", item: { type: "agent_message", text: "public answer" } },
+  ];
+  assert.equal(parseCodexJsonl(events.map((event) => JSON.stringify(event)).join("\n")), "public answer");
+  assert.equal(parseCodexJsonl(JSON.stringify(events[0])), "");
+});
+
+test("Codex response decoding preserves characters split between chunks", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "infernix-utf8-"));
+  try {
+    const command = join(directory, "codex-fixture");
+    writeFileSync(command, `#!${process.execPath}
+const fs = require("node:fs");
+fs.readFileSync(0);
+const output = Buffer.from(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "answer: 🌱" } }) + "\\n");
+const split = output.indexOf(Buffer.from("🌱")) + 1;
+process.stdout.write(output.subarray(0, split), () => setTimeout(() => process.stdout.write(output.subarray(split)), 50));
+`, { mode: 0o700 });
+    assert.equal(await runCodex({ model: "default", prompt: "fixture", cwd: directory }, { command }), "answer: 🌱");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

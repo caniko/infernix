@@ -20,6 +20,8 @@
     flatten
     ;
   cfg = config.services.infernix.llama-swap;
+  modelLock = import ../../lib/model-lock.nix {inherit lib pkgs;};
+  exclLib = import ../../lib/exclusive-units.nix {inherit lib;};
 
   # NB: gpuCfg, llama-cpp, llama-server, mkModelCmd, and downloadFiles all
   # depend on services.infernix.gpu.* (which is null when nothing's enabled)
@@ -146,6 +148,11 @@ in {
       type = types.path;
       description = "Directory where GGUF model files are stored.";
     };
+    lockPath = mkOption {
+      type = types.str;
+      default = "${toString cfg.modelsDir}.doty-lock";
+      description = "Directory-wide persistent model lock shared by download, serve and cleanup.";
+    };
 
     autoCleanup = mkOption {
       type = types.bool;
@@ -256,6 +263,20 @@ in {
       default = true;
       description = "Whether to open firewall ports for llama-swap.";
     };
+
+    exclusiveUnits = mkOption {
+      type = types.listOf types.str;
+      default = [];
+      example = ["infernix-colibri-kat-coder.service"];
+      description = ''
+        Systemd units that must not be active for llama-swap to start.
+        The same fail-closed peer-state check and process-lifetime atomic
+        pair locks as Colibri refuse competing starts. A lost admission
+        race exits with non-restarting status 78. Nothing is ever stopped
+        or killed. Declare both directions of every exclusive pair using
+        canonical .service unit names.
+      '';
+    };
   };
 
   config = mkIf cfg.enable (let
@@ -276,7 +297,7 @@ in {
       then bleedingPkgs.llama-cpp-vulkan
       else
         gpuLib.overrideLlamaCpp {
-          vendor = gpuCfg.vendor;
+          inherit (gpuCfg) vendor;
           pkgs = bleedingPkgs;
           hardwareOptimization = cfg.llamaCpp.hardwareOptimization;
           extraCmakeFlags = cfg.llamaCpp.extraCmakeFlags;
@@ -292,6 +313,7 @@ in {
         ++ optional (model.draft != null) "-ngld ${toString model.draft.nGpuLayers}";
     in
       concatStringsSep " " ([
+          (lib.escapeShellArgs (modelLock.command true cfg.lockPath))
           llama-server
           "--port \${PORT}"
           "-m ${cfg.modelsDir}/${model.file}"
@@ -314,15 +336,26 @@ in {
     expectedFilesManifest =
       pkgs.writeText "infernix-expected-model-files" "${concatStringsSep "\n" expectedFiles}\n";
   in {
+    systemd.tmpfiles.rules =
+      [(modelLock.anchor cfg.lockPath)]
+      ++ exclLib.anchors "llama-swap.service" cfg.exclusiveUnits;
     services.llama-swap = {
       enable = true;
-      package = bleedingPkgs.llama-swap;
+      # Retain the upstream module's listen/config/TLS arguments and unit
+      # hardening. exec keeps the pair leases in the serving process.
+      package =
+        if cfg.exclusiveUnits == []
+        then bleedingPkgs.llama-swap
+        else
+          pkgs.writeShellScriptBin "llama-swap" ''
+            exec ${lib.escapeShellArgs (exclLib.command pkgs "llama-swap.service" cfg.exclusiveUnits)} ${getExe bleedingPkgs.llama-swap} "$@"
+          '';
       listenAddress = cfg.host;
-      port = cfg.port;
+      inherit (cfg) port;
 
       settings = {
-        logLevel = cfg.logLevel;
-        healthCheckTimeout = cfg.healthCheckTimeout;
+        inherit (cfg) logLevel;
+        inherit (cfg) healthCheckTimeout;
 
         models =
           lib.mapAttrs (name: model: {
@@ -336,12 +369,14 @@ in {
     # GPU-specific systemd overrides
     systemd.services.llama-swap.serviceConfig =
       (gpuLib.systemdGpuOverrides {
-        vendor = gpuCfg.vendor;
+        inherit (gpuCfg) vendor;
         inherit (gpuCfg) visibleDevices;
-        amd = gpuCfg.amd;
+        inherit (gpuCfg) amd;
       })
       // {
         ReadOnlyPaths = [cfg.modelsDir];
+        ExecCondition = exclLib.mkExclusiveCondition pkgs cfg.exclusiveUnits;
+        RestartPreventExitStatus = lib.optional (cfg.exclusiveUnits != []) 78;
       };
 
     # Model download service
@@ -375,6 +410,10 @@ in {
         RemainAfterExit = true;
       };
       script = ''
+        # Download/autoCleanup hold the same inode as all llama-server children.
+        # util-linux flock retains this descriptor in every subprocess.
+        exec 9<>${lib.escapeShellArg cfg.lockPath}
+        ${lib.getExe' pkgs.util-linux "flock"} --exclusive --nonblock 9
         mkdir -p "${cfg.modelsDir}"
         ${optionalString cfg.autoCleanup ''
           # Remove GGUF files no longer declared in the flake

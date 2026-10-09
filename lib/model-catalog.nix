@@ -62,7 +62,12 @@ in
       (filterAttrs (_: model: model ? capabilities) (modelsForHost catalog host));
 
   mkHmEndpointModels = { catalog, endpoint }:
-    mapAttrs (_: resolveEndpointModel catalog)
+    mapAttrs
+      (name: spec:
+        (resolveEndpointModel catalog spec)
+        // optionalAttrs ((catalog.models.${spec.model} or { }) ? capabilities) {
+          capabilities = catalog.models.${spec.model}.capabilities;
+        })
       (catalog.homeManager.endpoints.${endpoint}.models or { });
 
   mkProbeSpecs = { catalog, host }:

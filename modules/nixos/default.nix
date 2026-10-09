@@ -1,6 +1,7 @@
 {
   imports = [
     ./cloud-router.nix
+    ./colibri.nix
     ./comfyui.nix
     ./fleet.nix
     ./hermes-agent.nix

@@ -48,6 +48,19 @@ NixOS modules (`nixosModules.default`):
 
 ### Inference packages
 
+Model publishers and consumers coordinate through persistent-inode flocks.
+Colibri uses `<modelDir>.doty-lock`; llama-swap uses a directory-wide
+`<modelsDir>.doty-lock`. Systemd tmpfiles provisions readable anchors. Fetch and
+download/autoCleanup hold exclusive locks; Colibri and each llama-server child
+hold shared locks across exec for their entire lifetime. A conflicting operation
+fails without starting its child. Never unlink an anchor to release a lock.
+`lockPath` overrides must also be used by external cleaners. The flake exports
+`lib.modelLocks = true` for downstream capability gating, and
+`lib/model-lock.nix` provides the shared command/anchor API.
+
+Run the native protocol tests with
+`python3 -m unittest discover -s tests -p '*_test.py'`.
+
 infernix uses a single `nixos-unstable` nixpkgs input for all packages,
 including `ollama`, `llama-cpp`, and `llama-swap`. GPU-aware packages are
 re-instantiated with the consumer's own `services.infernix.gpu.pkgs` config so
@@ -56,6 +69,8 @@ without introducing a second nixpkgs channel.
 
 Home-manager modules (`homeModules.default`):
 
+- **`services.infernix.modelProviders`** — one provider/model catalog rendered
+  by the opt-in OpenCode and Claude Code modules.
 - **`services.infernix.endpoints`** — the central abstraction. You declare
   each reachable local model backend once (type, URL, models with context size
   and optional contention metadata) and every other HM module consumes it.
@@ -72,15 +87,82 @@ Home-manager modules (`homeModules.default`):
   user, writing to `programs.yh.steeds` under `mkIf` still triggers
   type-checking for users who don't import yeeHaw's HM module. Wire it in
   yourself with one line per user — see the snippet below.
-- **`services.infernix.graphify`** — installs the Infernix-owned Graphify
-  package with its OpenAI-compatible semantic extras, resolves the configured
-  endpoint/model, and registers Graphify with every Unix harness supported by
-  the pinned Graphify release. Registration runs idempotently during Home
-  Manager activation; the read-only `registeredHarnesses` and
-  `registrationCommands` options expose the resolved contract.
+- **`services.infernix.ponytail`** — installs the pinned Ponytail runtime and
+  wires native hooks/plugins plus instruction and skill fallbacks across the
+  union of Ponytail's portability matrix and Infernix's harness registry.
+  Activation is local and idempotent: it never runs an interactive upstream
+  installer, preserves existing JSON and instruction files, and exposes the
+  resolved `registeredHarnesses` and `adapterStatus` read-only outputs. Set
+  `defaultMode` only when Infernix should own Ponytail's persisted default;
+  leaving it null preserves Ponytail's own user configuration.
+- **`services.infernix.harnesses`** — the shared harness registry used by
+  integrations such as MCP. Each entry declares a probe command and optional
+  adapter metadata. The default `mode = "auto"` probes the Home Manager
+  profile plus the activation `PATH`; `force` is for GUI or config-only
+  clients, and `off` suppresses an integration without removing its package.
+  The declarative plan is exposed as
+  `services.infernix.harnessRegistry.plan`. MCP rendering and reconciliation
+  now belong to Fleetix; ownership is recorded under
+  `$XDG_STATE_HOME/fleetix/mcp.json`, and activation reports configured/skipped
+  harnesses. `harnessRegistry.statusFile` is a deprecated compatibility option.
+
+Infernix owns this external plugin's pinned payload, harness adapters, and
+native hook/plugin installation. Skillnet owns canonical authored skills,
+materialised views, and usage storage; canix owns the user/host opt-in. Do not
+copy Ponytail into Skillnet or add per-harness installation policy to canix.
+
+### Harness auto-configuration
+
+The default module imports `fleetix.homeModules.mcp`. The old
+`services.infernix.mcp.servers` registry and harness `auto`/`force`/`off` modes
+are compatibility shims. New integrations use `fleetix.mcp` directly; generic
+adapters are available without enabling OpenPencil:
+
+```nix
+{
+  imports = [ infernix.homeModules.default ];
+  fleetix.mcp = {
+    enable = true;
+    harnesses.codex.enable = true;
+    harnesses.omp.enable = true;
+    servers.graph.url = "http://localhost:8781/mcp";
+  };
+}
+```
+
+`services.infernix.mcp.servers.<name>.harnesses = null` (the default) selects
+all registered adapters that are detected at activation. A list restricts the
+candidates, while each candidate still follows its registry mode. Missing
+`auto` probes are a successful no-op; they do not create empty client config
+files. Installing a client after activation requires another Home Manager
+switch. The activation report lists skipped clients. Removing a previously
+configured client prunes its owned entries while preserving unrelated settings.
+
+Fleetix supports native, managed-entry merge (strict JSON/TOML), and export
+delivery. Nix-native consumers use `fleetix.mcp.rendered` or the pure
+`fleetix.lib.mcp.renderServers` API. Declarative destinations must use native or
+export delivery. See Fleetix's `MCP.md` for capabilities, ownership conflicts,
+secret references, migration adoption and cleanup.
 
 Additional opt-in Home Manager modules:
 
+- **`homeModules.openpencil`** — registers the legacy OpenPencil MCP server
+  through Fleetix's independent harness catalogue.
+- **`homeModules.opencode`** — writes OpenCode's provider/model settings from
+  the shared catalog.
+- **`homeModules.claude-code`** — installs Claude Code and Claude Code Router,
+  starts the loopback gateway, and exposes Codex through `/model codex,default`.
+  The Codex provider runs `codex exec` directly; it does not use MCP or ACP.
+  Both clients use a private per-user credential created during Home Manager
+  activation at `$XDG_STATE_HOME/infernix/codex-provider.key` (directory `0700`,
+  file `0600`). The launchers read it at runtime; no credential value is written
+  to the Nix store or session-variable configuration. The provider authenticates
+  every request before reading its body or workspace header. Claude's router uses
+  the same credential and dedicated state beside the key, so old public local
+  keys are not inherited. `services.infernix.modelProviders.codexProviderKeyFile`
+  selects another private key file; the former plaintext `claude-code.apiKey`
+  option is replaced by this runtime-file contract. OpenCode alone also starts
+  the authenticated Codex provider when its catalog includes Codex.
 - **`homeModules.goose`** — writes `programs.goose.*` from the generated
   `services.infernix.goose.*` outputs for users that also import a Goose
   Home Manager module.
@@ -192,18 +274,22 @@ If you already import yeeHaw's Home Manager module, add
 `infernix.homeModules.yeehaw` to the module list to write
 `programs.yh.steeds` from `services.infernix.yeehaw.generatedSteeds`.
 
-To enable Graphify and its shared harness registration, declare one Infernix
-endpoint and select its model. The default `harnesses` list covers the full
-Unix Graphify target set; override it only for a deliberately narrower
-profile:
+To enable Ponytail's shared guidance and harness adapters:
 
 ```nix
-services.infernix.graphify = {
+services.infernix.ponytail = {
   enable = true;
-  endpoint = "local-llama-swap";
-  model = "coder";
+  # Optional: default is every supported Infernix/Ponytail harness.
+  # harnesses = [ "codex" "opencode" "claude" ];
+  # Optional: null leaves ~/.config/ponytail/config.json untouched.
+  # defaultMode = "full";
 };
 ```
+
+Native JavaScript adapters use the Nix-provided Node runtime. Hosts that only
+support project-local rules receive their upstream assets in the stable
+runtime directory and are reported as `scope = "project-only"`; Infernix does
+not mutate arbitrary project checkouts.
 
 ## GPU configuration
 

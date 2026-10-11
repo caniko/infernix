@@ -19,7 +19,7 @@
 
     plinth = {
       url = "git+https://github.com/caniko/plinth.git?ref=refs/heads/trunk";
-      inputs.nixpkgs.follows = "nixpkgs";
+      # Plinth pins nixpkgs to its Cargo.lock's Dioxus CLI contract.
     };
 
     harbor-rs = {

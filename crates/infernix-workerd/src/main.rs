@@ -6,15 +6,15 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use infernix_workload::{
-    sql::{CLAIM, COMPLETE, HEARTBEAT, SCHEMA, WORKER_HEARTBEAT},
     JobId, Lease, LeaseToken, WorkerId, WorkloadProfile,
+    sql::{CLAIM, COMPLETE, HEARTBEAT, SCHEMA, WORKER_HEARTBEAT},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::{
     io::AsyncWriteExt,
     process::Command,

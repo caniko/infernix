@@ -347,7 +347,23 @@
       };
     });
 
-    formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);
+    # Keep CI's Rust workspace formatting coverage on its pinned toolchain.
+    formatter = forAllSystems (system: let
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      };
+      toolchain = harbor-rs.lib.mkToolchain {
+        inherit pkgs;
+        toolchainProfile = "nightly";
+      };
+      treefmt = harbor-rs.inputs.treefmt-nix.lib.evalModule pkgs {
+        imports = [harbor-rs.treefmtModules.rust];
+        projectRootFile = "flake.nix";
+        programs.rustfmt.package = toolchain.rustToolchain;
+      };
+    in
+      treefmt.config.build.wrapper);
 
     devShells = forAllSystems (system: let
       pkgs = import nixpkgs {

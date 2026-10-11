@@ -860,10 +860,12 @@ mod tests {
         queue.register_worker(profile).unwrap();
         queue.set_drained(&worker_id, true).unwrap();
         queue.enqueue(job("job", 1, &[])).unwrap();
-        assert!(queue
-            .claim(&worker_id, Utc::now(), Duration::minutes(1))
-            .unwrap()
-            .is_none());
+        assert!(
+            queue
+                .claim(&worker_id, Utc::now(), Duration::minutes(1))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

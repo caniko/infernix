@@ -5,6 +5,14 @@ with harbor-py. `uv.lock` pins Headroom 0.40.0 and all proxy dependencies,
 including its native compression extension. No pip installation or model
 download happens when a service starts.
 
+`codex-routing.patch` repairs the 0.40.0 session adapter and Responses
+WebSocket path. Custom providers keep their transport setting and API prefix;
+the selected destination stays request-local during WebSocket-to-HTTP fallback.
+Explicit invalid destinations are rejected before credentials are forwarded.
+WebSockets retain validated address pinning, Host/TLS identity, and refuse
+redirects. Retire this patch only after the replacement package passes the
+custom-provider routing, fallback, cancellation and MCP retrieval fixtures.
+
 Refresh deliberately with `uv lock --upgrade` in this directory and build
 `canix cache binary build .#headroom` from the Infernix checkout. The lock must
 remain compatible with Python 3.12 and the package's native library overrides.

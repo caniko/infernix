@@ -19,10 +19,21 @@
     workspaceRoot = ./.;
     dependencies = {headroom-ai = ["proxy"];};
     pyprojectOverrides = _final: prev:
-      pkgs.lib.genAttrs ["headroom-ai" "onnxruntime" "sqlite-vec" "ast-grep-cli"] (name:
+      pkgs.lib.genAttrs ["onnxruntime" "sqlite-vec" "ast-grep-cli"] (name:
         prev.${name}.overrideAttrs (old: {
           buildInputs = (old.buildInputs or []) ++ [pkgs.stdenv.cc.cc.lib];
-        }));
+        }))
+      // {
+        headroom-ai = prev.headroom-ai.overrideAttrs (old: {
+          buildInputs = (old.buildInputs or []) ++ [pkgs.stdenv.cc.cc.lib];
+          nativeBuildInputs = (old.nativeBuildInputs or []) ++ [pkgs.patch];
+          postInstall =
+            (old.postInstall or "")
+            + ''
+              patch --fuzz=0 --directory="$out/${pkgs.python312.sitePackages}" -p1 < ${./codex-routing.patch}
+            '';
+        });
+      };
   };
 in
   harborPy.lib.mkPythonApplicationPackage {

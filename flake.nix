@@ -1256,7 +1256,7 @@
         touch "$out"
       '';
 
-      colibri = pkgs.runCommand "infernix-colibri-check" {} ''
+      colibri = pkgs.runCommand "infernix-colibri-check" {nativeBuildInputs = [pkgs.python3];} ''
         test "${nixpkgs.lib.boolToString (builtins.all (c: c.ok) colibriOwnAssertions)}" = "true"
         # wantedBy=[] does not stop switch-start: the admission marker
         # condition is the real manual-start gate, ANDed with weights.
@@ -1267,10 +1267,7 @@
           esac
         done
         test "${colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.Type}" = "exec"
-        case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)} in
-          *infernix-colibri-entrypoint*--ctx*8*) ;;
-          *) echo "serve unit must exec the manifest-gated entrypoint" >&2; exit 1 ;;
-        esac
+        python3 ${./tests/colibri_launcher.py} ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.ExecStart)}
         case ${nixpkgs.lib.escapeShellArg (toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.LoadCredential)} in
           *coli-api-key:/run/keys/fixture-colibri*) ;;
           *) echo "serve unit must load the key as a credential" >&2; exit 1 ;;

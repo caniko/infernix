@@ -46,6 +46,12 @@
 
     rust-overlay.follows = "harbor-rs/rust-overlay";
 
+    harbor-py = {
+      url = "github:caniko/harbor-py/dab2acaf106eab7f94084ed8d02747c495f31737";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.harbor-meta.follows = "harbor-rs/harbor-meta";
+    };
+
     # Colibri engine source for the GPU packaging flavors below.
     # Consumers override the rev (e.g. a fork with unreleased fixes) via
     # `<consumer>.inputs.infernix.inputs.colibri.follows`.
@@ -74,6 +80,7 @@
     visual-rubric,
     plinth,
     harbor-rs,
+    harbor-py,
     fleetix,
     nix-pklx,
     openpencil,
@@ -200,6 +207,11 @@
         _module.args.infernixVisualRubric = visual-rubric;
         _module.args.infernixCodexAcp = self.packages.${pkgs.stdenv.hostPlatform.system}.codex-acp;
         _module.args.infernixPonytail = self.packages.${pkgs.stdenv.hostPlatform.system}.ponytail;
+        _module.args.infernixHeadroom = self.packages.${pkgs.stdenv.hostPlatform.system}.headroom;
+      };
+      headroom = {pkgs, ...}: {
+        imports = [fleetix.homeModules.mcp ./modules/home-manager/headroom.nix];
+        _module.args.infernixHeadroom = self.packages.${pkgs.stdenv.hostPlatform.system}.headroom;
       };
       opencode = {
         imports = [
@@ -274,6 +286,10 @@
         codex-acp = pkgs.callPackage ./packages/codex-acp.nix {};
         codex-provider = pkgs.callPackage ./packages/codex-provider.nix {};
         ponytail = pkgs.callPackage ./packages/ponytail.nix {};
+        headroom = import ./packages/headroom {
+          inherit pkgs;
+          harborPy = harbor-py;
+        };
         # Colibri GPU flavors. Default archs target the first consumer's
         # hosts (Atlas gfx1100, Nomad sm_89); the lib function takes any
         # arch, and consumers pass their own pinned toolchains for
@@ -1398,6 +1414,20 @@
         test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.claude-code-router.Service.ExecStart 0}" = "${pkgs.claude-code-router}/bin/ccr start"
         touch "$out"
       '';
+
+      headroom = assert import ./tests/headroom.nix {
+        inherit pkgs fleetix;
+        homeManager = home-manager;
+      };
+        pkgs.runCommand "infernix-headroom-check" {} "touch $out";
+
+      headroom-runtime =
+        pkgs.runCommand "infernix-headroom-runtime" {
+          TIKTOKEN_CACHE_DIR = self.packages.${system}.headroom.tokenizerCache;
+        } ''
+          ${self.packages.${system}.headroom.pythonInterpreter} ${./tests/headroom-runtime.py} ${nixpkgs.lib.getExe self.packages.${system}.headroom}
+          touch "$out"
+        '';
 
       codex-provider-closure = pkgs.runCommand "infernix-codex-provider-closure-check" {} ''
         package=${self.packages.${system}.codex-provider}

@@ -7,6 +7,7 @@
     ./harnesses.nix
     ./mcp.nix
     ./ponytail.nix
+    ./headroom.nix
     ./goose.nix
     ./hermes-agent.nix
     ./ollama-aliases.nix

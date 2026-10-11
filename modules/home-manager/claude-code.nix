@@ -95,7 +95,7 @@ in {
     home.packages = [claudeWrapper cfg.routerPackage codexBridge];
 
     home.sessionVariables = {
-      ANTHROPIC_BASE_URL = "http://127.0.0.1:${toString cfg.routerPort}";
+      ANTHROPIC_BASE_URL = lib.mkDefault "http://127.0.0.1:${toString cfg.routerPort}";
       ANTHROPIC_AUTH_TOKEN = cfg.apiKey;
       CODEX_HOME = "${config.home.homeDirectory}/.codex";
     };

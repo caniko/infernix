@@ -133,19 +133,24 @@ class Runtime(unittest.TestCase):
 
     @classmethod
     def start_proxy(cls):
+        started = time.monotonic()
         cls.process = subprocess.Popen(cls.command, env=cls.environment, stdout=cls.log, stderr=cls.log)
         try:
-            for _ in range(120):
+            # Full-flake CI also builds Rust closures. Bound cold-import time
+            # using elapsed time, and keep failing immediately on a crash.
+            while time.monotonic() - started < 90:
                 if cls.process.poll() is not None:
                     cls.log.seek(0)
                     raise AssertionError(cls.log.read())
                 try:
                     with urlopen(cls.base + "/health", timeout=1) as response:
                         if response.status == 200:
+                            print(f"proxy ready after {time.monotonic() - started:.1f}s", flush=True)
                             return
                 except OSError:
                     time.sleep(0.25)
-            raise AssertionError("production proxy did not become healthy")
+            cls.log.seek(0)
+            raise AssertionError(f"production proxy did not become healthy after {time.monotonic() - started:.1f}s\n{cls.log.read()[-8192:]}")
         except BaseException:
             cls.process.terminate()
             cls.process.wait(timeout=15)

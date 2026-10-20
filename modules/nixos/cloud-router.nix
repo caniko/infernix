@@ -64,7 +64,8 @@ let
             return PROVIDERS["xiaomi"]
         elif model.startswith("zai-org/"):
             return PROVIDERS["gmi"]
-        return PROVIDERS["deepseek"]
+        # Never answer an unrouted model (e.g. claude-*) from another vendor.
+        return None
 
 
     class Proxy(http.server.BaseHTTPRequestHandler):
@@ -94,7 +95,11 @@ let
                 self._json_response(404, {"error": "not found"})
 
         def do_POST(self):
-            if self.path not in ("/v1/chat/completions", "/v1/messages"):
+            if self.path == "/v1/messages":
+                # Every upstream speaks OpenAI chat completions only.
+                self._json_response(400, {"error": "Anthropic Messages is not supported; use /v1/chat/completions"})
+                return
+            if self.path != "/v1/chat/completions":
                 self._json_response(404, {"error": "not found"})
                 return
 
@@ -103,6 +108,9 @@ let
                 body = json.loads(self.rfile.read(length)) if length > 0 else {}
                 model = body.get("model", "deepseek-v4-flash")
                 provider = route_model(model)
+                if provider is None:
+                    self._json_response(400, {"error": f"model {model!r} is not served by cloud-router"})
+                    return
 
                 api_key = os.environ.get(provider["envVar"], "")
                 if not api_key:

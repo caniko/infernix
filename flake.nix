@@ -507,6 +507,8 @@
               };
             };
 
+            services.infernix.cloud-router.enable = true;
+
             services.infernix.hermes-agent = {
               enable = true;
               environmentFiles = ["/run/secrets/hermes-env"];
@@ -525,6 +527,11 @@
                       urlSource = "fleetLoadBalancer";
                       defaultModel = "qwen3-vl-8b";
                       models."qwen3-vl-8b".context_length = 4096;
+                    };
+                    meridian = {
+                      urlSource = "literal";
+                      baseUrl = "http://127.0.0.1:3460";
+                      apiMode = "anthropic_messages";
                     };
                   };
                   model = {
@@ -1292,11 +1299,26 @@
         touch "$out"
       '';
 
+      # The router must refuse what it cannot serve instead of answering from
+      # another vendor. Rejections happen before any upstream call or key lookup.
+      cloud-router = pkgs.runCommand "infernix-cloud-router-check" {nativeBuildInputs = [pkgs.curl];} ''
+        ${hermesAgentSample.config.systemd.services.infernix-cloud-router.serviceConfig.ExecStart} &
+        for _ in $(seq 50); do curl -fsS http://127.0.0.1:2099/health >/dev/null 2>&1 && break; sleep 0.2; done
+        code() { curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$2" "http://127.0.0.1:2099$1"; }
+        test "$(code /v1/chat/completions '{"model":"claude-sonnet-5-5"}')" = 400
+        test "$(code /v1/messages '{"model":"deepseek-v4-flash"}')" = 400
+        # A routed model passes routing and stops only at its missing key.
+        test "$(code /v1/chat/completions '{"model":"deepseek-v4-flash"}')" = 500
+        kill %1
+        touch "$out"
+      '';
+
       hermes-agent = pkgs.runCommand "infernix-hermes-agent-check" {} ''
         settings='${builtins.toJSON hermesAgentSample.config.services.hermes-agent.settings}'
         printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.model.default == "gpt-5.5"'
         printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "local-fleet" and .base_url == "http://192.168.178.31:8014/v1" and .models."qwen3-vl-8b".context_length == 4096)'
-        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "cloud-router" and .base_url == "http://127.0.0.1:2099/v1")'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "cloud-router" and .base_url == "http://127.0.0.1:2099/v1" and (has("api_mode") | not))'
+        printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.custom_providers[] | select(.name == "meridian" and .base_url == "http://127.0.0.1:3460" and .api_mode == "anthropic_messages")'
         printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.auxiliary.vision.model == "qwen3-vl-8b"'
         printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.fallback_model[0].provider == "cloud-router"'
         printf '%s' "$settings" | ${pkgs.jq}/bin/jq -e '.moa.default_preset == "gpt55_dsflash"'

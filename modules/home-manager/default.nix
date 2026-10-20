@@ -1,5 +1,6 @@
 {
   imports = [
+    ./agents.nix
     ./model-providers.nix
     ./endpoints.nix
     ./workloads.nix

@@ -9,8 +9,14 @@
   inherit (lib) mkOption types;
   cfg = config.services.infernix.agents;
 
-  # Claude Code tools denied for each denied OpenCode permission.
+  # Claude Code tools denied for each denied OpenCode permission. A denial with
+  # no entry here fails evaluation rather than silently widening Claude access.
   claudeDeniedTools = {
+    bash = ["Bash"];
+    read = ["Read"];
+    glob = ["Glob"];
+    grep = ["Grep"];
+    skill = ["Skill"];
     edit = ["Edit" "Write" "NotebookEdit"];
     task = ["Agent"];
     webfetch = ["WebFetch"];
@@ -29,7 +35,7 @@
   # JSON strings are valid YAML double-quoted scalars.
   toClaude = name: agent: let
     denied = lib.concatLists (lib.mapAttrsToList (perm: action:
-      lib.optionals (action == "deny") (claudeDeniedTools.${perm} or []))
+      lib.optionals (action == "deny") claudeDeniedTools.${perm})
     agent.permission);
     field = key: value: "${key}: ${builtins.toJSON value}";
   in
@@ -96,6 +102,13 @@ in {
   };
 
   config = lib.mkIf (cfg != {}) {
+    assertions = lib.concatLists (lib.mapAttrsToList (name: agent:
+      lib.optionals (agent.claude != null) (lib.mapAttrsToList (perm: action: {
+          assertion = action != "deny" || claudeDeniedTools ? ${perm};
+          message = "services.infernix.agents.${name}: denied permission '${perm}' has no Claude Code tool mapping.";
+        })
+        agent.permission))
+    cfg);
     programs.opencode.settings.agent = lib.mapAttrs toOpencode cfg;
     home.file = lib.mapAttrs' (name: agent:
       lib.nameValuePair ".claude/agents/${name}.md" {text = toClaude name agent;})

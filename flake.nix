@@ -213,6 +213,8 @@
         imports = [fleetix.homeModules.mcp ./modules/home-manager/headroom.nix];
         _module.args.infernixHeadroom = self.packages.${pkgs.stdenv.hostPlatform.system}.headroom;
       };
+      # Path module: deduplicates with the copy imported by `default`.
+      agents = ./modules/home-manager/agents.nix;
       opencode = {
         imports = [
           ./modules/home-manager/model-providers.nix
@@ -1425,6 +1427,12 @@
         homeManager = home-manager;
       };
         pkgs.runCommand "infernix-mcp-adapters" {} ''touch $out'';
+
+      harness-agents = assert import ./tests/agents.nix {
+        inherit pkgs;
+        homeManager = home-manager;
+      };
+        pkgs.runCommand "infernix-harness-agents" {} ''touch $out'';
 
       codex-acp-closure = let
         closure = pkgs.closureInfo {

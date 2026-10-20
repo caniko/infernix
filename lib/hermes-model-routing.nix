@@ -27,6 +27,9 @@ let
     }
     // lib.optionalAttrs (provider ? defaultModel && provider.defaultModel != null) {
       model = provider.defaultModel;
+    }
+    // lib.optionalAttrs (provider ? apiMode && provider.apiMode != null) {
+      api_mode = provider.apiMode;
     };
 in
 {

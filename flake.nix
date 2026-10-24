@@ -272,6 +272,25 @@
           '';
         }}/bin/hermes-models-export";
           };
+        }
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          # Simit prebuild publication on trunk (secret ATTIC_TOKEN). Linux
+          # outputs only: darwin builds never reach the public canix cache.
+          push-flake-inputs = rs-harbor.lib.mkAtticPush {
+            inherit pkgs;
+            flake = ".";
+            paths = [
+              self.packages.${system}.infernix-lb
+              self.packages.${system}.codex-acp
+            ];
+            adapter = rs-harbor.lib.mkAdapter {
+              attic = {
+                endpoint = "https://attic.candee.baby";
+                cache = "canix";
+                tokenEnvVar = "ATTIC_TOKEN";
+              };
+            };
+          };
         });
 
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixpkgs-fmt);

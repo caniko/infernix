@@ -154,7 +154,7 @@ Additional opt-in Home Manager modules:
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     home-manager.url = "github:nix-community/home-manager";
-    infernix.url = "codeberg:caniko/infernix";
+    infernix.url = "github:caniko/infernix";
   };
 
   outputs = {nixpkgs, home-manager, infernix, ...}: {
@@ -297,7 +297,7 @@ Early. The module API may still change without deprecation warnings.
 
 ## CI
 
-Woodpecker CI on Codeberg runs `nix flake check` on every push and pull request to verify that all module definitions evaluate correctly.
+GitHub Actions runs the generated package checks on every push and pull request to verify that all module definitions evaluate correctly.
 
 ## License
 

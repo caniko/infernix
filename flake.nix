@@ -347,6 +347,27 @@
           '';
         }}/bin/hermes-models-export";
       };
+    }
+    // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+      # Simit prebuild publication on trunk (secret ATTIC_TOKEN). Linux
+      # outputs only: darwin builds never reach the public canix cache.
+      push-flake-inputs = harbor-rs.lib.mkAtticPush {
+        inherit pkgs;
+        flake = ".";
+        paths = with self.packages.${system}; [
+          infernix-lb
+          codex-acp
+          headroom
+          ponytail
+        ];
+        adapter = harbor-rs.lib.mkAdapter {
+          attic = {
+            endpoint = "https://attic.candee.baby";
+            cache = "canix";
+            tokenEnvVar = "ATTIC_TOKEN";
+          };
+        };
+      };
     });
 
     # Keep CI's Rust workspace formatting coverage on its pinned toolchain.
@@ -378,6 +399,9 @@
       };
       cross = harbor-rs.lib.mkCross {inherit pkgs system;};
     in {
+      default = toolchain.craneLib.devShell {
+        packages = [pkgs.pkg-config pkgs.openssl];
+      };
       docs = harbor-rs.lib.mkDocsShell {
         inherit pkgs cross;
         inherit (toolchain) craneLib;

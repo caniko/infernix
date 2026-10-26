@@ -288,6 +288,7 @@
         codex-acp = pkgs.callPackage ./packages/codex-acp.nix {};
         codex-provider = pkgs.callPackage ./packages/codex-provider.nix {};
         ponytail = pkgs.callPackage ./packages/ponytail.nix {};
+        model-fetch = pkgs.callPackage ./packages/model-fetch {};
         headroom = import ./packages/headroom {
           inherit pkgs;
           harborPy = harbor-py;
@@ -1427,6 +1428,11 @@
         homeManager = home-manager;
       };
         pkgs.runCommand "infernix-mcp-adapters" {} ''touch $out'';
+
+      model-fetch = import ./tests/model-fetch.nix {
+        inherit pkgs nixpkgs;
+        nixosModule = self.nixosModules.default;
+      };
 
       harness-agents = assert import ./tests/agents.nix {
         inherit pkgs;

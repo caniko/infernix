@@ -1429,7 +1429,7 @@
       };
         pkgs.runCommand "infernix-mcp-adapters" {} ''touch $out'';
 
-      model-fetch = import ./tests/model-fetch.nix {
+      model-fetch = import ./tests/model-fetch {
         inherit pkgs nixpkgs;
         nixosModule = self.nixosModules.default;
       };

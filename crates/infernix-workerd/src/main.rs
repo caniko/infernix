@@ -393,21 +393,20 @@ async fn claim(
     worker_id: &WorkerId,
     boot_id: &str,
 ) -> Result<Option<ClaimedJob>> {
-    let workloads = config
+    // Claim only pairs an adapter can run, not the workload x queue product.
+    let (workloads, queues): (Vec<String>, Vec<String>) = config
         .adapters
         .iter()
-        .map(|adapter| adapter.workload.clone())
+        .flat_map(|adapter| {
+            adapter
+                .queues
+                .iter()
+                .map(|queue| (adapter.workload.clone(), queue.clone()))
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect::<Vec<_>>();
-    let queues = config
-        .adapters
-        .iter()
-        .flat_map(|adapter| adapter.queues.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if workloads.is_empty() || queues.is_empty() {
+        .unzip();
+    if workloads.is_empty() {
         return Ok(None);
     }
 

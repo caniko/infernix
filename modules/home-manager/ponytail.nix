@@ -71,6 +71,8 @@
   ];
   package = if cfg.package != null then cfg.package else infernixPonytail;
   runtimeDir = cfg.runtimeDir;
+  # Activation shell for one harness, emitted only when that harness is selected.
+  forHarness = harness: lib.optionalString (builtins.elem harness cfg.harnesses);
   mode = types.enum [ "off" "lite" "full" "ultra" ];
   adapterStatus =
     lib.genAttrs cfg.harnesses (harness: {
@@ -475,27 +477,30 @@ in {
       ${jsonHookScript}
       ${jsonPluginScript}
 
-      managed_block "$HOME/AGENTS.md" "$runtime_dir/AGENTS.md"
-      managed_block "$HOME/.agents/rules/ponytail.md" "$runtime_dir/.agents/rules/ponytail.md"
-      managed_block "$HOME/.codex/AGENTS.md" "$runtime_dir/AGENTS.md"
-      managed_block "$HOME/.config/opencode/AGENTS.md" "$runtime_dir/AGENTS.md"
-      managed_block "$HOME/.claude/CLAUDE.md" "$runtime_dir/AGENTS.md"
-      managed_block "$HOME/.copilot/copilot-instructions.md" "$runtime_dir/.github/copilot-instructions.md"
-      managed_block "$HOME/.config/amp/AGENTS.md" "$runtime_dir/AGENTS.md"
-      managed_block "$HOME/.config/swival/AGENTS.md" "$runtime_dir/AGENTS.md"
-      managed_block "$HOME/.cursor/rules/ponytail.mdc" "$runtime_dir/.cursor/rules/ponytail.mdc"
-      managed_block "$HOME/.windsurf/rules/ponytail.md" "$runtime_dir/.windsurf/rules/ponytail.md"
-      managed_block "$HOME/.clinerules/ponytail.md" "$runtime_dir/.clinerules/ponytail.md"
-      managed_block "$HOME/.kiro/steering/ponytail.md" "$runtime_dir/.kiro/steering/ponytail.md"
-      managed_block "$HOME/.qoder/rules/ponytail.md" "$runtime_dir/.qoder/rules/ponytail.md"
+      ${forHarness "agents" ''managed_block "$HOME/AGENTS.md" "$runtime_dir/AGENTS.md"''}
+      ${forHarness "agents" ''managed_block "$HOME/.agents/rules/ponytail.md" "$runtime_dir/.agents/rules/ponytail.md"''}
+      ${forHarness "codex" ''managed_block "$HOME/.codex/AGENTS.md" "$runtime_dir/AGENTS.md"''}
+      ${forHarness "opencode" ''managed_block "$HOME/.config/opencode/AGENTS.md" "$runtime_dir/AGENTS.md"''}
+      ${forHarness "claude" ''managed_block "$HOME/.claude/CLAUDE.md" "$runtime_dir/AGENTS.md"''}
+      ${forHarness "copilot-cli" ''managed_block "$HOME/.copilot/copilot-instructions.md" "$runtime_dir/.github/copilot-instructions.md"''}
+      ${forHarness "amp" ''managed_block "$HOME/.config/amp/AGENTS.md" "$runtime_dir/AGENTS.md"''}
+      ${forHarness "swival" ''managed_block "$HOME/.config/swival/AGENTS.md" "$runtime_dir/AGENTS.md"''}
+      ${forHarness "cursor" ''managed_block "$HOME/.cursor/rules/ponytail.mdc" "$runtime_dir/.cursor/rules/ponytail.mdc"''}
+      ${forHarness "windsurf" ''managed_block "$HOME/.windsurf/rules/ponytail.md" "$runtime_dir/.windsurf/rules/ponytail.md"''}
+      ${forHarness "cline" ''managed_block "$HOME/.clinerules/ponytail.md" "$runtime_dir/.clinerules/ponytail.md"''}
+      ${forHarness "kiro" ''managed_block "$HOME/.kiro/steering/ponytail.md" "$runtime_dir/.kiro/steering/ponytail.md"''}
+      ${forHarness "qoder" ''managed_block "$HOME/.qoder/rules/ponytail.md" "$runtime_dir/.qoder/rules/ponytail.md"''}
 
+      ${forHarness "codex" ''
       merge_hook_json "$HOME/.codex/hooks.json" false true
       INFERNIX_CODEX_HOOKS="$HOME/.codex/hooks.json" \
         INFERNIX_CODEX_CONFIG="$HOME/.codex/config.toml" \
         INFERNIX_CODEX_MARKETPLACE_ROOT="$runtime_dir" \
         ${python} ${codexTrustScript}
-      merge_hook_json "$HOME/.claude/settings.json" true false
+      ''}
+      ${forHarness "claude" ''merge_hook_json "$HOME/.claude/settings.json" true false''}
 
+      ${forHarness "opencode" ''
       opencode_config_count=0
       for opencode_config in "$HOME/.config/opencode/opencode.json" "$HOME/.opencode/opencode.json"; do
         if [ -f "$opencode_config" ]; then
@@ -506,12 +511,14 @@ in {
       if [ "$opencode_config_count" -eq 0 ]; then
         merge_opencode_json "$HOME/.config/opencode/opencode.json"
       fi
+      ''}
 
-      managed_link "$runtime_dir/pi-extension" "$HOME/.pi/agent/extensions/ponytail"
-      managed_link "$runtime_dir" "$HOME/.gemini/extensions/ponytail"
-      managed_link "$runtime_dir/.openclaw/skills/ponytail" "$HOME/.openclaw/skills/ponytail"
-      managed_link "$runtime_dir" "$HOME/.devin/plugins/ponytail"
-      managed_link "$runtime_dir" "$HOME/.copilot/plugins/ponytail"
+      ${forHarness "pi" ''managed_link "$runtime_dir/pi-extension" "$HOME/.pi/agent/extensions/ponytail"''}
+      ${forHarness "gemini" ''managed_link "$runtime_dir" "$HOME/.gemini/extensions/ponytail"''}
+      ${forHarness "claw" ''managed_link "$runtime_dir/.openclaw/skills/ponytail" "$HOME/.openclaw/skills/ponytail"''}
+      ${forHarness "devin" ''managed_link "$runtime_dir" "$HOME/.devin/plugins/ponytail"''}
+      ${forHarness "copilot-cli" ''managed_link "$runtime_dir" "$HOME/.copilot/plugins/ponytail"''}
+      ${forHarness "codex" ''
       managed_link "$runtime_dir" "$HOME/.codex/plugins/ponytail"
       managed_link "$runtime_dir" "$HOME/.codex/plugins/cache/ponytail/ponytail/local"
       codex_plugin_cache="$HOME/.codex/plugins/cache/ponytail/ponytail/${ponytailVersion}"
@@ -533,14 +540,17 @@ in {
         cp -a "$runtime_dir/." "$codex_plugin_tmp/"
         mv "$codex_plugin_tmp" "$codex_plugin_cache"
       fi
-      managed_link "$runtime_dir" "$HOME/.claude/plugins/ponytail"
+      ''}
+      ${forHarness "claude" ''managed_link "$runtime_dir" "$HOME/.claude/plugins/ponytail"''}
 
+      ${forHarness "hermes" ''
       if command -v hermes >/dev/null 2>&1; then
         managed_link "$runtime_dir" "$HOME/.hermes/plugins/ponytail"
         hermes plugins enable ponytail --no-allow-tool-override >/dev/null 2>&1 || {
           echo "infernix ponytail: Hermes plugin could not be enabled; rules remain installed" >&2
         }
       fi
+      ''}
 
       ${lib.optionalString (cfg.defaultMode != null) ''
         mkdir -p "$HOME/.config/ponytail"

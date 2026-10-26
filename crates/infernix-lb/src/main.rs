@@ -3,26 +3,27 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
     body::Body,
     extract::State,
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use clap::Parser;
 use futures_util::TryStreamExt;
+use infernix_workload::Capability;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
@@ -70,14 +71,6 @@ struct ModelConfig {
     capabilities: BTreeSet<Capability>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "kebab-case")]
-enum Capability {
-    Chat,
-    Embeddings,
-    Rerank,
-}
-
 struct Backend {
     cfg: BackendConfig,
     in_flight: AtomicUsize,
@@ -92,6 +85,7 @@ struct AppState {
 struct SelectedBackend {
     backend: Arc<Backend>,
     model_name: String,
+    guard: InFlightGuard,
 }
 
 struct InFlightGuard {
@@ -208,7 +202,7 @@ async fn retrying_buffered_json(
         match select_backend(&state, &requested, capability, &attempted, &mut exclusions).await {
             Some(selected) => {
                 attempted.insert(selected.backend.cfg.id.clone());
-                let _guard = reserve_in_flight(&selected.backend);
+                let _guard = selected.guard;
                 rewrite_model(&mut body, &selected.model_name);
                 let response =
                     forward_json_buffered(&state.client, &selected.backend, path, &body).await;
@@ -247,7 +241,7 @@ async fn chat_completions(State(state): State<AppState>, Json(mut body): Json<Va
     else {
         return service_unavailable(&requested, exclusions);
     };
-    let guard = reserve_in_flight(&selected.backend);
+    let guard = selected.guard;
     rewrite_model(&mut body, &selected.model_name);
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if streaming {
@@ -327,13 +321,23 @@ async fn select_backend(
     }
 
     candidates.sort_by_key(|(priority, in_flight, weight, _, _)| (*priority, *in_flight, *weight));
-    candidates
-        .into_iter()
-        .next()
-        .map(|(_, _, _, backend, model)| SelectedBackend {
-            backend: Arc::clone(backend),
-            model_name: model.name.clone(),
-        })
+    // The load above only pre-filters; a concurrent request may have taken the
+    // last slot during the health check, so the reservation itself is the gate.
+    for (_, _, _, backend, model) in candidates {
+        if let Some(guard) = try_reserve_in_flight(backend) {
+            return Some(SelectedBackend {
+                backend: Arc::clone(backend),
+                model_name: model.name.clone(),
+                guard,
+            });
+        }
+        exclusions.push(json!({
+            "backend": backend.cfg.id,
+            "reason": "max-in-flight",
+            "max_in_flight": backend.cfg.max_in_flight
+        }));
+    }
+    None
 }
 
 async fn backend_healthy(client: &Client, backend: &Backend) -> bool {
@@ -456,18 +460,17 @@ fn requested_model(body: &Value) -> std::result::Result<String, Box<Response>> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| {
-            Box::new(
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": {
-                            "message": "request body must include string field `model`",
-                            "type": "invalid_request_error"
-                        }
-                    })),
-                )
-                    .into_response(),
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": "request body must include string field `model`",
+                        "type": "invalid_request_error"
+                    }
+                })),
             )
+                .into_response()
+                .into()
         })
 }
 
@@ -483,11 +486,14 @@ fn model_matches(model: &ModelConfig, requested: &str) -> bool {
         || model.aliases.iter().any(|alias| alias == requested)
 }
 
-fn reserve_in_flight(backend: &Arc<Backend>) -> InFlightGuard {
-    backend.in_flight.fetch_add(1, Ordering::SeqCst);
-    InFlightGuard {
+/// Atomically takes one slot below `max_in_flight`, or none. A refused
+/// increment is undone when its guard drops.
+fn try_reserve_in_flight(backend: &Arc<Backend>) -> Option<InFlightGuard> {
+    let guard = InFlightGuard {
         backend: Arc::clone(backend),
-    }
+    };
+    let previous = backend.in_flight.fetch_add(1, Ordering::SeqCst);
+    (previous < backend.cfg.max_in_flight).then_some(guard)
 }
 
 fn retryable(status: StatusCode) -> bool {
@@ -560,16 +566,21 @@ mod tests {
 
     #[derive(Clone)]
     struct MockBackend {
+        health_status: StatusCode,
         status: StatusCode,
+        delay_millis: u64,
         requests: Arc<Mutex<Vec<Value>>>,
     }
 
-    async fn mock_healthz() -> impl IntoResponse {
-        StatusCode::OK
+    async fn mock_healthz(State(state): State<MockBackend>) -> impl IntoResponse {
+        state.health_status
     }
 
     async fn mock_rerank(State(state): State<MockBackend>, Json(body): Json<Value>) -> Response {
         state.requests.lock().await.push(body);
+        if state.delay_millis != 0 {
+            tokio::time::sleep(Duration::from_millis(state.delay_millis)).await;
+        }
         (
             state.status,
             Json(json!({
@@ -582,9 +593,19 @@ mod tests {
     }
 
     async fn spawn_mock_backend(status: StatusCode) -> (String, Arc<Mutex<Vec<Value>>>) {
+        spawn_mock_backend_with_health(StatusCode::OK, status, 0).await
+    }
+
+    async fn spawn_mock_backend_with_health(
+        health_status: StatusCode,
+        status: StatusCode,
+        delay_millis: u64,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let state = MockBackend {
+            health_status,
             status,
+            delay_millis,
             requests: Arc::clone(&requests),
         };
         let app = Router::new()
@@ -621,6 +642,32 @@ mod tests {
             aliases: vec!["rerank".to_string()],
             capabilities: BTreeSet::from([Capability::Rerank]),
         }
+    }
+
+    #[test]
+    fn concurrent_requests_never_exceed_max_in_flight() {
+        let backend = test_backend(
+            "atlas",
+            "http://127.0.0.1:9".to_string(),
+            10,
+            rerank_model("jina-reranker-v3"),
+        );
+        let first = try_reserve_in_flight(&backend).expect("first slot");
+        assert!(try_reserve_in_flight(&backend).is_none());
+        assert_eq!(backend.in_flight.load(Ordering::SeqCst), 1);
+        drop(first);
+
+        let reservations = (0..64)
+            .map(|_| {
+                let backend = Arc::clone(&backend);
+                std::thread::spawn(move || try_reserve_in_flight(&backend))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(reservations.iter().flatten().count(), 1);
+        assert_eq!(backend.in_flight.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -673,6 +720,90 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(bad_requests.lock().await.len(), 1);
         assert_eq!(good_requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unhealthy_backend_is_excluded_before_forwarding() {
+        let (base_url, requests) =
+            spawn_mock_backend_with_health(StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK, 0)
+                .await;
+        let state = AppState {
+            client: Client::new(),
+            backends: Arc::new(vec![test_backend(
+                "atlas",
+                base_url,
+                10,
+                rerank_model("jina-reranker-v3"),
+            )]),
+        };
+
+        let response = retrying_buffered_json(
+            state,
+            json!({"model": "jina-reranker-v3", "query": "bay", "documents": ["window"]}),
+            Capability::Rerank,
+            "/v1/rerank",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_is_selected_when_primary_health_fails() {
+        let (primary_url, primary_requests) =
+            spawn_mock_backend_with_health(StatusCode::SERVICE_UNAVAILABLE, StatusCode::OK, 0)
+                .await;
+        let (fallback_url, fallback_requests) = spawn_mock_backend(StatusCode::OK).await;
+        let state = AppState {
+            client: Client::new(),
+            backends: Arc::new(vec![
+                test_backend("atlas", primary_url, 10, rerank_model("jina-reranker-v3")),
+                test_backend("nomad", fallback_url, 20, rerank_model("jina-reranker-v3")),
+            ]),
+        };
+
+        let response = retrying_buffered_json(
+            state,
+            json!({"model": "jina-reranker-v3", "query": "bay", "documents": ["window"]}),
+            Capability::Rerank,
+            "/v1/rerank",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(primary_requests.lock().await.is_empty());
+        assert_eq!(fallback_requests.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_fails_closed_without_leaking_backend_data() {
+        let (base_url, requests) =
+            spawn_mock_backend_with_health(StatusCode::OK, StatusCode::OK, 300).await;
+        let client = Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let state = AppState {
+            client,
+            backends: Arc::new(vec![test_backend(
+                "atlas",
+                base_url,
+                10,
+                rerank_model("jina-reranker-v3"),
+            )]),
+        };
+
+        let response = retrying_buffered_json(
+            state,
+            json!({"model": "jina-reranker-v3", "query": "bay", "documents": ["window"]}),
+            Capability::Rerank,
+            "/v1/rerank",
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(requests.lock().await.len(), 1);
     }
 
     #[tokio::test]

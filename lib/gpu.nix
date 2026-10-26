@@ -70,6 +70,8 @@ in {
     else if vendor == "nvidia"
     then {
       DevicePolicy = mkForce "auto";
+      ProcSubset = mkForce "all";
+      LimitMEMLOCK = "infinity";
       Environment = envVars;
     }
     else if vendor == "intel"

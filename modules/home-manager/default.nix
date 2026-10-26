@@ -1,8 +1,14 @@
 {
   imports = [
+    ./agents.nix
+    ./model-providers.nix
     ./endpoints.nix
+    ./workloads.nix
     ./acp.nix
-    ./graphify.nix
+    ./harnesses.nix
+    ./mcp.nix
+    ./ponytail.nix
+    ./headroom.nix
     ./goose.nix
     ./hermes-agent.nix
     ./ollama-aliases.nix

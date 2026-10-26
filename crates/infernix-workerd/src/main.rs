@@ -6,15 +6,15 @@ use std::{
     time::Duration as StdDuration,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use infernix_workload::{
+    JobId, Lease, LeaseToken, WorkerId, WorkloadProfile,
     sql::{CLAIM, COMPLETE, HEARTBEAT, SCHEMA, WORKER_HEARTBEAT},
-    JobId, Lease, LeaseToken, WorkerId,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::{
     io::AsyncWriteExt,
     process::Command,
@@ -78,6 +78,8 @@ struct Config {
     worker: WorkerConfig,
     #[serde(default)]
     adapters: Vec<AdapterConfig>,
+    #[serde(default)]
+    profiles: Vec<WorkloadProfile>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -201,6 +203,11 @@ fn validate_config(config: &Config) -> Result<()> {
             || adapter.command.as_os_str().is_empty()
     }) {
         bail!("each adapter needs a workload, at least one queue, and a command")
+    }
+    for profile in &config.profiles {
+        profile
+            .validate()
+            .map_err(|error| anyhow!("invalid workload profile: {error}"))?;
     }
     Ok(())
 }
@@ -386,21 +393,20 @@ async fn claim(
     worker_id: &WorkerId,
     boot_id: &str,
 ) -> Result<Option<ClaimedJob>> {
-    let workloads = config
+    // Claim only pairs an adapter can run, not the workload x queue product.
+    let (workloads, queues): (Vec<String>, Vec<String>) = config
         .adapters
         .iter()
-        .map(|adapter| adapter.workload.clone())
+        .flat_map(|adapter| {
+            adapter
+                .queues
+                .iter()
+                .map(|queue| (adapter.workload.clone(), queue.clone()))
+        })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect::<Vec<_>>();
-    let queues = config
-        .adapters
-        .iter()
-        .flat_map(|adapter| adapter.queues.iter().cloned())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if workloads.is_empty() || queues.is_empty() {
+        .unzip();
+    if workloads.is_empty() {
         return Ok(None);
     }
 
@@ -549,13 +555,10 @@ async fn execute_job(
         }
     };
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
-        let error = if stderr.trim().is_empty() {
-            format!("adapter exited with {}", output.status)
-        } else {
-            stderr.trim().to_owned()
-        };
+        // Adapter stderr is untrusted and may contain credentials, source, or
+        // prompt data. Keep status/error records stable and metadata-only.
+        let error = format!("adapter exited with {}", output.status);
         fail(&client, &job.lease, &error).await?;
         bail!("job {} failed: {error}", job.lease.job_id.as_str())
     }
@@ -563,12 +566,7 @@ async fn execute_job(
     let result = if output.stdout.is_empty() {
         json!({"status": "completed"})
     } else {
-        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
-            json!({
-                "status": "completed",
-                "stdout": String::from_utf8_lossy(&output.stdout),
-            })
-        })
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| json!({"status": "completed"}))
     };
     let affected = client
         .execute(

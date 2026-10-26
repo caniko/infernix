@@ -55,10 +55,10 @@
     import socketserver
 
     marker = "${marker}"
-    units = ${builtins.toJSON cfg.units}
+    healthUnits = ${builtins.toJSON (if cfg.healthUnits == null then cfg.units else cfg.healthUnits)}
 
     def units_active():
-        for unit in units:
+        for unit in healthUnits:
             result = subprocess.run(
                 ["${pkgs.systemd}/bin/systemctl", "is-active", "--quiet", unit],
                 check=False,
@@ -108,7 +108,14 @@ in {
       type = types.listOf types.str;
       default = [];
       example = ["llama-swap.service" "ollama.service"];
-      description = "Systemd units stopped on `off` and started on `on`.";
+      description = "Systemd units stopped on `off` and started on `on` (lifecycle control).";
+    };
+
+    healthUnits = mkOption {
+      type = types.nullOr (types.listOf types.str);
+      default = null;
+      example = ["llama-swap.service"];
+      description = "Systemd units required for /healthz to report healthy. Defaults to `units` when null. Set explicitly when some lifecycle units (e.g. optional backends) must not gate node health.";
     };
 
     openFirewallInterfaces = mkOption {

@@ -1,0 +1,258 @@
+--- a/headroom/cli/wrap.py
++++ b/headroom/cli/wrap.py
+@@ -2984,17 +2984,19 @@
+                 f"Codex custom provider {provider!r} has no upstream base_url"
+             )
+         prefix = ("model_providers", provider)
+-        overrides.extend(
+-            (
+-                f"{_codex_dotted_key(*prefix, 'base_url')}={_codex_toml_value(proxy_url)}",
+-                f"{_codex_dotted_key(*prefix, 'supports_websockets')}=true",
+-            )
++        overrides.append(
++            f"{_codex_dotted_key(*prefix, 'base_url')}={_codex_toml_value(proxy_url)}"
+         )
+         env[_UPSTREAM_BASE_URL_ENV_VAR] = upstream.rstrip("/")
+         display.append(f"{_UPSTREAM_BASE_URL_ENV_VAR}={upstream.rstrip('/')}")
+         overrides.append(
+             f"{_codex_dotted_key(*prefix, 'env_http_headers', _UPSTREAM_BASE_URL_HEADER_NAME)}="
+             f"{_codex_toml_value(_UPSTREAM_BASE_URL_ENV_VAR)}"
++        )
++        env["HEADROOM_CODEX_UPSTREAM_PATH"] = "/responses"
++        overrides.append(
++            f"{_codex_dotted_key(*prefix, 'env_http_headers', 'X-Headroom-Original-Path')}="
++            f"{_codex_toml_value('HEADROOM_CODEX_UPSTREAM_PATH')}"
+         )
+
+     if project and "HEADROOM_PROJECT" not in env:
+--- a/headroom/proxy/handlers/openai.py
++++ b/headroom/proxy/handlers/openai.py
+@@ -448,32 +448,36 @@
+     return parsed.path
+
+
++def _parse_openai_upstream_base(raw: str) -> str:
++    base = raw.strip().rstrip("/")
++    parsed = urlparse(base)
++    port = parsed.port
++    if (
++        parsed.scheme not in {"http", "https"}
++        or not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.query
++        or parsed.fragment
++        or (port is not None and port < 1)
++    ):
++        raise ValueError("custom upstream not allowed")
++    return base
++
++
+ def _resolve_openai_upstream_base(request_headers: dict[str, str]) -> str | None:
+-    raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
+-    if raw_base_url is None:
++    from fastapi import HTTPException
++
++    raw = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
++    if raw is None:
+         return None
+-
+-    normalized = _normalize_origin(raw_base_url)
+-    if normalized is None:
+-        return None
+-
+-    # _normalize_origin drops the path; re-attach it so a custom upstream served
+-    # from a sub-path (e.g. https://host/api/v1) is preserved rather than routed
+-    # to the bare origin.
+-    path = (urlparse(raw_base_url.strip()).path or "").rstrip("/")
+-    if path:
+-        normalized = f"{normalized}{path}"
+-
+-    if urlparse(normalized).scheme not in {"http", "https"}:
+-        return None
+-    if not is_safe_upstream_url(normalized):
+-        # Client-supplied upstream resolves to a private/loopback/link-local or
+-        # cloud-metadata address (SSRF). Ignore the override and fall back to the
+-        # configured upstream; set HEADROOM_ALLOWED_BASE_URLS to permit specific
+-        # internal endpoints.
+-        logger.warning("ignoring unsafe x-headroom-base-url override: %r", raw_base_url)
+-        return None
+-    return normalized
++    try:
++        base = _parse_openai_upstream_base(raw)
++        if not is_safe_upstream_url(base):
++            raise ValueError("custom upstream not allowed")
++    except ValueError as exc:
++        raise HTTPException(status_code=403, detail="custom upstream not allowed") from exc
++    return base
+
+
+ def _resolve_openai_chat_handler_path(base_url: str, model: str | None) -> str:
+@@ -482,6 +486,19 @@
+     if is_copilot_api_url(base_url) and model_prefers_responses_api(model):
+         return _OPENAI_RESPONSES_PATH
+     return _OPENAI_CHAT_COMPLETIONS_PATH
++
++
++async def _resolve_openai_ws_upstream_base(request_headers: dict[str, str]) -> str | None:
++    """Reject an invalid explicit route rather than forwarding its credentials elsewhere."""
++    from headroom.proxy.upstream_guard import is_safe_upstream_url_async
++
++    raw = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
++    if raw is None:
++        return None
++    base = _parse_openai_upstream_base(raw)
++    if not await is_safe_upstream_url_async(base):
++        raise ValueError("custom upstream not allowed")
++    return base
+
+
+ def _append_request_query(url: str, query: str) -> str:
+@@ -6498,7 +6515,7 @@
+
+         # Route to correct endpoint based on auth mode.
+         # ChatGPT session auth (codex login) uses chatgpt.com, not api.openai.com.
+-        if is_chatgpt_auth:
++        if is_chatgpt_auth and custom_upstream_base_url is None:
+             url = codex_responses_http_url()
+         else:
+             handler_path = (
+@@ -7564,8 +7581,22 @@
+         ws_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
+         _lower_headers = {k.lower(): v for k, v in upstream_headers.items()}
+
+-        # Build upstream WebSocket URL based on auth mode
+-        if is_chatgpt_auth:
++        try:
++            custom_upstream_base_url = await _resolve_openai_ws_upstream_base(ws_headers)
++        except ValueError:
++            await websocket.close(code=1008, reason="custom upstream not allowed")
++            return
++
++        # Keep explicit provider routing request-local across both transports.
++        if custom_upstream_base_url is not None:
++            ws_base = custom_upstream_base_url.replace("https://", "wss://", 1).replace(
++                "http://", "ws://", 1
++            )
++            upstream_url = build_copilot_upstream_url(
++                ws_base,
++                _resolve_openai_handler_path(ws_headers, handler_path=_OPENAI_RESPONSES_PATH),
++            )
++        elif is_chatgpt_auth:
+             # ChatGPT session auth → route to chatgpt.com backend
+             upstream_url = codex_responses_websocket_url()
+             logger.debug(
+@@ -7775,19 +7806,21 @@
+             upstream: Any = None
+             from headroom.proxy.helpers import merge_extra_headers
+
+-            # The WS upstream is derived from config (chatgpt.com backend or
+-            # OPENAI_API_URL), never from a request header.
+             upstream_headers = merge_extra_headers(
+                 upstream_headers,
+                 self.config.openai_extra_headers,
+-                upstream_url=None,
++                upstream_url=custom_upstream_base_url,
+                 config=self.config,
+             )
++
++            from headroom.proxy.upstream_pinning import connect_guarded_websocket
+
+             for ws_attempt in range(ws_connect_attempts):
+                 try:
+-                    upstream = await websockets.connect(
++                    upstream = await connect_guarded_websocket(
+                         upstream_url,
++                        upstream_base_url=custom_upstream_base_url,
++                        attempt=ws_attempt,
+                         additional_headers=upstream_headers,
+                         subprotocols=(
+                             [websockets.Subprotocol(p) for p in client_subprotocols]
+@@ -9988,7 +10021,12 @@
+                     fb_cache_write_tokens,
+                     fb_uncached_tokens,
+                 ) = await self._ws_http_fallback(
+-                    websocket, body, first_msg_raw, upstream_headers, request_id
++                    websocket,
++                    body,
++                    first_msg_raw,
++                    upstream_headers,
++                    request_id,
++                    upstream_base_url=custom_upstream_base_url,
+                 )
+                 # Fold the fallback's provider usage into the session totals so
+                 # the WS session-end outcome records the authoritative wire-token
+@@ -10262,6 +10300,8 @@
+         first_msg_raw: str,
+         upstream_headers: dict[str, str],
+         request_id: str,
++        *,
++        upstream_base_url: str | None = None,
+     ) -> tuple[int, int, int, int, int]:
+         """Fall back to HTTP POST streaming when upstream WS fails.
+
+@@ -10289,7 +10329,14 @@
+
+         # Route to correct endpoint based on auth mode
+         is_chatgpt_fallback = has_chatgpt_account_header(upstream_headers)
+-        if is_chatgpt_fallback:
++        if upstream_base_url is not None:
++            http_url = build_copilot_upstream_url(
++                upstream_base_url,
++                _resolve_openai_handler_path(
++                    dict(websocket.headers), handler_path=_OPENAI_RESPONSES_PATH
++                ),
++            )
++        elif is_chatgpt_fallback:
+             http_url = codex_responses_http_url()
+         else:
+             http_url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
+@@ -10369,6 +10416,11 @@
+                         headers=http_headers,
+                         content=outbound_bytes,
+                         timeout=self._ws_http_fallback_timeout(),
++                        **(
++                            {"follow_redirects": False}
++                            if upstream_base_url is not None
++                            else {}
++                        ),
+                     ) as response:
+                         if response.status_code != 200:
+                             error_body = b""
+--- a/headroom/proxy/upstream_pinning.py
++++ b/headroom/proxy/upstream_pinning.py
+@@ -120,6 +120,34 @@
+         "HEADROOM_ALLOWED_BASE_URLS (HEADROOM_PROXIED_BASE_URLS for a proxy "
+         "route) — see headroom/proxy/upstream_pinning.py."
+     )
++
++
++def connect_guarded_websocket(
++    url: str, *, upstream_base_url: str | None = None, attempt: int = 0, **kwargs: Any
++) -> Any:
++    """Carry validated addresses to WS without changing Host or TLS SNI."""
++    from websockets.asyncio.client import connect
++    from websockets.proxy import get_proxy
++    from websockets.uri import parse_uri
++
++    if upstream_base_url is None:
++        return connect(url, **kwargs)
++
++    class NoRedirectConnect(connect):
++        def process_redirect(self, exc: Exception) -> Exception:
++            return exc
++
++    uri = parse_uri(url)
++    pin = guarded_pin(uri.host)
++    if pin is not None:
++        if pin.is_expired():
++            raise _refusal(uri.host, "the validated addresses have expired")
++        if get_proxy(uri) is not None:
++            if not proxied_upstream_listed(httpx.URL(upstream_base_url)):
++                raise _refusal(uri.host, "the WebSocket proxy cannot enforce address pinning")
++        else:
++            kwargs.update(host=pin.addresses[attempt % len(pin.addresses)], proxy=None)
++    return NoRedirectConnect(url, **kwargs)
+
+
+ class PinnedAddressBackend(httpcore.AsyncNetworkBackend):

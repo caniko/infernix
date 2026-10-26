@@ -24,8 +24,8 @@ description = "Declarative NixOS and home-manager modules for self-hosted AI/ML 
 [[pages.sections]]
 type = "hero"
 title = "infernix"
-tagline = "Declarative NixOS and home-manager modules for self-hosted AI/ML inference"
-subtitle = "Declarative NixOS and home-manager modules for self-hosted AI/ML inference"
+tagline = "Self-hosted AI/ML services in Nix"
+subtitle = "GPU-aware NixOS and Home Manager modules for Ollama, llama-swap, ComfyUI, Qdrant, and SurrealDB."
 
 [[pages.sections.ctas]]
 label = "View source"
@@ -37,5 +37,17 @@ type = "feature_grid"
 id = "overview"
 
 [[pages.sections.features]]
-title = "Nix"
-description = "Project technology detected from repository manifests."
+title = "GPU abstraction"
+description = "Switch AMD/ROCm, NVIDIA/CUDA, and CPU backends through one shared service configuration."
+
+[[pages.sections.features]]
+title = "Model serving"
+description = "Compose Ollama and llama-swap services with model catalogs, preloading, and GPU-aware defaults."
+
+[[pages.sections.features]]
+title = "Diffusion and storage"
+description = "Configure ComfyUI, Qdrant, and SurrealDB modules with managed paths, ports, and firewall rules."
+
+[[pages.sections.features]]
+title = "Home Manager endpoints"
+description = "Expose local model providers and endpoints to Goose, OpenCode, and Claude Code configurations."

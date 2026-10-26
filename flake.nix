@@ -1313,6 +1313,7 @@
         test "${toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.MemorySwapMax}" = "0"
         test "${colibriSample.config.systemd.services."infernix-colibri-fetch-fixture-qwen36".serviceConfig.Type}" = "oneshot"
         test "${nixpkgs.lib.boolToString (builtins.elem "infernix-colibri-fixture-qwen36.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "true"
+        test "${nixpkgs.lib.boolToString (builtins.elem "llama-swap.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "true"
         test "${nixpkgs.lib.boolToString (builtins.elem 20213 colibriSample.config.networking.firewall.interfaces."wg-home".allowedTCPPorts)}" = "true"
         # Rejections: GLM engine on a gpu backend, package/profile
         # backend mismatch, unpinned healthUnits, and a gpu backend
@@ -1479,6 +1480,9 @@
         printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e 'map(.name) | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
         printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_base_url == "http://127.0.0.1:3967/v1/chat/completions"'
         printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "deepseek") | .api_key == "$DEEPSEEK_API_KEY"'
+        printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_key == "$INFERNIX_CODEX_PROVIDER_TOKEN"'
+        test '${claudeCodeRouterConfig.APIKEY}' = '$INFERNIX_CODEX_PROVIDER_TOKEN'
+        test "${toString claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.EnvironmentFile}" = "${toString claudeCodeSample.config.systemd.user.services.claude-code-router.Service.EnvironmentFile}"
         printf '%s' "$opencode" | ${pkgs.jq}/bin/jq -e 'keys | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
         test "${claudeCodeSample.config.home.sessionVariables.ANTHROPIC_BASE_URL}" = "http://127.0.0.1:3456"
         test "${builtins.elemAt claudeCodeSample.config.systemd.user.services.infernix-codex-provider.Service.ExecStart 0}" = "${self.packages.${system}.codex-provider}/bin/infernix-codex-provider"

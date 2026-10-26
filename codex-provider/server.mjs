@@ -2,14 +2,24 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { resolve } from "node:path";
 
 const port = process.env.INFERNIX_CODEX_PROVIDER_PORT ? Number(process.env.INFERNIX_CODEX_PROVIDER_PORT) : null;
 const host = process.env.INFERNIX_CODEX_PROVIDER_HOST ?? "127.0.0.1";
 const codexPath = process.env.CODEX_PATH ?? "codex";
 const models = (process.env.INFERNIX_CODEX_MODELS ?? "default").split(",").filter(Boolean);
+const token = process.env.INFERNIX_CODEX_PROVIDER_TOKEN;
 const maxBodyBytes = 10 * 1024 * 1024;
+
+const digest = (value) => createHash("sha256").update(value).digest();
+
+// Any local account can reach the loopback port, so every request must
+// carry the owner's bearer token before Codex runs on their behalf.
+export function authorized(header, token) {
+  if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
+  return timingSafeEqual(digest(header.slice("Bearer ".length)), digest(token));
+}
 
 function textOfContent(content) {
   if (typeof content === "string") return content;
@@ -119,6 +129,7 @@ async function readBody(request, response) {
 }
 
 async function handle(request, response) {
+  if (!authorized(request.headers.authorization, token)) return json(response, 401, { error: { message: "missing or invalid bearer token", type: "authentication_error" } });
   if (request.method === "GET" && request.url === "/v1/models") {
     return json(response, 200, { object: "list", data: models.map((id) => ({ id, object: "model", owned_by: "codex-cli" })) });
   }
@@ -146,8 +157,15 @@ function selfTest() {
   assert.match(promptFromMessages([{ role: "user", content: "hello" }]), /## user\nhello/);
   assert.equal(parseCodexJsonl('{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n'), "done");
   assert.equal(parseCodexJsonl("not-json\n"), "");
+  assert.ok(authorized("Bearer secret", "secret"));
+  assert.ok(!authorized("Bearer wrong", "secret"));
+  assert.ok(!authorized("secret", "secret"));
+  assert.ok(!authorized(undefined, "secret"));
 }
 
 if (process.argv.includes("--self-test")) selfTest();
-else if (port == null) throw new Error("INFERNIX_CODEX_PROVIDER_PORT is required");
-else createServer((request, response) => handle(request, response).catch((error) => json(response, 500, { error: { message: error.message } }))).listen(port, host);
+else {
+  if (port == null) throw new Error("INFERNIX_CODEX_PROVIDER_PORT is required");
+  if (!token) throw new Error("INFERNIX_CODEX_PROVIDER_TOKEN is required");
+  createServer((request, response) => handle(request, response).catch((error) => json(response, 500, { error: { message: error.message } }))).listen(port, host);
+}

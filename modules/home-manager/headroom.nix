@@ -172,7 +172,9 @@ in {
           {
             ExecStartPre = "${pkgs.coreutils}/bin/install -d -m 0700 ${lib.escapeShellArg cfg.stateDirectory} ${lib.escapeShellArg "${cfg.stateDirectory}/${name}"}";
             ExecStart = command instance;
-            ExecStartPost = "${lib.getExe pkgs.curl} --fail --silent --show-error --retry 30 --retry-connrefused --retry-delay 1 --retry-max-time 60 ${baseUrl instance}/health";
+            # Bound readiness by elapsed time, inside TimeoutStartSec: a cold
+            # first boot imports the proxy for over 30 seconds.
+            ExecStartPost = "${lib.getExe pkgs.curl} --fail --silent --show-error --retry 80 --retry-connrefused --retry-delay 1 --retry-max-time 80 ${baseUrl instance}/health";
             Environment = lib.mapAttrsToList (key: value: "${key}=${value}") (commonEnvironment
               // {
                 HEADROOM_WORKSPACE_DIR = "${cfg.stateDirectory}/${name}";

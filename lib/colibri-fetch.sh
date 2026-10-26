@@ -110,8 +110,9 @@ if [ "$file_count" -eq 0 ]; then
   exit 1
 fi
 declared=$(jq '[.files[].sizeBytes // 0] | add' "$job")
-if [ "$declared" -eq 0 ] && [ "$budget" -eq 0 ]; then
-  echo "infernix-colibri-fetch: job declares files but no sizes and no totalBytes" >&2
+unsized=$(jq '[.files[] | select(.sizeBytes == null)] | length' "$job")
+if [ "$budget" -eq 0 ] && [ "$unsized" -ne 0 ]; then
+  echo "infernix-colibri-fetch: $unsized file(s) lack sizeBytes and no totalBytes is set; cannot budget disk" >&2
   exit 1
 fi
 need=$budget
@@ -135,6 +136,7 @@ while IFS= read -r name; do
   want=$(jq -r --arg n "$name" '.files[] | select(.name == $n) | .sizeBytes // empty' "$job")
   want_hash=$(jq -r --arg n "$name" '.files[] | select(.name == $n) | .sha256 // empty' "$job")
   echo "infernix-colibri-fetch: downloading $name"
+  mkdir -p "$(dirname "$staging/$name")"
   curl --fail --show-error --location --retry 3 \
     --config "$curl_conf" \
     "$base/$repo/resolve/$rev/$name" \

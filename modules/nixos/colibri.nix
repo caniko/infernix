@@ -227,7 +227,7 @@
           };
         });
         default = [ ];
-        description = "Files to fetch (empty = whole revision).";
+        description = "Files to fetch. Required for an enabled profile: whole-revision fetches are not supported.";
       };
       weightsTotalBytes = mkOption {
         type = types.nullOr types.ints.positive;
@@ -476,6 +476,10 @@
       message = "services.infernix.colibri.profiles.${name} is blocked: ${toString profile.blockedReason}";
       ok = !profile.enable || profile.blockedReason == null;
     }
+    {
+      message = "services.infernix.colibri.profiles.${name}.weightsFiles must list the snapshot files; whole-revision fetches are not supported";
+      ok = !profile.enable || profile.weightsFiles != [ ];
+    }
   ];
 
   allChecks = globalChecks ++ builtins.concatLists (mapAttrsToList profileChecks cfg.profiles);
@@ -524,8 +528,11 @@ in
     (mkIf (enabledProfiles != { } && nodeName != null) {
       # Lifecycle: enabled profiles join nodectl drain/resume. Health is
       # deliberately untouched here (see the assertion above).
+      # A definition replaces the option default, so keep fleet.nix's default
+      # llama-swap unit draining alongside the Colibri units.
       services.infernix.fleet.nodes.${nodeName}.units =
-        mapAttrsToList (name: _: "infernix-colibri-${name}.service") enabledProfiles;
+        ["llama-swap.service"]
+        ++ mapAttrsToList (name: _: "infernix-colibri-${name}.service") enabledProfiles;
 
       networking.firewall.interfaces = builtins.listToAttrs (map
         (iface: nameValuePair iface {

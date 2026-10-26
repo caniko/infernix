@@ -99,7 +99,8 @@ in {
     systemd.user.services.infernix-openpencil-mcp = lib.mkIf (cfg.transport == "http") {
       Unit.Description = "OpenPencil live MCP server";
       Service = {
-        ExecStart = "${cfg.package}/bin/${manifest.executables.desktop} --live-mcp ${toString cfg.live.port} ${cfg.document}";
+        # systemd splits ExecStart on whitespace; quote the document path.
+        ExecStart = "${cfg.package}/bin/${manifest.executables.desktop} --live-mcp ${toString cfg.live.port} \"${lib.replaceStrings ["\\" "\"" "%" "$"] ["\\\\" "\\\"" "%%" "$$"] cfg.document}\"";
         Restart = "on-failure";
       };
       Install.WantedBy = ["default.target"];

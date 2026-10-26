@@ -85,6 +85,7 @@ struct AppState {
 struct SelectedBackend {
     backend: Arc<Backend>,
     model_name: String,
+    guard: InFlightGuard,
 }
 
 struct InFlightGuard {
@@ -201,7 +202,7 @@ async fn retrying_buffered_json(
         match select_backend(&state, &requested, capability, &attempted, &mut exclusions).await {
             Some(selected) => {
                 attempted.insert(selected.backend.cfg.id.clone());
-                let _guard = reserve_in_flight(&selected.backend);
+                let _guard = selected.guard;
                 rewrite_model(&mut body, &selected.model_name);
                 let response =
                     forward_json_buffered(&state.client, &selected.backend, path, &body).await;
@@ -240,7 +241,7 @@ async fn chat_completions(State(state): State<AppState>, Json(mut body): Json<Va
     else {
         return service_unavailable(&requested, exclusions);
     };
-    let guard = reserve_in_flight(&selected.backend);
+    let guard = selected.guard;
     rewrite_model(&mut body, &selected.model_name);
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if streaming {
@@ -320,13 +321,23 @@ async fn select_backend(
     }
 
     candidates.sort_by_key(|(priority, in_flight, weight, _, _)| (*priority, *in_flight, *weight));
-    candidates
-        .into_iter()
-        .next()
-        .map(|(_, _, _, backend, model)| SelectedBackend {
-            backend: Arc::clone(backend),
-            model_name: model.name.clone(),
-        })
+    // The load above only pre-filters; a concurrent request may have taken the
+    // last slot during the health check, so the reservation itself is the gate.
+    for (_, _, _, backend, model) in candidates {
+        if let Some(guard) = try_reserve_in_flight(backend) {
+            return Some(SelectedBackend {
+                backend: Arc::clone(backend),
+                model_name: model.name.clone(),
+                guard,
+            });
+        }
+        exclusions.push(json!({
+            "backend": backend.cfg.id,
+            "reason": "max-in-flight",
+            "max_in_flight": backend.cfg.max_in_flight
+        }));
+    }
+    None
 }
 
 async fn backend_healthy(client: &Client, backend: &Backend) -> bool {
@@ -475,11 +486,14 @@ fn model_matches(model: &ModelConfig, requested: &str) -> bool {
         || model.aliases.iter().any(|alias| alias == requested)
 }
 
-fn reserve_in_flight(backend: &Arc<Backend>) -> InFlightGuard {
-    backend.in_flight.fetch_add(1, Ordering::SeqCst);
-    InFlightGuard {
+/// Atomically takes one slot below `max_in_flight`, or none. A refused
+/// increment is undone when its guard drops.
+fn try_reserve_in_flight(backend: &Arc<Backend>) -> Option<InFlightGuard> {
+    let guard = InFlightGuard {
         backend: Arc::clone(backend),
-    }
+    };
+    let previous = backend.in_flight.fetch_add(1, Ordering::SeqCst);
+    (previous < backend.cfg.max_in_flight).then_some(guard)
 }
 
 fn retryable(status: StatusCode) -> bool {
@@ -628,6 +642,32 @@ mod tests {
             aliases: vec!["rerank".to_string()],
             capabilities: BTreeSet::from([Capability::Rerank]),
         }
+    }
+
+    #[test]
+    fn concurrent_requests_never_exceed_max_in_flight() {
+        let backend = test_backend(
+            "atlas",
+            "http://127.0.0.1:9".to_string(),
+            10,
+            rerank_model("jina-reranker-v3"),
+        );
+        let first = try_reserve_in_flight(&backend).expect("first slot");
+        assert!(try_reserve_in_flight(&backend).is_none());
+        assert_eq!(backend.in_flight.load(Ordering::SeqCst), 1);
+        drop(first);
+
+        let reservations = (0..64)
+            .map(|_| {
+                let backend = Arc::clone(&backend);
+                std::thread::spawn(move || try_reserve_in_flight(&backend))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(reservations.iter().flatten().count(), 1);
+        assert_eq!(backend.in_flight.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@
     ./node.nix
     ./ollama.nix
     ./llama-swap.nix
+    ./model-fetch.nix
     ./qdrant.nix
     ./surrealdb.nix
     ./visual-rubric.nix

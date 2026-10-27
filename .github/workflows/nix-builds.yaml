@@ -25,6 +25,7 @@ jobs:
           - ".#headroom"
           - ".#checks.x86_64-linux.headroom"
           - ".#checks.x86_64-linux.headroom-runtime"
+          - ".#checks.x86_64-linux.model-fetch"
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:

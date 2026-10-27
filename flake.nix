@@ -52,14 +52,6 @@
       inputs.harbor-meta.follows = "harbor-rs/harbor-meta";
     };
 
-    # Colibri engine source for the GPU packaging flavors below.
-    # Consumers override the rev (e.g. a fork with unreleased fixes) via
-    # `<consumer>.inputs.infernix.inputs.colibri.follows`.
-    colibri = {
-      url = "github:JustVugg/colibri/f028d26b422144ed4a69ad9aeaee2553ce0f9572";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
     hermes-agent = {
       # Temporary fork pin until NousResearch/hermes-agent#75946 lands.
       url = "github:caniko/hermes-agent/9748d68ece1db36ae7116c48e0b74912ba4a99d9";
@@ -87,7 +79,6 @@
     rust-overlay,
     hermes-agent,
     hermes-webui,
-    colibri,
   }: let
     # infernix's outputs serve AI/ML hosts with discrete GPUs (CUDA on
     # NVIDIA, ROCm on AMD) and llama.cpp/ollama builds whose upstreams
@@ -259,12 +250,6 @@
       pkgs = nixpkgs.legacyPackages.${system};
       infernix-lb = mkLbPackage system;
       infernix-workerd = mkWorkerdPackage system;
-      # CUDA redists are unfree: resolve that toolchain from a
-      # dedicated allowUnfree pkgs, never by flipping the shared set.
-      pkgsUnfree = import nixpkgs {
-        inherit system;
-        config.allowUnfree = true;
-      };
       visualRubricPackage =
         if
           builtins.hasAttr "packages" visual-rubric
@@ -292,25 +277,6 @@
         headroom = import ./packages/headroom {
           inherit pkgs;
           harborPy = harbor-py;
-        };
-        # Colibri GPU flavors. Default archs target the first consumer's
-        # hosts (Atlas gfx1100, Nomad sm_89); the lib function takes any
-        # arch, and consumers pass their own pinned toolchains for
-        # cache-pin alignment.
-        colibri-hip = (import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;}).mkColibriGpu {
-          basePackage = colibri.packages.${system}.colibri;
-          backend = "hip";
-          gpuArch = "gfx1100";
-          inherit (pkgs) rocmPackages;
-        };
-        # CUDA redists are unfree (see pkgsUnfree above).
-        colibri-cuda = (import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;}).mkColibriGpu {
-          basePackage = colibri.packages.${system}.colibri;
-          backend = "cuda";
-          gpuArch = "sm_89";
-          inherit (pkgsUnfree) cudaPackages;
-          inherit (pkgs) symlinkJoin;
-          nvccHostCc = pkgsUnfree.gcc14;
         };
         default = infernix-lb;
       }
@@ -420,7 +386,6 @@
           }
         ];
       };
-      claudeCodeRouterConfig = builtins.fromJSON (builtins.readFile claudeCodeSample.config.xdg.configFile."claude-code-router/config.json".source);
       workloadFabricSample = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -1250,6 +1215,11 @@
         builtins.head (nixpkgs.lib.splitString " "
           (toString hermesAgentSample.config.systemd.services."hermes-agent-scheduled-settings-day".serviceConfig.ExecStart));
     in {
+      optional-engine-dependencies = assert !(self.inputs ? colibri);
+      assert !(self.packages.${system} ? colibri-hip) && !(self.packages.${system} ? colibri-cuda);
+      assert builtins.all (node: (node.locked.repo or "") != "colibri") (builtins.attrValues (builtins.fromJSON (builtins.readFile ./flake.lock)).nodes);
+        pkgs.runCommand "infernix-optional-engine-dependencies" {} ''touch "$out"'';
+
       nvidia-gpu-systemd-overrides = pkgs.runCommand "infernix-nvidia-gpu-systemd-overrides-check" {} ''
         test "${nvidiaGpuOverrides.ProcSubset.content}" = all
         test "${nvidiaGpuOverrides.LimitMEMLOCK}" = infinity
@@ -1456,7 +1426,7 @@
         '';
 
       claude-code-routing = pkgs.runCommand "infernix-claude-code-routing-check" {} ''
-        providers='${builtins.toJSON claudeCodeRouterConfig.Providers}'
+        providers=$(${pkgs.jq}/bin/jq -c '.Providers' ${claudeCodeSample.config.xdg.configFile."claude-code-router/config.json".source})
         opencode='${builtins.toJSON opencodeModelSample.config.programs.opencode.settings.provider}'
         printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e 'map(.name) | sort == ["codex","deepseek","gmi","opencode","opencode-go","xiaomi"]'
         printf '%s' "$providers" | ${pkgs.jq}/bin/jq -e '.[] | select(.name == "codex") | .api_base_url == "http://127.0.0.1:3967/v1/chat/completions"'

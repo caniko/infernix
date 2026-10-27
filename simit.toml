@@ -6,10 +6,15 @@ runtime = "nix"
 workspace = true
 all_features = false
 nix_builds = [".#packages.x86_64-linux.infernix-lb", ".#packages.x86_64-linux.codex-acp"]
+# Validate PR heads once (pull_request); push runs cover the default branch
+# and the simit updater's candidate branches.
+push_branches = ["trunk", "simit/update/**"]
 
 [prebuild]
 publish_attic = true
 attic_app = ".#push-flake-inputs"
+# Attic publication happens on trunk pushes only; PRs still build.
+push_branches = ["trunk", "simit/update/**"]
 system_runners = { x86_64-linux = "ubuntu-24.04" }
 
 [release.attic]

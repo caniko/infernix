@@ -38,6 +38,14 @@
       };
     };
     title.description = "OpenCode-only";
+    explore = {
+      description = "Search";
+      claude = {
+        name = "Explore";
+        model = "sonnet";
+        omitClaudeMd = true;
+      };
+    };
   };
   # A denial Claude Code cannot express must fail evaluation, not widen access.
   unmapped = eval {
@@ -70,4 +78,15 @@ in
     disallowedTools: "Bash, Edit, Write, NotebookEdit, Agent"
     ---
     Stay bounded.
+  '';
+  assert !(config.home.file ? ".claude/agents/explore.md");
+  assert config.home.file.".claude/agents/Explore.md".text
+  == ''
+    ---
+    name: "Explore"
+    description: "Search"
+    model: "sonnet"
+    omitClaudeMd: true
+    ---
+
   ''; true

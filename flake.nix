@@ -1390,10 +1390,29 @@
         ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
         ${pkgs.jq}/bin/jq -e '.plugin == ["plugins/existing.js"]' "$TMPDIR/ponytail-home/.opencode/opencode.json"
         plugin_dir="$TMPDIR/ponytail-home/.config/opencode/plugins/ponytail"
-        ${pkgs.jq}/bin/jq -e '.main == "./index.mjs"' "$plugin_dir/package.json"
-        grep -Fq 'id: ' "$plugin_dir/index.mjs"
-        grep -Fq 'setup: async' "$plugin_dir/index.mjs"
-        ${pkgs.nodejs}/bin/node --check "$plugin_dir/index.mjs"
+        ${pkgs.jq}/bin/jq -e '.main == "./index.js" and .type == "module"' "$plugin_dir/package.json"
+        test "$(ls -A "$plugin_dir" | sort | tr '\n' ' ')" = "index.js package.json "
+        grep -Fq "id: 'ponytail'" "$plugin_dir/index.js"
+        grep -Fq "ctx.session.hook('context'" "$plugin_dir/index.js"
+        grep -Fq "hooks/'" "$plugin_dir/index.js"
+        ${pkgs.nodejs}/bin/node --check --input-type=module < "$plugin_dir/index.js"
+        XDG_CONFIG_HOME="$TMPDIR/ponytail-home/.config" ${pkgs.nodejs}/bin/node --input-type=module -e '
+          const plugin = (await import(process.argv[1])).default;
+          let hook;
+          await plugin.setup({ command: { transform: async () => {} }, session: { hook: async (n, cb) => { if (n === "context") hook = cb; } } });
+          const ev = { system: [] };
+          hook(ev);
+          if (ev.system.length !== 1 || ev.system[0].type !== "text" || !ev.system[0].text.includes("Ponytail")) throw new Error("context hook did not inject");
+          const fs = await import("node:fs");
+          fs.writeFileSync(process.env.XDG_CONFIG_HOME + "/opencode/.ponytail-active", "off");
+          const off = { system: [] };
+          hook(off);
+          if (off.system.length !== 0) throw new Error("off mode injected");
+        ' "$plugin_dir/index.js"
+        printf x > "$plugin_dir/user-file"
+        if (export HOME="$TMPDIR/ponytail-home"; ${ponytailSample.config.home.activation.infernixPonytail.data}) 2>/dev/null; then echo "activation overwrote unmanaged dir" >&2; exit 1; fi
+        test -f "$plugin_dir/user-file"
+        rm "$plugin_dir/user-file"
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs

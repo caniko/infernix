@@ -86,6 +86,72 @@
   jq = "${pkgs.jq}/bin/jq";
   node = "${pkgs.nodejs}/bin/node";
   python = "${pkgs.python3.withPackages (p: [p.tomlkit])}/bin/python3";
+  # OpenCode V2 loads plugin directories (see packages/core/src/plugin/module.ts)
+  # whose default export is {id, setup}; the upstream V1 module (a function
+  # returning hooks) is rejected. Auto-discovery resolves a root `index` with a
+  # .js/.ts extension, so the entry is index.js (ESM via package.json `type`).
+  # `context` is V2's replacement for experimental.chat.system.transform.
+  opencodePlugin = pkgs.linkFarm "infernix-ponytail-opencode-plugin" [
+    {
+      name = "package.json";
+      path = pkgs.writeText "package.json" (builtins.toJSON {
+        name = "infernix-ponytail";
+        type = "module";
+        main = "./index.js";
+      });
+    }
+    {
+      name = "index.js";
+      path = pkgs.writeText "index.js" ''
+        import { createRequire } from 'node:module';
+        import fs from 'node:fs';
+        import os from 'node:os';
+        import path from 'node:path';
+
+        const require = createRequire(import.meta.url);
+        const hooks = ${builtins.toJSON (toString cfg.runtimeDir)} + '/hooks/';
+        const config = require(hooks + 'ponytail-config');
+        const { getPonytailInstructions } = require(hooks + 'ponytail-instructions');
+        const statePath = path.join(
+          process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+          'opencode',
+          '.ponytail-active',
+        );
+
+        function readMode() {
+          try {
+            return config.normalizePersistedMode(fs.readFileSync(statePath, 'utf8').trim()) || config.getDefaultMode();
+          } catch (e) {
+            return config.getDefaultMode();
+          }
+        }
+
+        export default {
+          id: 'ponytail',
+          setup: async (ctx) => {
+            await ctx.command.transform((editor) => {
+              editor.add({
+                name: 'ponytail',
+                description: 'Switch ponytail intensity level (lite/full/ultra/off)',
+                execute: async ({ prompt }) => {
+                  const arg = String(prompt?.text || "").trim().split(/\s+/).pop();
+                  const mode = arg ? config.normalizePersistedMode(arg) : config.getDefaultMode();
+                  if (!mode) return;
+                  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+                  fs.writeFileSync(statePath, mode);
+                },
+              });
+            });
+            await ctx.session.hook('context', (event) => {
+              const mode = readMode();
+              if (mode === 'off') return;
+              event.system.push({ type: 'text', text: getPonytailInstructions(mode) });
+            });
+          },
+        };
+      '';
+    }
+  ];
   runtimeStore = if package == null then "/nonexistent" else toString package;
   codexTrustScript = pkgs.writeText "infernix-codex-hook-trust.py" ''
     import hashlib
@@ -309,8 +375,9 @@
         exit 1
       fi
       tmp="$(mktemp "$opencode_file.XXXXXX")"
-      if ! ${jq} --arg plugin "$runtime_dir/.opencode/plugins/ponytail.mjs" '
-        .plugin = (((.plugin // []) + [$plugin]) | unique)
+      # Remove only the legacy file entry earlier revisions merged; V2 rejects file paths.
+      if ! ${jq} --arg legacy "$runtime_dir/.opencode/plugins/ponytail.mjs" '
+        if .plugin == null then . else .plugin |= map(select(. != $legacy)) end
       ' "$opencode_file" > "$tmp"; then
         rm -f "$tmp"
         echo "infernix ponytail: failed to merge $opencode_file" >&2
@@ -506,6 +573,31 @@ in {
       if [ "$opencode_config_count" -eq 0 ]; then
         merge_opencode_json "$HOME/.config/opencode/opencode.json"
       fi
+
+      opencode_plugin_dir="$HOME/.config/opencode/plugins/ponytail"
+      if [ -L "$opencode_plugin_dir" ] || { [ -e "$opencode_plugin_dir" ] && [ ! -d "$opencode_plugin_dir" ]; }; then
+        echo "infernix ponytail: refusing to replace non-directory or symlink $opencode_plugin_dir" >&2
+        exit 1
+      fi
+      mkdir -p "$opencode_plugin_dir"
+      # index.mjs is a stale name from an earlier revision of this module.
+      for entry in "$opencode_plugin_dir"/* "$opencode_plugin_dir"/.[!.]* "$opencode_plugin_dir"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        case "$(basename "$entry")" in
+          package.json|index.js|index.mjs) ;;
+          *)
+            echo "infernix ponytail: refusing to modify $opencode_plugin_dir, unmanaged entry $entry" >&2
+            exit 1
+            ;;
+        esac
+      done
+      rm -f "$opencode_plugin_dir/index.mjs"
+      for name in package.json index.js; do
+        plugin_tmp="$(mktemp "$opencode_plugin_dir/.$name.XXXXXX")"
+        cp -L ${opencodePlugin}/$name "$plugin_tmp"
+        chmod 644 "$plugin_tmp"
+        mv -f "$plugin_tmp" "$opencode_plugin_dir/$name"
+      done
 
       managed_link "$runtime_dir/pi-extension" "$HOME/.pi/agent/extensions/ponytail"
       managed_link "$runtime_dir" "$HOME/.gemini/extensions/ponytail"

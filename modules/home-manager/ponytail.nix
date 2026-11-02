@@ -363,6 +363,9 @@
       opencode_file="$1"
       opencode_dir="$(dirname "$opencode_file")"
       mkdir -p "$opencode_dir"
+      # A Home Manager-managed symlink is owned by its generation; rewriting it
+      # turns the link into a file that the next switch must back up.
+      [ -L "$opencode_file" ] && return 0
       if [ -e "$opencode_file" ] && [ ! -f "$opencode_file" ]; then
         echo "infernix ponytail: refusing non-file OpenCode target $opencode_file" >&2
         exit 1

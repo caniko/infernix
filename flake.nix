@@ -1416,6 +1416,14 @@
         mv "$plugin_dir" "$plugin_dir.user" && ln -s "$plugin_dir.user" "$plugin_dir"
         if (export HOME="$TMPDIR/ponytail-home"; ${ponytailSample.config.home.activation.infernixPonytail.data}) 2>/dev/null; then echo "activation wrote through a symlinked plugin dir" >&2; exit 1; fi
         rm "$plugin_dir" && mv "$plugin_dir.user" "$plugin_dir"
+        managed_cfg="$TMPDIR/ponytail-managed-opencode.json"
+        printf '{}\n' > "$managed_cfg" && chmod 444 "$managed_cfg"
+        oc_cfg="$TMPDIR/ponytail-home/.config/opencode/opencode.json"
+        rm -f "$oc_cfg" && ln -s "$managed_cfg" "$oc_cfg"
+        (export HOME="$TMPDIR/ponytail-home"; ${ponytailSample.config.home.activation.infernixPonytail.data})
+        test -L "$oc_cfg"
+        test "$(readlink "$oc_cfg")" = "$managed_cfg"
+        rm "$oc_cfg"
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs

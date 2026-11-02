@@ -868,7 +868,7 @@
         printf '%s\n' '# existing user guidance' > "$HOME/AGENTS.md"
         printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}' > "$HOME/.codex/hooks.json"
         printf '%s\n' '[hooks.state]' > "$HOME/.codex/config.toml"
-        printf '%s\n' '{"plugin":["plugins/existing.js"]}' > "$HOME/.opencode/opencode.json"
+        printf '%s\n' '{"plugin":["plugins/existing.js","/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs"]}' > "$HOME/.opencode/opencode.json"
         ${ponytailSample.config.home.activation.infernixPonytail.data}
         ${ponytailSample.config.home.activation.infernixPonytail.data}
       '';
@@ -1388,7 +1388,12 @@
         test "$(grep -Ec 'trusted_hash = \"sha256:[0-9a-f]{64}\"' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 2
         ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart == null' "$TMPDIR/ponytail-home/.codex/hooks.json"
         ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
-        ${pkgs.jq}/bin/jq -e '.plugin | index("/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs") != null' "$TMPDIR/ponytail-home/.opencode/opencode.json"
+        ${pkgs.jq}/bin/jq -e '.plugin == ["plugins/existing.js"]' "$TMPDIR/ponytail-home/.opencode/opencode.json"
+        plugin_dir="$TMPDIR/ponytail-home/.config/opencode/plugins/ponytail"
+        ${pkgs.jq}/bin/jq -e '.main == "./index.mjs"' "$plugin_dir/package.json"
+        grep -Fq 'id: ' "$plugin_dir/index.mjs"
+        grep -Fq 'setup: async' "$plugin_dir/index.mjs"
+        ${pkgs.nodejs}/bin/node --check "$plugin_dir/index.mjs"
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs

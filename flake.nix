@@ -1413,6 +1413,9 @@
         if (export HOME="$TMPDIR/ponytail-home"; ${ponytailSample.config.home.activation.infernixPonytail.data}) 2>/dev/null; then echo "activation overwrote unmanaged dir" >&2; exit 1; fi
         test -f "$plugin_dir/user-file"
         rm "$plugin_dir/user-file"
+        mv "$plugin_dir" "$plugin_dir.user" && ln -s "$plugin_dir.user" "$plugin_dir"
+        if (export HOME="$TMPDIR/ponytail-home"; ${ponytailSample.config.home.activation.infernixPonytail.data}) 2>/dev/null; then echo "activation wrote through a symlinked plugin dir" >&2; exit 1; fi
+        rm "$plugin_dir" && mv "$plugin_dir.user" "$plugin_dir"
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs

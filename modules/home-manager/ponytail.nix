@@ -575,8 +575,8 @@ in {
       fi
 
       opencode_plugin_dir="$HOME/.config/opencode/plugins/ponytail"
-      if [ -e "$opencode_plugin_dir" ] && [ ! -d "$opencode_plugin_dir" ]; then
-        echo "infernix ponytail: refusing to replace non-directory $opencode_plugin_dir" >&2
+      if [ -L "$opencode_plugin_dir" ] || { [ -e "$opencode_plugin_dir" ] && [ ! -d "$opencode_plugin_dir" ]; }; then
+        echo "infernix ponytail: refusing to replace non-directory or symlink $opencode_plugin_dir" >&2
         exit 1
       fi
       mkdir -p "$opencode_plugin_dir"

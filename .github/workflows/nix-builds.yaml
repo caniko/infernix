@@ -27,6 +27,9 @@ jobs:
           - ".#checks.x86_64-linux.headroom"
           - ".#checks.x86_64-linux.headroom-runtime"
           - ".#checks.x86_64-linux.model-fetch"
+          - ".#checks.x86_64-linux.model-lock"
+          - ".#checks.x86_64-linux.colibri"
+          - ".#checks.x86_64-linux.llama-swap-extra-files"
     env:
       NIX_CONFIG: "experimental-features = nix-command flakes"
     steps:

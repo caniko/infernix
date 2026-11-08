@@ -529,9 +529,10 @@ in
       # Lifecycle: enabled profiles join nodectl drain/resume. Health is
       # deliberately untouched here (see the assertion above).
       # A definition replaces the option default, so keep fleet.nix's default
-      # llama-swap unit draining alongside the Colibri units.
+      # llama-swap unit draining alongside the Colibri units when it exists;
+      # nodectl stops on a missing unit.
       services.infernix.fleet.nodes.${nodeName}.units =
-        ["llama-swap.service"]
+        lib.optional config.services.infernix.llama-swap.enable "llama-swap.service"
         ++ mapAttrsToList (name: _: "infernix-colibri-${name}.service") enabledProfiles;
 
       networking.firewall.interfaces = builtins.listToAttrs (map

@@ -1284,7 +1284,10 @@
         test "${toString colibriSample.config.systemd.services."infernix-colibri-fixture-qwen36".serviceConfig.MemorySwapMax}" = "0"
         test "${colibriSample.config.systemd.services."infernix-colibri-fetch-fixture-qwen36".serviceConfig.Type}" = "oneshot"
         test "${nixpkgs.lib.boolToString (builtins.elem "infernix-colibri-fixture-qwen36.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "true"
-        test "${nixpkgs.lib.boolToString (builtins.elem "llama-swap.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "true"
+        # llama-swap keeps draining next to Colibri only where it is enabled;
+        # nodectl must not try to stop a missing unit.
+        test "${nixpkgs.lib.boolToString (builtins.elem "llama-swap.service" colibriSample.config.services.infernix.fleet.nodes.fixture.units)}" = "false"
+        test "${nixpkgs.lib.boolToString (builtins.elem "llama-swap.service" (colibriSample.extendModules {modules = [{services.infernix.llama-swap.enable = true;}];}).config.services.infernix.fleet.nodes.fixture.units)}" = "true"
         test "${nixpkgs.lib.boolToString (builtins.elem 20213 colibriSample.config.networking.firewall.interfaces."wg-home".allowedTCPPorts)}" = "true"
         # Rejections: GLM engine on a gpu backend, package/profile
         # backend mismatch, unpinned healthUnits, and a gpu backend

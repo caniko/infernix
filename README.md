@@ -61,6 +61,12 @@ re-instantiated with the consumer's own `services.infernix.gpu.pkgs` config so
 they keep `rocmSupport`, `cudaSupport`, `allowUnfree`, and similar settings
 without introducing a second nixpkgs channel.
 
+Colibri is no longer an automatic flake dependency, and the `colibri-hip` and
+`colibri-cuda` package outputs are retired. Optional Colibri users must supply
+their own pinned engine through `services.infernix.colibri.package`; the existing
+`lib.colibriPackaging.mkColibriGpu` helper and module validation remain available.
+Consumers that only use llama-swap need no Colibri source or toolchain.
+
 Home-manager modules (`homeModules.default`):
 
 - **`services.infernix.modelProviders`** — one provider/model catalog rendered

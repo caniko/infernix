@@ -20,6 +20,7 @@
     flatten
     ;
   cfg = config.services.infernix.llama-swap;
+  modelLock = import ../../lib/model-lock.nix {inherit lib pkgs;};
 
   # NB: gpuCfg, llama-cpp, llama-server, mkModelCmd, and downloadFiles all
   # depend on services.infernix.gpu.* (which is null when nothing's enabled)
@@ -145,6 +146,12 @@ in {
     modelsDir = mkOption {
       type = types.path;
       description = "Directory where GGUF model files are stored.";
+    };
+
+    lockPath = mkOption {
+      type = types.str;
+      default = "${toString cfg.modelsDir}.doty-lock";
+      description = "Directory-wide persistent model lock shared by download, serve and cleanup.";
     };
 
     autoCleanup = mkOption {
@@ -306,6 +313,7 @@ in {
         ++ optional (model.draft != null) "-ngld ${toString model.draft.nGpuLayers}";
     in
       concatStringsSep " " ([
+          (lib.escapeShellArgs (modelLock.command true cfg.lockPath))
           llama-server
           "--port \${PORT}"
           "-m ${cfg.modelsDir}/${model.file}"
@@ -328,6 +336,7 @@ in {
     expectedFilesManifest =
       pkgs.writeText "infernix-expected-model-files" "${concatStringsSep "\n" expectedFiles}\n";
   in {
+    systemd.tmpfiles.rules = [(modelLock.anchor cfg.lockPath)];
     services.llama-swap = {
       enable = true;
       package = bleedingPkgs.llama-swap;
@@ -390,6 +399,10 @@ in {
         RemainAfterExit = true;
       };
       script = ''
+        # Download/autoCleanup hold the same inode as all llama-server children.
+        # util-linux flock retains this descriptor in every subprocess.
+        exec 9<>${lib.escapeShellArg cfg.lockPath}
+        ${lib.getExe' pkgs.util-linux "flock"} --exclusive --nonblock 9
         mkdir -p "${cfg.modelsDir}"
         ${optionalString cfg.autoCleanup ''
           # Remove GGUF files no longer declared in the flake

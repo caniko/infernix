@@ -90,6 +90,36 @@ in {
       default = {};
       description = "Environment variables for the ComfyUI service.";
     };
+
+    proxy = {
+      listenStreams = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        example = ["10.0.0.5:8190"];
+        description = ''
+          Socket addresses where a socket-activated systemd-socket-proxyd
+          forwards to ComfyUI, so ComfyUI itself can stay on loopback. The
+          sockets use `FreeBind`, so they never wait for a VPN address to
+          appear. Empty disables the proxy.
+        '';
+      };
+
+      onDemand = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Start ComfyUI on the first proxied connection and stop both the
+          proxy and ComfyUI after `idleExit` without connections, which
+          releases all VRAM.
+        '';
+      };
+
+      idleExit = mkOption {
+        type = types.str;
+        default = "20min";
+        description = "Idle period after which the on-demand proxy and ComfyUI stop.";
+      };
+    };
   };
 
   config = mkIf cfg.enable (let
@@ -106,6 +136,7 @@ in {
       if cfg.package != null
       then cfg.package
       else inferredPackage;
+    proxied = cfg.proxy.listenStreams != [];
     serviceEnvironment =
       (gpuOverrides.Environment or [])
       ++ lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment;
@@ -184,7 +215,37 @@ in {
           '';
           Restart = "on-failure";
           RestartSec = 5;
+        }
+        // lib.optionalAttrs proxied {
+          # Started only once it answers, so the proxy never forwards the
+          # first request to a port that is not listening yet.
+          ExecStartPost = "${pkgs.curl}/bin/curl -sf -o /dev/null --retry 180 --retry-delay 1 --retry-connrefused --retry-max-time 240 http://${cfg.host}:${toString cfg.port}/system_stats";
+          TimeoutStartSec = "5min";
         };
+      unitConfig.StopWhenUnneeded = mkIf (proxied && cfg.proxy.onDemand) true;
+    };
+
+    systemd.sockets.comfyui-proxy = mkIf proxied {
+      description = "ComfyUI proxy socket";
+      wantedBy = ["sockets.target"];
+      inherit (cfg.proxy) listenStreams;
+      socketConfig.FreeBind = true;
+    };
+
+    systemd.services.comfyui-proxy = mkIf proxied {
+      description = "Forward proxied connections to ComfyUI";
+      requires = ["comfyui.service" "comfyui-proxy.socket"];
+      after = ["comfyui.service" "comfyui-proxy.socket"];
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs ([
+            "${config.systemd.package}/lib/systemd/systemd-socket-proxyd"
+            "--connections-max=64"
+          ]
+          ++ lib.optional cfg.proxy.onDemand "--exit-idle-time=${cfg.proxy.idleExit}"
+          ++ ["${cfg.host}:${toString cfg.port}"]);
+        DynamicUser = true;
+        NoNewPrivileges = true;
+      };
     };
 
     networking.firewall.interfaces = lib.genAttrs cfg.firewallInterfaces (_: {

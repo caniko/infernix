@@ -1,6 +1,7 @@
 {
   imports = [
     ./cloud-router.nix
+    ./colibri.nix
     ./comfyui.nix
     ./fleet.nix
     ./hermes-agent.nix
@@ -11,6 +12,7 @@
     ./node.nix
     ./ollama.nix
     ./llama-swap.nix
+    ./model-fetch.nix
     ./qdrant.nix
     ./surrealdb.nix
     ./visual-rubric.nix

@@ -1,12 +1,13 @@
 # Endpoint declarations — the central abstraction for local Infernix-backed
 # model endpoints that other HM modules consume.
-{lib, ...}: let
+{ lib, ... }:
+let
   inherit (lib) mkOption types;
 
   endpointSubmodule = types.submodule {
     options = {
       type = mkOption {
-        type = types.enum ["ollama" "llama-swap"];
+        type = types.enum [ "ollama" "llama-swap" ];
         description = "Backend type.";
       };
 
@@ -29,6 +30,31 @@
         '';
       };
 
+      healthUrl = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "http://localhost:8014/healthz";
+        description = "Health endpoint used by health-aware workload profiles.";
+      };
+
+      locality = mkOption {
+        type = types.enum [ "local-only" "network-allowed" ];
+        default = "local-only";
+        description = "Network locality permitted for this endpoint.";
+      };
+
+      dataResidency = mkOption {
+        type = types.enum [ "local-only" "eu" "ch" "us" "unrestricted" ];
+        default = "local-only";
+        description = "Data-residency class advertised by this endpoint.";
+      };
+
+      apiKeyRequired = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Whether requests to this endpoint require an API key.";
+      };
+
       models = mkOption {
         type = types.attrsOf (types.submodule {
           options = {
@@ -45,6 +71,12 @@
               description = "Context window size in tokens.";
             };
 
+            capabilities = mkOption {
+              type = types.listOf (types.enum [ "chat" "embeddings" "rerank" ]);
+              default = [ ];
+              description = "API capabilities this model is allowed to serve.";
+            };
+
             blockingGroup = mkOption {
               type = types.nullOr types.str;
               default = null;
@@ -53,15 +85,16 @@
             };
           };
         });
-        default = {};
+        default = { };
         description = "Models available on this endpoint.";
       };
     };
   };
-in {
+in
+{
   options.services.infernix.endpoints = mkOption {
     type = types.attrsOf endpointSubmodule;
-    default = {};
+    default = { };
     description = ''
       Named local model endpoints. Each endpoint describes a reachable Infernix-
       backed model backend that other Infernix HM modules and downstream config

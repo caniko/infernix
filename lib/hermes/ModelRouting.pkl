@@ -8,6 +8,9 @@ class Provider {
   baseUrl: String? = null
   apiKey: String = "no-key-required"
   defaultModel: String? = null
+  /// Hermes wire protocol, e.g. anthropic_messages for an Anthropic-compatible
+  /// proxy such as Meridian. Null lets Hermes detect it from the URL.
+  apiMode: String? = null
   models: Mapping<String, Dynamic> = new {}
 }
 

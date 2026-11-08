@@ -1,0 +1,65 @@
+"""Exercise the rendered serve command and its JSON manifest launch gate."""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+command = shlex.split(sys.argv[1])
+assert len(command) == 3 and command[1].endswith("/bin/infernix-colibri-entrypoint"), command
+config = json.loads(Path(command[2]).read_text())
+assert config["ctxSize"] == 8192 and config["expertSlotsPerLayer"] == 256
+
+with tempfile.TemporaryDirectory() as root:
+    root = Path(root)
+    config["modelDir"] = str(root / "model")
+    model = Path(config["modelDir"])
+    model.mkdir()
+    for name in config["files"]:
+        file = model / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(b"weights")
+    stub = root / "coli"
+    stub.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "print(json.dumps({'argv': sys.argv[1:], 'key': os.environ['COLI_API_KEY']}))\n"
+    )
+    stub.chmod(0o755)
+    config["coliBin"] = str(stub)
+    launch_config = root / "launch.json"
+    launch_config.write_text(json.dumps(config))
+    command[2] = str(launch_config)
+    credentials = root / "credentials"
+    credentials.mkdir()
+    (credentials / "coli-api-key").write_text("fixture-key\n")
+    env = dict(os.environ, CREDENTIALS_DIRECTORY=str(credentials))
+
+    def launch():
+        return subprocess.run(command, env=env, capture_output=True, text=True, check=False)
+
+    missing = launch()
+    assert missing.returncode != 0 and "missing ready manifest" in missing.stderr, (missing.stdout, missing.stderr)
+    manifest = {
+        "rev": "wrong-revision",
+        "repo": config["repo"],
+        "files": [{"name": name, "sizeBytes": 7} for name in config["files"]],
+    }
+    ready = model / "ready.json"
+    ready.write_text(json.dumps(manifest))
+    wrong = launch()
+    assert wrong.returncode != 0 and "rev mismatch" in wrong.stderr, (wrong.stdout, wrong.stderr)
+    manifest["rev"] = config["rev"]
+    ready.write_text(json.dumps(manifest))
+    served = launch()
+    assert served.returncode == 0, served.stderr
+    result = json.loads(served.stdout)
+    args = result["argv"]
+    assert args[0] == "serve" and args[args.index("--ctx") + 1] == "8192", args
+    assert args[args.index("--cap") + 1] == "256", args
+    assert args[args.index("--model") + 1] == str(model), args
+    assert result["key"] == "fixture-key"
+    assert "fixture-key" not in args

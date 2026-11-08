@@ -1,5 +1,5 @@
-"""Exercise the rendered serve command and its JSON manifest launch gate."""
-
+"""Exercise the rendered serve command, including its lock and JSON launch gate."""
+import fcntl
 import json
 import os
 import shlex
@@ -9,12 +9,16 @@ import tempfile
 from pathlib import Path
 
 command = shlex.split(sys.argv[1])
-assert len(command) == 3 and command[1].endswith("/bin/infernix-colibri-entrypoint"), command
-config = json.loads(Path(command[2]).read_text())
+assert command[2] == "--shared" and command[4] == "--", command
+assert command[6].endswith("/bin/infernix-colibri-entrypoint"), command
+config = json.loads(Path(command[7]).read_text())
 assert config["ctxSize"] == 8192 and config["expertSlotsPerLayer"] == 256
 
 with tempfile.TemporaryDirectory() as root:
     root = Path(root)
+    lock = root / "model.doty-lock"
+    lock.touch(mode=0o644)
+    command[3] = str(lock)
     config["modelDir"] = str(root / "model")
     model = Path(config["modelDir"])
     model.mkdir()
@@ -25,18 +29,25 @@ with tempfile.TemporaryDirectory() as root:
     stub = root / "coli"
     stub.write_text(
         f"#!{sys.executable}\n"
-        "import json, os, sys\n"
+        "import fcntl, json, os, sys\n"
+        "with open(os.environ['TEST_LOCK'], 'rb') as handle:\n"
+        "    try:\n"
+        "        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "    except BlockingIOError:\n"
+        "        pass\n"
+        "    else:\n"
+        "        raise SystemExit('serving child lost the model lock')\n"
         "print(json.dumps({'argv': sys.argv[1:], 'key': os.environ['COLI_API_KEY']}))\n"
     )
     stub.chmod(0o755)
     config["coliBin"] = str(stub)
     launch_config = root / "launch.json"
     launch_config.write_text(json.dumps(config))
-    command[2] = str(launch_config)
+    command[7] = str(launch_config)
     credentials = root / "credentials"
     credentials.mkdir()
     (credentials / "coli-api-key").write_text("fixture-key\n")
-    env = dict(os.environ, CREDENTIALS_DIRECTORY=str(credentials))
+    env = dict(os.environ, CREDENTIALS_DIRECTORY=str(credentials), TEST_LOCK=str(lock))
 
     def launch():
         return subprocess.run(command, env=env, capture_output=True, text=True, check=False)

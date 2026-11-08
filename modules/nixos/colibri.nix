@@ -48,11 +48,16 @@
     ;
 
   cfg = config.services.infernix.colibri;
+  modelLock = import ../../lib/model-lock.nix { inherit lib pkgs; };
 
   colibriPackaging = import ../../lib/colibri-packaging.nix { inherit lib; };
   exclLib = import ../../lib/exclusive-units.nix { inherit lib; };
 
-  profileType = types.submodule ({ name, ... }: {
+  profileType = types.submodule ({
+    name,
+    config,
+    ...
+  }: {
     options = {
       enable = mkEnableOption "Colibri ${name} profile";
       port = mkOption {
@@ -67,6 +72,11 @@
       modelDir = mkOption {
         type = types.path;
         description = "Final model directory published atomically by the fetch unit (must contain ready.json).";
+      };
+      lockPath = mkOption {
+        type = types.str;
+        default = "${toString config.modelDir}.doty-lock";
+        description = "Persistent producer/consumer/cleanup lock beside the snapshot; never unlink.";
       };
       stagingDir = mkOption {
         type = types.path;
@@ -526,6 +536,7 @@ in
     }
 
     (mkIf (enabledProfiles != { } && nodeName != null) {
+      systemd.tmpfiles.rules = mapAttrsToList (_: profile: modelLock.anchor profile.lockPath) enabledProfiles;
       # Lifecycle: enabled profiles join nodectl drain/resume. Health is
       # deliberately untouched here (see the assertion above).
       # A definition replaces the option default, so keep fleet.nix's default
@@ -572,7 +583,7 @@ in
               WorkingDirectory = "/var/lib/infernix-colibri-${name}";
               # A list would render as repeated ExecStart directives, which
               # systemd only allows for Type=oneshot: join into one command.
-              ExecStart = escapeShellArgs ["${getExe' pkgs.python3 "python3"}" "${entrypoint}/bin/infernix-colibri-entrypoint" "${serveConfig name profile}"];
+              ExecStart = escapeShellArgs (modelLock.command true profile.lockPath ++ ["${getExe' pkgs.python3 "python3"}" "${entrypoint}/bin/infernix-colibri-entrypoint" "${serveConfig name profile}"]);
               LoadCredential = ["coli-api-key:${profile.apiKeyFile}"];
               Restart = "on-failure";
               RestartSec = "10s";
@@ -594,7 +605,7 @@ in
           # systemd only allows for Type=oneshot: join into one command.
           serviceConfig = {
             Type = "oneshot";
-            ExecStart = escapeShellArgs ["${fetchTool}/bin/infernix-colibri-fetch" "${fetchJob name profile}"];
+            ExecStart = escapeShellArgs (modelLock.command false profile.lockPath ++ ["${fetchTool}/bin/infernix-colibri-fetch" "${fetchJob name profile}"]);
           };
         };
       }));

@@ -6,7 +6,7 @@ runtime = "nix"
 workspace = true
 publish_crates = true
 all_features = false
-nix_builds = [".#headroom", ".#checks.x86_64-linux.headroom", ".#checks.x86_64-linux.headroom-runtime", ".#checks.x86_64-linux.model-fetch"]
+nix_builds = [".#headroom", ".#checks.x86_64-linux.headroom", ".#checks.x86_64-linux.headroom-runtime", ".#checks.x86_64-linux.model-fetch", ".#checks.x86_64-linux.model-lock", ".#checks.x86_64-linux.colibri", ".#checks.x86_64-linux.llama-swap-extra-files"]
 # Validate PR heads once (pull_request); push runs cover the default branch
 # and the simit updater's candidate branches.
 push_branches = ["trunk", "simit/update/**"]

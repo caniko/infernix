@@ -32,6 +32,12 @@
     // lib.optionalAttrs (agent.prompt != null) {inherit (agent) prompt;}
     // agent.opencode;
 
+  # A Claude name equal to a built-in's (e.g. Explore) replaces that built-in.
+  claudeName = name: agent:
+    if agent.claude.name != null
+    then agent.claude.name
+    else name;
+
   # JSON strings are valid YAML double-quoted scalars.
   toClaude = name: agent: let
     denied = lib.concatLists (lib.mapAttrsToList (perm: action:
@@ -42,13 +48,14 @@
     lib.concatStringsSep "\n" (
       [
         "---"
-        (field "name" name)
+        (field "name" (claudeName name agent))
         (field "description" agent.description)
         (field "model" agent.claude.model)
       ]
       ++ lib.optional (agent.claude.effort != null) (field "effort" agent.claude.effort)
       ++ lib.optional (agent.steps != null) (field "maxTurns" agent.steps)
       ++ lib.optional (denied != []) (field "disallowedTools" (lib.concatStringsSep ", " denied))
+      ++ lib.optional agent.claude.omitClaudeMd (field "omitClaudeMd" true)
       ++ ["---" (lib.optionalString (agent.prompt != null) agent.prompt) ""]
     );
 in {
@@ -86,6 +93,16 @@ in {
           description = "Claude Code rendering; null keeps the agent OpenCode-only.";
           type = types.nullOr (types.submodule {
             options = {
+              name = mkOption {
+                type = types.nullOr types.str;
+                default = null;
+                description = "Claude Code agent name; defaults to the attribute name.";
+              };
+              omitClaudeMd = mkOption {
+                type = types.bool;
+                default = false;
+                description = "Run without the user, project and local CLAUDE.md files.";
+              };
               model = mkOption {
                 type = types.str;
                 description = "Claude model alias (haiku, sonnet, opus, fable, inherit) or full ID.";
@@ -111,7 +128,7 @@ in {
     cfg);
     programs.opencode.settings.agent = lib.mapAttrs toOpencode cfg;
     home.file = lib.mapAttrs' (name: agent:
-      lib.nameValuePair ".claude/agents/${name}.md" {text = toClaude name agent;})
+      lib.nameValuePair ".claude/agents/${claudeName name agent}.md" {text = toClaude name agent;})
     (lib.filterAttrs (_: agent: agent.claude != null) cfg);
   };
 }

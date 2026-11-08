@@ -288,6 +288,7 @@
         codex-acp = pkgs.callPackage ./packages/codex-acp.nix {};
         codex-provider = pkgs.callPackage ./packages/codex-provider.nix {};
         ponytail = pkgs.callPackage ./packages/ponytail.nix {};
+        model-fetch = pkgs.callPackage ./packages/model-fetch {};
         headroom = import ./packages/headroom {
           inherit pkgs;
           harborPy = harbor-py;
@@ -891,7 +892,7 @@
         printf '%s\n' '# existing user guidance' > "$HOME/AGENTS.md"
         printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}' > "$HOME/.codex/hooks.json"
         printf '%s\n' '[hooks.state]' > "$HOME/.codex/config.toml"
-        printf '%s\n' '{"plugin":["plugins/existing.js"]}' > "$HOME/.opencode/opencode.json"
+        printf '%s\n' '{"plugin":["plugins/existing.js","/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs"]}' > "$HOME/.opencode/opencode.json"
         ${ponytailSample.config.home.activation.infernixPonytail.data}
         ${ponytailSample.config.home.activation.infernixPonytail.data}
       '';
@@ -1412,7 +1413,42 @@
         test "$(grep -Ec 'trusted_hash = \"sha256:[0-9a-f]{64}\"' "$TMPDIR/ponytail-home/.codex/config.toml")" -eq 2
         ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart == null' "$TMPDIR/ponytail-home/.codex/hooks.json"
         ${pkgs.jq}/bin/jq -e '.hooks.SubagentStart | length == 1' "$TMPDIR/ponytail-home/.claude/settings.json"
-        ${pkgs.jq}/bin/jq -e '.plugin | index("/tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs") != null' "$TMPDIR/ponytail-home/.opencode/opencode.json"
+        ${pkgs.jq}/bin/jq -e '.plugin == ["plugins/existing.js"]' "$TMPDIR/ponytail-home/.opencode/opencode.json"
+        plugin_dir="$TMPDIR/ponytail-home/.config/opencode/plugins/ponytail"
+        ${pkgs.jq}/bin/jq -e '.main == "./index.js" and .type == "module"' "$plugin_dir/package.json"
+        test "$(ls -A "$plugin_dir" | sort | tr '\n' ' ')" = "index.js package.json "
+        grep -Fq "id: 'ponytail'" "$plugin_dir/index.js"
+        grep -Fq "ctx.session.hook('context'" "$plugin_dir/index.js"
+        grep -Fq "hooks/'" "$plugin_dir/index.js"
+        ${pkgs.nodejs}/bin/node --check --input-type=module < "$plugin_dir/index.js"
+        XDG_CONFIG_HOME="$TMPDIR/ponytail-home/.config" ${pkgs.nodejs}/bin/node --input-type=module -e '
+          const plugin = (await import(process.argv[1])).default;
+          let hook;
+          await plugin.setup({ command: { transform: async () => {} }, session: { hook: async (n, cb) => { if (n === "context") hook = cb; } } });
+          const ev = { system: [] };
+          hook(ev);
+          if (ev.system.length !== 1 || ev.system[0].type !== "text" || !ev.system[0].text.includes("Ponytail")) throw new Error("context hook did not inject");
+          const fs = await import("node:fs");
+          fs.writeFileSync(process.env.XDG_CONFIG_HOME + "/opencode/.ponytail-active", "off");
+          const off = { system: [] };
+          hook(off);
+          if (off.system.length !== 0) throw new Error("off mode injected");
+        ' "$plugin_dir/index.js"
+        printf x > "$plugin_dir/user-file"
+        if (export HOME="$TMPDIR/ponytail-home"; ${ponytailSample.config.home.activation.infernixPonytail.data}) 2>/dev/null; then echo "activation overwrote unmanaged dir" >&2; exit 1; fi
+        test -f "$plugin_dir/user-file"
+        rm "$plugin_dir/user-file"
+        mv "$plugin_dir" "$plugin_dir.user" && ln -s "$plugin_dir.user" "$plugin_dir"
+        if (export HOME="$TMPDIR/ponytail-home"; ${ponytailSample.config.home.activation.infernixPonytail.data}) 2>/dev/null; then echo "activation wrote through a symlinked plugin dir" >&2; exit 1; fi
+        rm "$plugin_dir" && mv "$plugin_dir.user" "$plugin_dir"
+        managed_cfg="$TMPDIR/ponytail-managed-opencode.json"
+        printf '{}\n' > "$managed_cfg" && chmod 444 "$managed_cfg"
+        oc_cfg="$TMPDIR/ponytail-home/.config/opencode/opencode.json"
+        rm -f "$oc_cfg" && ln -s "$managed_cfg" "$oc_cfg"
+        (export HOME="$TMPDIR/ponytail-home"; ${ponytailSample.config.home.activation.infernixPonytail.data})
+        test -L "$oc_cfg"
+        test "$(readlink "$oc_cfg")" = "$managed_cfg"
+        rm "$oc_cfg"
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-activate.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/hooks/ponytail-mode-tracker.js
         ${pkgs.nodejs}/bin/node --check /tmp/infernix-ponytail-fixture/.opencode/plugins/ponytail.mjs
@@ -1452,6 +1488,11 @@
         homeManager = home-manager;
       };
         pkgs.runCommand "infernix-mcp-adapters" {} ''touch $out'';
+
+      model-fetch = import ./tests/model-fetch {
+        inherit pkgs nixpkgs;
+        nixosModule = self.nixosModules.default;
+      };
 
       harness-agents = assert import ./tests/agents.nix {
         inherit pkgs;

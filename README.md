@@ -35,6 +35,13 @@ NixOS modules (`nixosModules.default`):
 - **`services.infernix.comfyui`** — ComfyUI diffusion interface with
   GPU-aware package defaults, visible-device masking, state/model directory
   management, extra model paths, and per-interface firewall rules.
+  `proxy.listenStreams` puts a socket-activated proxy in front of a loopback
+  ComfyUI; with `proxy.onDemand` the first connection starts ComfyUI and both
+  stop after `proxy.idleExit`, freeing VRAM.
+- **`services.infernix.modelFetch.jobs`** — manual-only
+  `model-fetch-<name>` oneshots that download a pinned Hugging Face revision,
+  verify each file's size and sha256, and publish files plus a ready manifest
+  atomically. Re-runs skip once the manifest and files verify.
 - **`services.infernix.qdrant`** — vector database with HTTP/gRPC ports,
   storage and snapshot path options, and firewall handling.
 - **`services.infernix.surrealdb`** — SurrealDB multi-model database with

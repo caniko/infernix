@@ -6,7 +6,7 @@ runtime = "nix"
 workspace = true
 publish_crates = true
 all_features = false
-nix_builds = [".#headroom", ".#checks.x86_64-linux.headroom", ".#checks.x86_64-linux.headroom-runtime"]
+nix_builds = [".#headroom", ".#checks.x86_64-linux.headroom", ".#checks.x86_64-linux.headroom-runtime", ".#checks.x86_64-linux.model-fetch"]
 
 [ci.nix_build]
 max_parallel = 2

@@ -505,6 +505,11 @@
             services.infernix.hermes-agent = {
               enable = true;
               environmentFiles = ["/run/secrets/hermes-env"];
+              envFile = {
+                literals.MATRIX_SESSION_SCOPE = "auto";
+                secrets.MATRIX_PASSWORD = "/run/secrets/matrix-password";
+              };
+              prune.enable = true;
               modelRouting = {
                 enable = true;
                 profile = {
@@ -603,6 +608,7 @@
                 allowedToolsets = ["web" "vision"];
                 readOnlyState = true;
                 settings.toolsets = ["all"];
+                envFile.literals.MATRIX_SESSION_SCOPE = "room";
               };
             };
 
@@ -1376,6 +1382,15 @@
           *"--restart"*) ;;
           *) echo "day schedule service does not restart hermes-agent" >&2; exit 1 ;;
         esac
+        case ${pkgs.lib.escapeShellArg hermesAgentSample.config.systemd.services.hermes-agent-env.serviceConfig.ExecStart} in
+          *'/bin/infernix-env-file" "--output-path" "/run/hermes-agent/env" "--literal" "MATRIX_SESSION_SCOPE=auto" "--secret" "MATRIX_PASSWORD=/run/secrets/matrix-password"') ;;
+          *) echo "unexpected hermes-agent-env command" >&2; exit 1 ;;
+        esac
+        test '${builtins.toJSON hermesAgentSample.config.systemd.services.hermes-agent.serviceConfig.EnvironmentFile}' = '["/run/hermes-agent/env"]'
+        test '${builtins.toJSON hermesAgentSample.config.systemd.services.hermes-agent-iris.serviceConfig.EnvironmentFile}' = '["/run/hermes-agent-iris/env"]'
+        test "${hermesAgentSample.config.systemd.services.hermes-agent-iris-env.serviceConfig.Group}" = "${hermesAgentSample.config.services.infernix.hermes-agent.instances.iris.group}"
+        test "${hermesAgentSample.config.systemd.timers.hermes-agent-session-prune.timerConfig.OnCalendar}" = "daily"
+        test "${toString (hermesAgentSample.config.systemd.services ? hermes-agent-iris-session-prune)}" = ""
         test "${hermesAgentSample.config.services.infernix.fleet.nodes.atlas.address}" = "192.168.178.88"
         test "${hermesAgentSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"
         test "${fleetLegacyLanIpSample.config.services.infernix.loadBalancer.backends.atlas.baseUrl}" = "http://192.168.178.88:8013"

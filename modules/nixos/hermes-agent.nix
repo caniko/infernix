@@ -1,7 +1,9 @@
 { config
 , infernixHermesAgent
+, infernixSelf
 , lib
 , pkgs
+, utils
 , ...
 }:
 let
@@ -56,8 +58,127 @@ let
         else { })
         instanceCfg.settings);
 
+  # Shared by the gateway and every instance. `unit` is the systemd unit of
+  # the Hermes process the options belong to.
+  maintenanceOptions = unit: {
+    envFile = {
+      literals = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        description = "Non-secret variables written to the rendered environment file.";
+      };
+
+      secrets = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        example = { MATRIX_PASSWORD = "/run/agenix/hermes-matrix-password"; };
+        description = ''
+          Variables whose value is read from a secret file when
+          `${unit}-env.service` starts. A missing or empty file fails that
+          unit and with it the Hermes service. Unlike `environmentFiles`,
+          the values never reach `.hermes/.env` on disk.
+        '';
+      };
+
+      path = mkOption {
+        type = types.str;
+        default = "/run/${unit}/env";
+        readOnly = true;
+        description = "Rendered `root:<group>` 0640 file, loaded as the service's EnvironmentFile.";
+      };
+    };
+
+    prune = {
+      enable = mkEnableOption "scheduled `hermes sessions prune`";
+
+      olderThanDays = mkOption {
+        type = types.ints.positive;
+        default = 30;
+        description = "Prune sessions older than this many days.";
+      };
+
+      onCalendar = mkOption {
+        type = types.str;
+        default = "daily";
+        description = "systemd calendar expression for the prune timer.";
+      };
+    };
+  };
+
+  envFileExe = "${infernixSelf.packages.${system}.infernix-workerd}/bin/infernix-env-file";
+
+  maintenanceUnits = unit: target:
+    let
+      inherit (target) envFile prune;
+      envFileEnabled = envFile.literals != { } || envFile.secrets != { };
+      flags = flag: entries: lib.concatLists (lib.mapAttrsToList (key: value: [ flag "${key}=${value}" ]) entries);
+    in
+    {
+      services = mkMerge [
+        (mkIf envFileEnabled {
+          "${unit}-env" = {
+            description = "Render the ${unit} environment file";
+            before = [ "${unit}.service" ];
+            requiredBy = [ "${unit}.service" ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              # Group= and the runtime directory give root:<group> ownership.
+              Group = target.group;
+              UMask = "0027";
+              RuntimeDirectory = unit;
+              RuntimeDirectoryMode = "0750";
+              ExecStart = utils.escapeSystemdExecArgs (
+                [ envFileExe "--output-path" envFile.path ]
+                ++ flags "--literal" envFile.literals
+                ++ flags "--secret" envFile.secrets
+              );
+            };
+          };
+          ${unit}.serviceConfig.EnvironmentFile = [ envFile.path ];
+        })
+        (mkIf prune.enable {
+          "${unit}-session-prune" = {
+            description = "Prune old ${unit} sessions";
+            after = [ "${unit}.service" ];
+            unitConfig.ConditionPathExists = "${target.stateDir}/.hermes/state.db";
+            environment = {
+              HOME = target.stateDir;
+              HERMES_HOME = "${target.stateDir}/.hermes";
+              HERMES_MANAGED = "true";
+            };
+            serviceConfig = {
+              Type = "oneshot";
+              User = target.user;
+              Group = target.group;
+              WorkingDirectory = target.stateDir;
+              ExecStart = "${target.package}/bin/hermes sessions prune --older-than ${toString prune.olderThanDays} --yes";
+              Nice = 10;
+              IOSchedulingClass = "idle";
+              NoNewPrivileges = true;
+              PrivateTmp = true;
+              ProtectSystem = "strict";
+              ReadWritePaths = [ target.stateDir ];
+            };
+          };
+        })
+      ];
+
+      timers = mkIf prune.enable {
+        "${unit}-session-prune" = {
+          description = "Schedule ${unit} session pruning";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnCalendar = prune.onCalendar;
+            Persistent = true;
+            RandomizedDelaySec = "15m";
+          };
+        };
+      };
+    };
+
   instanceModule = { config, name, ... }: {
-    options = {
+    options = maintenanceOptions "hermes-agent-${name}" // {
       enable = mkEnableOption "Hermes Agent instance ${name}";
 
       package = mkOption {
@@ -275,7 +396,7 @@ let
   '';
 in
 {
-  options.services.infernix.hermes-agent = {
+  options.services.infernix.hermes-agent = maintenanceOptions "hermes-agent" // {
     enable = mkEnableOption "Hermes Agent gateway service via Infernix";
 
     package = mkOption {
@@ -532,6 +653,10 @@ in
   config = mkMerge [
     (mkIf cfg.enable (mkMerge [
       {
+        systemd = maintenanceUnits "hermes-agent" cfg;
+      }
+
+      {
         assertions = [
           {
             assertion = cfg.package != null;
@@ -675,5 +800,17 @@ in
           })
         cfg.instances);
     }
+
+    (
+      let
+        instanceUnits = kind: mkMerge (lib.mapAttrsToList
+          (name: instanceCfg: mkIf instanceCfg.enable (maintenanceUnits "hermes-agent-${name}" instanceCfg).${kind})
+          cfg.instances);
+      in
+      {
+        systemd.services = instanceUnits "services";
+        systemd.timers = instanceUnits "timers";
+      }
+    )
   ];
 }

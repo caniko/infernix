@@ -36,7 +36,8 @@ in {
     settings = {
       model = cfg.routes.default;
       small_model = cfg.routes.background;
-      agent = {
+      # A routed agent takes its model from services.infernix.agentRoutes only.
+      agent = lib.filterAttrs (name: _: (config.services.infernix.agents.${name}.route or null) == null) {
         build.model = cfg.routes.background;
         plan.model = cfg.routes.think;
         general = {

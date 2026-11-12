@@ -1,12 +1,15 @@
 [site]
 title = "infernix"
-description = "Declarative NixOS and home-manager modules for self-hosted AI/ML inference"
+description = "NixOS and Home Manager modules that put Ollama, llama-swap, ComfyUI, Qdrant and SurrealDB behind one services.infernix namespace with a shared AMD, NVIDIA or CPU GPU abstraction."
 base_url = "/"
-footer_note = "Generated from repository metadata by the plinth-project FOSS sweep."
 
 [[nav]]
 label = "Overview"
 href = "#overview"
+
+[[nav]]
+label = "Quick start"
+href = "#install"
 
 [[nav]]
 label = "Source"
@@ -19,35 +22,58 @@ href = "https://github.com/caniko/infernix"
 [[pages]]
 slug = "index"
 title = "infernix"
-description = "Declarative NixOS and home-manager modules for self-hosted AI/ML inference"
+description = "NixOS and Home Manager modules that put Ollama, llama-swap, ComfyUI, Qdrant and SurrealDB behind one services.infernix namespace with a shared AMD, NVIDIA or CPU GPU abstraction."
 
 [[pages.sections]]
 type = "hero"
 title = "infernix"
-tagline = "Self-hosted AI/ML services in Nix"
-subtitle = "GPU-aware NixOS and Home Manager modules for Ollama, llama-swap, ComfyUI, Qdrant, and SurrealDB."
+tagline = "Self-hosted model serving with one vendor switch."
+subtitle = "NixOS and Home Manager modules that put Ollama, llama-swap, ComfyUI, Qdrant and SurrealDB behind one services.infernix namespace with a shared AMD, NVIDIA or CPU GPU abstraction."
 
 [[pages.sections.ctas]]
 label = "View source"
 href = "https://github.com/caniko/infernix"
 primary = true
 
+[[pages.sections.ctas]]
+label = "Quick start"
+href = "#install"
+
 [[pages.sections]]
 type = "feature_grid"
 id = "overview"
 
 [[pages.sections.features]]
-title = "GPU abstraction"
-description = "Switch AMD/ROCm, NVIDIA/CUDA, and CPU backends through one shared service configuration."
+title = "One namespace, one vendor switch"
+description = "services.infernix.gpu picks AMD, NVIDIA or CPU and is consumed by the Ollama, llama-swap and ComfyUI modules, which handle the GPU override variable, visible device masking and package selection for you."
 
 [[pages.sections.features]]
-title = "Model serving"
-description = "Compose Ollama and llama-swap services with model catalogs, preloading, and GPU-aware defaults."
+title = "Pinned, verified model fetches"
+description = "modelFetch.jobs download a pinned Hugging Face revision, check each file's size and sha256, and publish the files with a ready manifest atomically; a re-run skips once that manifest verifies."
 
 [[pages.sections.features]]
-title = "Diffusion and storage"
-description = "Configure ComfyUI, Qdrant, and SurrealDB modules with managed paths, ports, and firewall rules."
+title = "Multi-model llama-swap"
+description = "llama-swap sits in front of llama-server with per-model TTL and extra arguments, speculative decoding through draft models, flash-attention all-quants, and CPU microarchitecture tuning."
 
 [[pages.sections.features]]
-title = "Home Manager endpoints"
-description = "Expose local model providers and endpoints to Goose, OpenCode, and Claude Code configurations."
+title = "Endpoints reach the agents"
+description = "Declare each reachable backend once under Home Manager endpoints, and the opt-in modules render Goose providers, yeeHaw steeds, and OpenCode and Claude Code provider settings from that catalog."
+
+[[pages.sections]]
+type = "install"
+id = "install"
+heading = "Quick start"
+intro = "Add the flake input, import the NixOS module, and describe the services you want. GPU packages come from your own nixpkgs instantiation, so rocmSupport or cudaSupport stays your decision rather than a flake-wide flag."
+guide_href = "https://github.com/caniko/infernix"
+
+[[pages.sections.primary_routes]]
+label = "Flake input"
+audience = "A flake that already builds your NixOS hosts"
+command = 'infernix.url = "github:caniko/infernix";'
+href = "https://github.com/caniko/infernix#quick-start"
+recommended = true
+
+[[pages.sections.secondary_routes]]
+label = "GPU package set"
+audience = "Consumers that set rocmSupport or cudaSupport"
+href = "https://github.com/caniko/infernix#gpu-configuration"

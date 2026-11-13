@@ -1,0 +1,39 @@
+{
+  "id": "qwen3-tts-0.6b-customvoice-rocm",
+  "model": "qwen3-tts",
+  "operation": "tts",
+  "state": "documented",
+  "blockedReason": null,
+  "checkpoint": {
+    "repo": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+    "files": []
+  },
+  "code": {
+    "repo": "https://github.com/QwenLM/Qwen3-TTS",
+    "commit": null,
+    "package": "qwen-tts==0.1.1"
+  },
+  "licence": {
+    "code": "Apache-2.0",
+    "weights": "Apache-2.0",
+    "gated": false,
+    "evidence": ["https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"],
+    "acceptedBy": null
+  },
+  "helpers": [],
+  "backend": "rocm",
+  "device": "gpu:atlas-7900xtx",
+  "deviceMatch": "gfx1100",
+  "precision": "bf16",
+  "cpuPolicy": "forbidden",
+  "cpuThreads": 4,
+  "peakVramGib": null,
+  "tenants": {
+    "llamaSwapUrl": "http://127.0.0.1:8013"
+  },
+  "limits": {
+    "maxInputSeconds": null
+  },
+  "evidence": []
+}

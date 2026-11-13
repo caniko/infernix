@@ -1,0 +1,39 @@
+{
+  "id": "sam2-1-hiera-small-rocm",
+  "model": "sam2",
+  "operation": "mask",
+  "state": "documented",
+  "blockedReason": null,
+  "checkpoint": {
+    "repo": "facebook/sam2.1-hiera-small",
+    "revision": "ee5bba1d82bb8749febdf90f45e84b687142ba03",
+    "files": []
+  },
+  "code": {
+    "repo": "https://github.com/facebookresearch/sam2",
+    "commit": "2b90b9f5ceec907a1c18123530e92e794ad901a4",
+    "package": "sam2"
+  },
+  "licence": {
+    "code": "Apache-2.0",
+    "weights": "Apache-2.0",
+    "gated": false,
+    "evidence": ["https://huggingface.co/facebook/sam2.1-hiera-small"],
+    "acceptedBy": null
+  },
+  "helpers": [],
+  "backend": "rocm",
+  "device": "gpu:atlas-7900xtx",
+  "deviceMatch": "gfx1100",
+  "precision": "bf16",
+  "cpuPolicy": "forbidden",
+  "cpuThreads": 4,
+  "peakVramGib": null,
+  "tenants": {
+    "llamaSwapUrl": "http://127.0.0.1:8013"
+  },
+  "limits": {
+    "maxInputSeconds": null
+  },
+  "evidence": []
+}

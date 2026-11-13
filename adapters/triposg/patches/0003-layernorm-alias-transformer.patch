@@ -1,0 +1,21 @@
+diff --git a/triposg/models/transformers/triposg_transformer.py b/triposg/models/transformers/triposg_transformer.py
+index 5676a11..8b3752f 100755
+--- a/triposg/models/transformers/triposg_transformer.py
++++ b/triposg/models/transformers/triposg_transformer.py
+@@ -107,7 +107,6 @@ from diffusers.models.modeling_utils import ModelMixin
+ from diffusers.models.normalization import (
+     AdaLayerNormContinuous,
+     FP32LayerNorm,
+-    LayerNorm,
+ )
+ from diffusers.utils import (
+     USE_PEFT_BACKEND,
+@@ -119,6 +118,8 @@ from diffusers.utils import (
+ from diffusers.utils.torch_utils import maybe_allow_in_graph
+ from torch import nn
+ 
++LayerNorm = nn.LayerNorm
++
+ from ..attention_processor import FusedTripoSGAttnProcessor2_0, TripoSGAttnProcessor2_0
+ from .modeling_outputs import Transformer1DModelOutput
+ 

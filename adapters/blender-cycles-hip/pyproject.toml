@@ -1,0 +1,12 @@
+[project]
+name = "infernix-adapter-blender-cycles-hip"
+version = "0.1.0"
+description = "Headless Cycles GPU render + hardware HEVC encode adapter (atlas HIP / nomad OPTIX)"
+requires-python = ">=3.12,<3.13"
+dependencies = ["infernix-adapter"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+infernix-adapter = { path = "../common" }

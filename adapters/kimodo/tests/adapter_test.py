@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -85,7 +86,7 @@ LLAMA_FILES = {
 }
 ENCODER_FILES = {
     "adapter_config.json": json.dumps(
-        {"base_model_name_or_path": adapter.BASE_LLAMA}
+        {"base_model_name_or_path": adapter.BASE_LLAMA, "peft_type": "LORA"}
     ).encode(),
     "adapter_model.safetensors": b"mntp-weights",
     "config.json": b'{"hidden_size": 4096}',
@@ -95,7 +96,7 @@ ENCODER_FILES = {
 }
 SUPERVISED_FILES = {
     "adapter_config.json": json.dumps(
-        {"base_model_name_or_path": adapter.BASE_LLAMA}
+        {"base_model_name_or_path": adapter.BASE_LLAMA, "peft_type": "LORA"}
     ).encode(),
     "adapter_model.safetensors": b"supervised-weights",
 }
@@ -285,6 +286,13 @@ class KimodoTests(unittest.TestCase):
         snapshots = adapter.verify_snapshots(helper)
         checkpoint = adapter.verified_checkpoint(profile)
         return adapter.staging_tree(profile, helper, checkpoint, snapshots)
+
+    def expected(self, staging):
+        """The trusted file map for the tree at `staging`, from the pins only."""
+        helper = adapter.text_encoder_helper(self.profile)
+        return adapter._expected_tree(
+            staging, self.profile, helper, adapter.verify_snapshots(helper)
+        )
 
     def resolved_config(self, profile=None):
         profile = profile or self.profile
@@ -635,8 +643,8 @@ class KimodoTests(unittest.TestCase):
                 loaded["kwargs"] = kwargs
                 self.model = types.SimpleNamespace(model="llama")
 
-        def stack(model, path):
-            loaded["stacks"].append((model, path))
+        def stack(model, path, **kwargs):
+            loaded["stacks"].append((model, path, kwargs))
             return f"stacked:{path}"
 
         with (
@@ -650,11 +658,46 @@ class KimodoTests(unittest.TestCase):
         )
         self.assertEqual(
             loaded["stacks"],
-            [("llama", snapshots[adapter.LLM2VEC_SUPERVISED])],
+            [
+                (
+                    "llama",
+                    snapshots[adapter.LLM2VEC_SUPERVISED],
+                    {"trust_remote_code": False},
+                )
+            ],
         )
         for path in snapshots.values():
             self.assertTrue(Path(path).is_absolute())
             self.assertNotEqual(Path(path), shadow)
+
+    def test_every_loader_call_disables_remote_code(self):
+        import kimodo.model.llm2vec as llm2vec_module
+        import peft
+        import transformers
+
+        snapshots = adapter.staged_snapshots(self.staging())
+        seen = {}
+
+        class Recorder:
+            def __init__(self, **kwargs):
+                self.model = types.SimpleNamespace(model="llama")
+
+        def config(*args, **kwargs):
+            seen["config"] = kwargs
+            return types.SimpleNamespace(hidden_size=4096)
+
+        def stack(model, path, **kwargs):
+            seen.setdefault("peft", []).append(kwargs)
+            return f"stacked:{path}"
+
+        with (
+            mock.patch.object(llm2vec_module, "LLM2VecEncoder", Recorder),
+            mock.patch.object(peft.PeftModel, "from_pretrained", stack),
+            mock.patch.object(transformers.AutoConfig, "from_pretrained", config),
+        ):
+            self.real["build_text_encoder"]("cuda:0", snapshots)
+        self.assertIs(seen["config"]["trust_remote_code"], False)
+        self.assertIs(seen["peft"][0]["trust_remote_code"], False)
 
     def test_the_staged_adapter_config_names_the_staged_base(self):
         snapshots = adapter.staged_snapshots(self.staging())
@@ -786,7 +829,7 @@ class KimodoTests(unittest.TestCase):
         target = Path(staging) / relative
         os.chmod(target, 0o644)
         target.write_bytes(b"tampered")
-        self.assertIsNone(adapter._reusable(staging, manifest["key"]))
+        self.assertIsNone(adapter._reusable(staging, self.expected(staging)))
         rebuilt = self.staging()
         self.assertEqual(rebuilt, staging)
         self.assertNotEqual((Path(rebuilt) / relative).read_bytes(), b"tampered")
@@ -805,7 +848,6 @@ class KimodoTests(unittest.TestCase):
         # Neither a rewritten weight nor a config we wrote ourselves can hide
         # behind the size check: reuse re-hashes every declared file.
         staging = self.staging()
-        key = json.loads((Path(staging) / adapter.MANIFEST).read_text())["key"]
         for relative in (
             "model.safetensors",
             f"{adapter.ENCODER_DIRECTORY}/{adapter._slug(adapter.LLM2VEC)}"
@@ -817,9 +859,85 @@ class KimodoTests(unittest.TestCase):
                 os.chmod(target, 0o644)
                 target.write_bytes(b"x" * len(original))
                 self.assertEqual(os.lstat(target).st_size, len(original))
-                self.assertIsNone(adapter._reusable(staging, key))
+                self.assertIsNone(adapter._reusable(staging, self.expected(staging)))
                 rebuilt = self.staging()
                 self.assertEqual((Path(rebuilt) / relative).read_bytes(), original)
+
+    def test_concurrent_builders_share_one_valid_tree(self):
+        # Two jobs may validate and build the same key at once; the late one
+        # must reuse the published tree instead of discarding it.
+        helper = adapter.text_encoder_helper(self.profile)
+        snapshots = adapter.verify_snapshots(helper)
+        checkpoint = adapter.verified_checkpoint(self.profile)
+        barrier = threading.Barrier(2)
+        results, errors, discarded = [], [], []
+
+        def worker():
+            try:
+                barrier.wait(timeout=10)
+                results.append(
+                    adapter.staging_tree(self.profile, helper, checkpoint, snapshots)
+                )
+            except BaseException as error:  # noqa: BLE001 - reported below
+                errors.append(error)
+
+        real_discard = adapter._discard
+
+        def discard(path):
+            discarded.append(Path(path))
+            return real_discard(path)
+
+        with mock.patch.object(adapter, "_discard", discard):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1])
+        tree = Path(results[0])
+        self.assertTrue(tree.is_dir())
+        self.assertNotIn(tree, discarded)
+        self.assertIsNotNone(adapter._reusable(tree, self.expected(tree)))
+        published = sorted(
+            entry.name
+            for entry in tree.parent.iterdir()
+            if not entry.name.startswith(".")
+        )
+        self.assertEqual(published, [tree.name])
+
+    def test_a_self_consistent_manifest_cannot_authenticate_a_tree(self):
+        # A manifest rewritten to match a tampered weight must not be believed:
+        # the expected files and hashes come from the pins, not from the tree.
+        staging = self.staging()
+        relative = "model.safetensors"
+        target = Path(staging) / relative
+        tampered = b"x" * target.stat().st_size
+        os.chmod(target, 0o644)
+        target.write_bytes(tampered)
+        manifest_path = Path(staging) / adapter.MANIFEST
+        manifest = json.loads(manifest_path.read_text())
+        for record in manifest["files"]:
+            if record["path"] == relative:
+                record["sha256"] = digest(tampered)
+                record["size"] = len(tampered)
+        os.chmod(manifest_path, 0o644)
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+        )
+        self.assertIsNone(adapter._reusable(staging, self.expected(staging)))
+        rebuilt = self.staging()
+        self.assertEqual(rebuilt, staging)
+        self.assertEqual(
+            (Path(rebuilt) / relative).read_bytes(),
+            CHECKPOINT_FILES[relative],
+        )
+        manifest = json.loads((Path(rebuilt) / adapter.MANIFEST).read_text())
+        record = next(
+            item for item in manifest["files"] if item["path"] == relative
+        )
+        self.assertEqual(record["sha256"], digest(CHECKPOINT_FILES[relative]))
 
     def test_tokenizer_data_is_not_confined_as_a_path(self):
         # Vocabulary tokens, merges and added tokens are data: a merge such as
@@ -851,6 +969,51 @@ class KimodoTests(unittest.TestCase):
             self.staging()
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("/etc/passwd", str(caught.exception))
+
+    def test_an_external_fast_tokenizer_files_entry_is_refused(self):
+        outside = self.root / "elsewhere" / "tokenizer.1.0.json"
+        outside.parent.mkdir()
+        outside.write_bytes(b"undeclared tokenizer")
+        payload = json.dumps(
+            {
+                "tokenizer_class": "PreTrainedTokenizerFast",
+                "fast_tokenizer_files": [str(outside)],
+            }
+        ).encode()
+        self.redeclare(self.helper()["checkpoints"][1], "tokenizer_config.json", payload)
+        with self.assertRaises(AdapterError) as caught:
+            self.staging()
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn(str(outside), str(caught.exception))
+
+    def test_autotokenizer_follows_fast_tokenizer_files_out_of_the_snapshot(self):
+        # The vector the confinement closes: AutoTokenizer passes each entry to
+        # the snapshot resolver as a filename, and an absolute one wins over the
+        # snapshot directory. Skipped when transformers is not importable here.
+        try:
+            from tokenizers import Tokenizer, models
+            from transformers import AutoTokenizer
+        except ImportError:
+            self.skipTest("transformers is not importable offline")
+        outside = self.root / "elsewhere" / "tokenizer.1.0.json"
+        outside.parent.mkdir()
+        Tokenizer(models.WordLevel({"hello": 0}, unk_token="hello")).save(
+            str(outside)
+        )
+        snapshot = self.root / "tokenizer-snapshot"
+        snapshot.mkdir()
+        (snapshot / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "tokenizer_class": "PreTrainedTokenizerFast",
+                    "fast_tokenizer_files": [str(outside)],
+                }
+            )
+        )
+        loaded = AutoTokenizer.from_pretrained(
+            str(snapshot), trust_remote_code=False
+        )
+        self.assertEqual(loaded.convert_tokens_to_ids("hello"), 0)
 
     def test_an_auto_map_value_is_confined(self):
         # `auto_map` names code files; a value that leaves the snapshot is
@@ -957,12 +1120,46 @@ class KimodoTests(unittest.TestCase):
 
     def test_adapter_base_redirect_is_refused(self):
         pin = self.helper()["checkpoints"][2]
-        payload = json.dumps({"base_model_name_or_path": "attacker/model"}).encode()
+        payload = json.dumps(
+            {
+                "base_model_name_or_path": "attacker/model",
+                "peft_type": "LORA",
+            }
+        ).encode()
         self.redeclare(pin, "adapter_config.json", payload)
         with self.assertRaises(AdapterError) as caught:
             adapter.verify_snapshots(self.helper())
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("adapter_config.json", str(caught.exception))
+
+    def test_a_non_lora_adapter_config_is_refused(self):
+        pin = self.helper()["checkpoints"][2]
+        payload = json.dumps(
+            {
+                "base_model_name_or_path": adapter.BASE_LLAMA,
+                "peft_type": "XLORA",
+            }
+        ).encode()
+        self.redeclare(pin, "adapter_config.json", payload)
+        with self.assertRaises(AdapterError) as caught:
+            adapter.verify_snapshots(self.helper())
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("XLORA", str(caught.exception))
+
+    def test_a_nested_adapters_mapping_is_refused(self):
+        pin = self.helper()["checkpoints"][2]
+        payload = json.dumps(
+            {
+                "base_model_name_or_path": adapter.BASE_LLAMA,
+                "peft_type": "LORA",
+                "adapters": {"other": {"peft_type": "LORA"}},
+            }
+        ).encode()
+        self.redeclare(pin, "adapter_config.json", payload)
+        with self.assertRaises(AdapterError) as caught:
+            adapter.verify_snapshots(self.helper())
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("adapters", str(caught.exception))
 
     def test_snapshot_ref_must_name_the_pinned_revision(self):
         pin = self.helper()["checkpoints"][0]

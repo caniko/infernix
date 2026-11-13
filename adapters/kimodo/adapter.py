@@ -28,6 +28,7 @@ the staged base, so no `from_pretrained` call receives a repository id.
 
 import contextlib
 import fcntl
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -122,6 +123,8 @@ PATH_VALUE = re.compile(r"\.(safetensors|npy|pt|bin|json|ya?ml)$")
 # snapshot config is data: a vocabulary token or merge such as "/ /" can look
 # like an absolute path and is still not one.
 SNAPSHOT_PATH_KEY = ("_file", "_path", "_dir", "name_or_path")
+# A snapshot key whose value is a list of loader files, not one path.
+SNAPSHOT_PATH_LIST = "fast_tokenizer_files"
 # linux/fs.h FICLONE: share the source extents instead of copying its bytes.
 FICLONE = 0x40049409
 
@@ -234,11 +237,13 @@ def _snapshot_root(helper, repo):
 
 
 def _adapter_base(snapshot):
-    """The base a verified adapter_config.json names, which must be the declared Llama.
+    """The verified adapter config: one LoRA on the declared Llama.
 
     The LoRA is attached to a model loaded from the verified base directory, so
-    this value is never used to resolve weights; the check only refuses an
-    adapter that claims a different base.
+    `base_model_name_or_path` is never used to resolve weights; the check only
+    refuses a config that claims a different base or a different adapter type.
+    A nested `adapters` mapping names further adapters PEFT would load, so it is
+    refused too: the pin declares exactly these two LoRA files.
     """
     path = Path(snapshot) / "adapter_config.json"
     if not path.is_file():
@@ -247,7 +252,22 @@ def _adapter_base(snapshot):
         document = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         raise AdapterError(14, f"adapter config {path} is unreadable: {error}") from error
-    base = document.get("base_model_name_or_path") if isinstance(document, dict) else None
+    if not isinstance(document, dict):
+        raise AdapterError(14, f"adapter config {path} is not a mapping")
+    peft_type = document.get("peft_type")
+    if peft_type != "LORA":
+        raise AdapterError(
+            14,
+            f"adapter config {path} declares peft_type {peft_type!r}, not 'LORA': "
+            "only a LoRA may be attached to the verified base",
+        )
+    if isinstance(document.get("adapters"), dict):
+        raise AdapterError(
+            14,
+            f"adapter config {path} declares a nested adapters mapping: only the "
+            "pinned LoRA may be attached to the verified base",
+        )
+    base = document.get("base_model_name_or_path")
     if base != BASE_LLAMA:
         raise AdapterError(
             14,
@@ -444,7 +464,7 @@ def _materialise(staging, sources, records):
             }
 
 
-def _confined(value, base, tree, staging, path_like=False):
+def _confined(value, base, tree, staging, path_like=False, exists=os.path.exists):
     """One string leaf: its published absolute path, or the value unchanged.
 
     A value that resolves to an existing path must resolve inside the tree and
@@ -452,13 +472,15 @@ def _confined(value, base, tree, staging, path_like=False):
     so no loader can resolve it against the working directory or another base.
     An absolute value, one that resolves outside the tree, or (`path_like`) one
     that names nothing the tree holds is exit 14: the pin does not contain it.
+    `exists` lets the caller answer against the pinned file set before a tree
+    exists; the default asks the filesystem.
     """
     tree, staging = str(tree), str(staging)
     candidate = value if os.path.isabs(value) else os.path.join(base, value)
     real = os.path.realpath(candidate)
     relative = os.path.relpath(real, tree)
     inside = relative != ".." and not relative.startswith(".." + os.sep)
-    if os.path.exists(real):
+    if exists(real):
         if not inside:
             raise AdapterError(
                 14,
@@ -503,29 +525,42 @@ def _snapshot_path(key):
     return key is not None and (key == "auto_map" or key.endswith(SNAPSHOT_PATH_KEY))
 
 
-def _confine_snapshot(node, base, tree, staging, key=None):
+def _confine_snapshot(node, base, tree, staging, key=None, exists=os.path.exists):
     """Confine the path-bearing values of a staged Hugging Face config.
 
     These configs steer loading from inside the snapshot (a `tokenizer_file`, a
     task-specific file), so a value that resolves inside the tree is pinned to
     its published absolute path and one that resolves outside it, or is absolute
     at all, is refused. Only a value whose key names a path is checked, plus the
-    `auto_map` entries: a tokenizer's vocabulary and merges are data, and "/ /"
-    is a merge, not an absolute path. Values that resolve to nothing are left as
-    they are: with the cache directories empty and offline mode on, they cannot
-    load bytes.
+    `auto_map` entries and the `fast_tokenizer_files` list: a tokenizer's
+    vocabulary and merges are data, and "/ /" is a merge, not an absolute path.
+    `fast_tokenizer_files` entries are loader filenames, so each one must name a
+    staged file; the loader joins them onto the snapshot and would take an
+    absolute or escaping entry as-is. Values that resolve to nothing are left
+    as they are: with the cache directories empty and offline mode on, they
+    cannot load bytes.
     """
     if isinstance(node, dict):
         return {
             name: _confine_snapshot(
-                value, base, tree, staging, "auto_map" if key == "auto_map" else name
+                value,
+                base,
+                tree,
+                staging,
+                "auto_map" if key == "auto_map" else name,
+                exists,
             )
             for name, value in node.items()
         }
     if isinstance(node, (list, tuple)):
-        return [_confine_snapshot(value, base, tree, staging, key) for value in node]
-    if isinstance(node, str) and node and _snapshot_path(key):
-        return _confined(node, base, tree, staging)
+        return [
+            _confine_snapshot(value, base, tree, staging, key, exists) for value in node
+        ]
+    if isinstance(node, str) and node:
+        if _snapshot_path(key):
+            return _confined(node, base, tree, staging, exists=exists)
+        if key == SNAPSHOT_PATH_LIST:
+            return _confined(node, base, tree, staging, path_like=True, exists=exists)
     return node
 
 
@@ -564,6 +599,90 @@ def _staged_configs(tree, staging, adapters):
                 continue
             _replace_file(path, json.dumps(updated, sort_keys=True, indent=2) + "\n")
             yield path
+
+
+def _staged_rewrites(helper, snapshots, staging, staged):
+    """The exact digest of every config the pins' own configs turn into.
+
+    The rewrite is computed in memory from the verified source snapshot, not
+    read back from a candidate tree: a reused tree must be authenticated by the
+    pins, never by bytes it carries itself. `staged` answers whether a value
+    names a file the pins materialise, so the rewrite does not depend on the
+    candidate tree either.
+    """
+    published = Path(staging)
+    base = published / ENCODER_DIRECTORY / _slug(BASE_LLAMA)
+    adapters = {
+        published / ENCODER_DIRECTORY / _slug(repo): base
+        for repo in (LLM2VEC, LLM2VEC_SUPERVISED)
+    }
+    rewrites = {}
+    for repo in ENCODERS:
+        directory = published / ENCODER_DIRECTORY / _slug(repo)
+        prefix = Path(ENCODER_DIRECTORY) / _slug(repo)
+        for entry in _pin(helper, repo)["files"]:
+            relative = Path(entry["path"])
+            name = relative.name
+            if not name.endswith(".json") or name.endswith(".index.json"):
+                continue
+            path = Path(snapshots[repo]) / relative
+            try:
+                document = json.loads(path.read_text())
+            except (OSError, ValueError) as error:
+                raise AdapterError(
+                    14, f"verified snapshot config {path} is unreadable: {error}"
+                ) from error
+            parent = directory / relative.parent
+            updated = _confine_snapshot(
+                document, parent, published, published, exists=staged
+            )
+            adapter_base = adapters.get(parent)
+            if adapter_base is not None and name == "adapter_config.json":
+                if not isinstance(updated, dict):
+                    raise AdapterError(
+                        14, f"staged adapter config {path} is not a mapping"
+                    )
+                updated = dict(updated, base_model_name_or_path=str(adapter_base))
+            if updated == document:
+                continue
+            payload = json.dumps(updated, sort_keys=True, indent=2) + "\n"
+            rewrites[(prefix / relative).as_posix()] = hashlib.sha256(
+                payload.encode()
+            ).hexdigest()
+    return rewrites
+
+
+def _expected_tree(staging, profile, helper, snapshots):
+    """Every file a verified tree for these pins holds, and its exact digest.
+
+    Trusted inputs only: the declared pin hashes and the deterministic staged
+    rewrites. The manifest is deliberately not consulted, so a tree cannot
+    authenticate its own bytes.
+    """
+    expected = {}
+    for entry in (profile.get("checkpoint") or {}).get("files") or []:
+        expected[Path(entry["path"]).as_posix()] = str(entry["sha256"]).lower()
+    for repo in ENCODERS:
+        prefix = Path(ENCODER_DIRECTORY) / _slug(repo)
+        for entry in _pin(helper, repo)["files"]:
+            relative = (prefix / Path(entry["path"]).as_posix()).as_posix()
+            expected[relative] = str(entry["sha256"]).lower()
+
+    tree = Path(staging)
+
+    def staged(path):
+        real = os.path.realpath(path)
+        relative = Path(os.path.relpath(real, tree)).as_posix()
+        inside = relative != ".." and not relative.startswith("../")
+        if not inside:
+            return os.path.exists(real)
+        prefix = "" if relative == "." else relative.rstrip("/") + "/"
+        return relative in expected or any(
+            name.startswith(prefix) for name in expected
+        )
+
+    expected.update(_staged_rewrites(helper, snapshots, staging, staged))
+    return expected
 
 
 def _seal(staging):
@@ -630,76 +749,76 @@ def _build_staging(staging, key, checkpoint, checkpoint_files, helper, snapshots
     _seal(staging)
 
 
-def _reusable(staging, key):
-    """The staging manifest when every staged file still hashes to it, else None.
+def _reusable(staging, expected):
+    """The expected file map when the tree matches it exactly, else None.
 
-    Every declared file is re-hashed on each job, not sampled by size: a rewrite
-    that keeps the size — of a weight, or of a config we wrote ourselves — is
-    the cheap attack, and only the digest sees it. The cost is one pass over the
-    provisioned tree per job.
+    `expected` comes from the pins, never from the tree's own manifest: a
+    tampered weight plus a manifest rewritten to match it is still a mismatch.
+    Every file is re-hashed on each job, not sampled by size: a rewrite that
+    keeps the size — of a weight, or of a config we wrote ourselves — is the
+    cheap attack, and only the digest sees it. The tree must hold exactly the
+    expected files (plus the informational manifest), no symlink and no extra
+    file. The cost is one pass over the provisioned tree per job.
     """
     # ponytail: the staging tree is owned by the worker UID that also runs the
     # adapter, so its mode bits cannot isolate it from a compromised adapter;
     # the per-job re-hash is the guard (0.8 s for the provisioned 1.4 GiB tree on
     # atlas, ~11 s once the gated 8B base adds its 16 GiB), and a real barrier
     # needs a separate UID.
-    try:
-        manifest = json.loads((Path(staging) / MANIFEST).read_text())
-    except (OSError, ValueError):
+    staging = Path(staging)
+    if staging.is_symlink() or not staging.is_dir():
         return None
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("v") != 1
-        or manifest.get("key") != key
-    ):
-        return None
-    files = manifest.get("files")
-    if not isinstance(files, list) or not files:
-        return None
-    declared = set()
-    for record in files:
-        if not isinstance(record, dict):
+    for name in (HF_HOME_DIRECTORY, HF_HUB_DIRECTORY):
+        path = staging / name
+        if path.is_symlink() or not path.is_dir():
             return None
-        relative, size = record.get("path"), record.get("size")
-        expected = record.get("sha256")
-        if (
-            not isinstance(relative, str)
-            or not relative
-            or not isinstance(size, int)
-            or not isinstance(expected, str)
-        ):
-            return None
-        staged = Path(staging) / relative
-        try:
-            info = os.lstat(staged)
-        except OSError:
-            return None
-        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
-            return None
-        if sha256_file(staged) != expected:
-            return None
-        declared.add(relative)
-    seen = 0
+    found = set()
     for base, directories, names in os.walk(staging):
         if any(os.path.islink(os.path.join(base, name)) for name in directories):
             return None
         for name in names:
-            if os.path.islink(os.path.join(base, name)):
+            path = Path(base) / name
+            relative = path.relative_to(staging).as_posix()
+            if os.path.islink(path):
                 return None
-            seen += 1
-    if seen != len(declared) + 1:
+            if relative == MANIFEST:
+                continue
+            digest = expected.get(relative)
+            if digest is None:
+                return None
+            try:
+                info = os.lstat(path)
+            except OSError:
+                return None
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            try:
+                if sha256_file(path) != digest:
+                    return None
+            except OSError:
+                return None
+            found.add(relative)
+    if found != set(expected):
         return None
-    return manifest
+    return expected
 
 
 def _discard(path):
     """Remove a staging tree, including its read-only contents.
 
     Only directories are opened for writing: a read-only file can be unlinked
-    from a writable directory, so no file mode ever needs changing.
+    from a writable directory, so no file mode ever needs changing. A symlink is
+    unlinked itself, never walked into, and a non-directory is unlinked: neither
+    is a tree this adapter published.
     """
     path = Path(path)
+    if path.is_symlink():
+        path.unlink()
+        return
     if not path.exists():
+        return
+    if not path.is_dir():
+        path.unlink()
         return
     for base, directories, _names in os.walk(path):
         for name in directories:
@@ -714,6 +833,17 @@ def _discard(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
+@contextlib.contextmanager
+def _staging_lock(path):
+    """Serialise validation and replacement for one staging key."""
+    handle = open(path, "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        handle.close()
+
+
 def staging_tree(profile, helper, checkpoint, snapshots):
     """The verified staging tree for these pins, built once and reused.
 
@@ -722,35 +852,33 @@ def staging_tree(profile, helper, checkpoint, snapshots):
     so the bytes upstream reads are the bytes the pin verified. Only declared
     files exist there — no symlink, no extra file — and the tree is read-only
     once published. It is built in a temporary directory and renamed into
-    place, so a concurrent job reuses it instead of reading a partial tree.
+    place. Validation and replacement are serialised per key, so a concurrent
+    job reuses a valid tree instead of discarding one another job published.
     """
     root = Path(cache_root()) / STAGING_DIRECTORY
     key = staging_key(profile, helper)
     staging = root / key
     root.mkdir(parents=True, exist_ok=True)
-    if _reusable(staging, key) is None:
-        temporary = Path(tempfile.mkdtemp(prefix=f".tmp-{key[:16]}-", dir=root))
-        try:
-            if staging.exists():
-                _discard(staging)
-            _build_staging(
-                temporary,
-                key,
-                checkpoint,
-                (profile.get("checkpoint") or {}).get("files") or [],
-                helper,
-                snapshots,
-            )
+    with _staging_lock(root / f".{key}.lock"):
+        expected = _expected_tree(staging, profile, helper, snapshots)
+        if _reusable(staging, expected) is None:
+            temporary = Path(tempfile.mkdtemp(prefix=f".tmp-{key[:16]}-", dir=root))
             try:
+                if staging.exists():
+                    _discard(staging)
+                _build_staging(
+                    temporary,
+                    key,
+                    checkpoint,
+                    (profile.get("checkpoint") or {}).get("files") or [],
+                    helper,
+                    snapshots,
+                )
                 os.replace(temporary, staging)
-            except OSError:
-                # Another job published the same pins first; reuse its tree.
-                if not staging.is_dir():
-                    raise
-        finally:
-            _discard(temporary)
-    if _reusable(staging, key) is None:
-        raise AdapterError(14, f"the verified staging tree {staging} is incomplete")
+            finally:
+                _discard(temporary)
+        if _reusable(staging, expected) is None:
+            raise AdapterError(14, f"the verified staging tree {staging} is incomplete")
     return staging
 
 
@@ -810,7 +938,11 @@ def build_text_encoder(device, snapshots):
     from transformers import AutoConfig
 
     base = snapshots[BASE_LLAMA]
-    hidden = AutoConfig.from_pretrained(base).hidden_size
+    hidden = AutoConfig.from_pretrained(base, trust_remote_code=False).hidden_size
+    # Upstream's LLM2VecEncoder takes no trust_remote_code kwarg and forwards no
+    # extra kwargs, so its internal AutoTokenizer/AutoConfig/AutoModel and PEFT
+    # calls run with the transformers default, which refuses remote code; every
+    # auto_map value is confined to the staged tree by this adapter.
     encoder = LLM2VecEncoder(
         base_model_name_or_path=base,
         peft_model_name_or_path=snapshots[LLM2VEC],
@@ -820,7 +952,9 @@ def build_text_encoder(device, snapshots):
     )
     # The supervised LoRA stacks on the mntp one, both by verified directory.
     encoder.model.model = PeftModel.from_pretrained(
-        encoder.model.model, snapshots[LLM2VEC_SUPERVISED]
+        encoder.model.model,
+        snapshots[LLM2VEC_SUPERVISED],
+        trust_remote_code=False,
     )
     return encoder
 

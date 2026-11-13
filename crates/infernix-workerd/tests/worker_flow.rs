@@ -76,6 +76,9 @@ impl StubHub {
                         return;
                     };
                     let request = parse_request(&head, body);
+                    // `fetch_update` is `try_update` on newer toolchains; keep
+                    // the stable name and silence the rename on nightly.
+                    #[allow(deprecated)]
                     let failed = failing
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                             remaining.checked_sub(1)

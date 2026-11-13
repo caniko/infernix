@@ -702,8 +702,16 @@ async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) ->
     let code = run.output.status.code();
     match code {
         Some(0) => {
-            finish_success(&client, &config, &adapter, &lease, &staging, &job.payload, run)
-                .await
+            finish_success(
+                &client,
+                &config,
+                &adapter,
+                &lease,
+                &staging,
+                &job.payload,
+                run,
+            )
+            .await
         }
         Some(EXIT_RESOURCE_BUSY) => {
             release_busy(&client, &config, &lease).await?;
@@ -863,14 +871,18 @@ async fn renew_lease(
     pid: u32,
 ) -> Result<Renewal> {
     match client.heartbeat(lease, lease_duration).await {
-        Ok(HeartbeatOutcome::Renewed { cancel_requested_at }) => {
+        Ok(HeartbeatOutcome::Renewed {
+            cancel_requested_at,
+        }) => {
             if let Err(error) = client
                 .worker_heartbeat(&lease.worker_id, &lease.boot_id)
                 .await
             {
                 warn!(%error, "workload worker heartbeat failed");
             }
-            Ok(Renewal::Renewed { cancel_requested_at })
+            Ok(Renewal::Renewed {
+                cancel_requested_at,
+            })
         }
         Ok(HeartbeatOutcome::Fenced) => {
             signal_group(pid, libc::SIGKILL);
@@ -1314,7 +1326,10 @@ mod tests {
             .spawn()
             .expect("spawn a group member");
         let pid = child.id().expect("child pid");
-        assert!(wait_for_zombie(pid).await, "the member never became a zombie");
+        assert!(
+            wait_for_zombie(pid).await,
+            "the member never became a zombie"
+        );
 
         assert!(
             !group_gone(pid),

@@ -564,7 +564,8 @@ mod tests {
     #[test]
     fn an_artifact_symlink_is_rejected() {
         let (staging, mut document) = staging_fixture();
-        let outside = std::env::temp_dir().join(format!("infernix-outside-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("infernix-outside-{}", uuid::Uuid::new_v4()));
         std::fs::write(&outside, b"outside").unwrap();
         let link = staging.join("out/link.wav");
         std::os::unix::fs::symlink(&outside, &link).unwrap();

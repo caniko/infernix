@@ -28,7 +28,7 @@ use tokio::{
     io::AsyncWriteExt,
     process::Command,
     task::JoinSet,
-    time::{Instant, interval, sleep},
+    time::{Instant, interval, sleep, sleep_until},
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -49,8 +49,17 @@ const EXIT_BACKEND_MISMATCH: i32 = 13;
 const EXIT_INVALID_INPUT: i32 = 14;
 const EXIT_CANCELLED: i32 = 15;
 
+/// How long a cancelled adapter group may take to disappear after SIGKILL.
+const GROUP_KILL_WAIT: StdDuration = StdDuration::from_secs(10);
+
+/// Upper bound on the retained-delivery retry backoff.
+const MAX_DELIVERY_BACKOFF: StdDuration = StdDuration::from_secs(600);
+
 const DELIVERY_STAGING_LOST: &str = "staging_lost";
 const DELIVERY_METADATA_MISSING: &str = "delivery_metadata_missing";
+
+/// The requirement that binds a job to the adapter serving its model profile.
+const PROFILE_REQUIREMENT_PREFIX: &str = "profile:";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -126,6 +135,9 @@ struct WorkerConfig {
     boot_id: Option<String>,
     #[serde(default)]
     capabilities: BTreeSet<String>,
+    /// GPU device id (`gpu:<host>-<card>`) this worker advertises.
+    #[serde(default)]
+    gpu_device: Option<String>,
     #[serde(default = "default_concurrency")]
     concurrency: usize,
     #[serde(default = "default_lease_duration_secs")]
@@ -134,6 +146,9 @@ struct WorkerConfig {
     heartbeat_interval_secs: u64,
     #[serde(default = "default_poll_interval_secs")]
     poll_interval_secs: u64,
+    /// Base delay between retained-delivery recovery passes.
+    #[serde(default = "default_delivery_retry_secs")]
+    delivery_retry_secs: u64,
     #[serde(default = "default_staging_root")]
     staging_root: PathBuf,
     /// Grace between SIGTERM and SIGKILL of the adapter process group.
@@ -157,6 +172,9 @@ struct WorkerConfig {
 struct AdapterConfig {
     workload: String,
     queues: BTreeSet<String>,
+    /// Profile ids (`profile:<id>` job requirements) this adapter can serve.
+    #[serde(default)]
+    profiles: BTreeSet<String>,
     command: PathBuf,
     #[serde(default)]
     args: Vec<String>,
@@ -204,6 +222,10 @@ fn default_heartbeat_interval_secs() -> u64 {
 
 fn default_poll_interval_secs() -> u64 {
     5
+}
+
+fn default_delivery_retry_secs() -> u64 {
+    30
 }
 
 fn default_staging_root() -> PathBuf {
@@ -274,12 +296,31 @@ fn validate_config(config: &Config) -> Result<()> {
     if config.worker.max_busy_releases == 0 {
         bail!("worker.max_busy_releases must be greater than zero")
     }
+    if config.worker.delivery_retry_secs == 0 {
+        bail!("worker.delivery_retry_secs must be greater than zero")
+    }
     if config.adapters.iter().any(|adapter| {
         adapter.workload.trim().is_empty()
             || adapter.queues.is_empty()
             || adapter.command.as_os_str().is_empty()
     }) {
         bail!("each adapter needs a workload, at least one queue, and a command")
+    }
+    // Selection is by (workload, queue, profile); a duplicate would silently
+    // fall back to configuration order.
+    let mut served = BTreeSet::new();
+    for adapter in &config.adapters {
+        for queue in &adapter.queues {
+            for profile in &adapter.profiles {
+                if !served.insert((adapter.workload.clone(), queue.clone(), profile.clone())) {
+                    bail!(
+                        "adapter {}:{} is configured twice for profile {profile}",
+                        adapter.workload,
+                        queue
+                    )
+                }
+            }
+        }
     }
     for profile in &config.profiles {
         profile
@@ -310,12 +351,30 @@ async fn migrate(client: &WorkloadClient) -> Result<()> {
     Ok(())
 }
 
+/// The capabilities a claim is matched against: the configured labels, the
+/// GPU device this worker owns, and one `profile:<id>` per adapter profile.
+fn worker_capabilities(config: &Config) -> BTreeSet<String> {
+    let mut capabilities = config.worker.capabilities.clone();
+    if let Some(device) = &config.worker.gpu_device {
+        capabilities.insert(format!("gpu:{device}"));
+    }
+    for adapter in &config.adapters {
+        capabilities.extend(
+            adapter
+                .profiles
+                .iter()
+                .map(|profile| format!("{PROFILE_REQUIREMENT_PREFIX}{profile}")),
+        );
+    }
+    capabilities
+}
+
 fn worker_profile(config: &Config, boot_id: &str) -> Result<WorkerProfile> {
     Ok(WorkerProfile {
         id: WorkerId::new(config.worker.id.clone())
             .map_err(|error| anyhow!("invalid worker id: {error}"))?,
         boot_id: boot_id.to_owned(),
-        capabilities: config.worker.capabilities.clone(),
+        capabilities: worker_capabilities(config),
         concurrency: config.worker.concurrency,
         drained: false,
     })
@@ -405,10 +464,16 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
         .await
         .context("register workload worker")?;
 
-    // Finish delivery for jobs this worker completed before the restart.
-    if let Err(error) = finish_pending_deliveries(&client, &config, &worker.id).await {
-        warn!(%error, "delivery recovery pass did not complete");
+    // Finish delivery for jobs this worker completed before the restart, and
+    // keep retrying retained deliveries while the worker runs.
+    let retry = StdDuration::from_secs(config.worker.delivery_retry_secs);
+    let mut delivery_backoff = retry;
+    match finish_pending_deliveries(&client, &config, &worker.id).await {
+        Ok(0) => {}
+        Ok(failures) => warn!(failures, "delivery recovery left jobs undelivered"),
+        Err(error) => warn!(%error, "delivery recovery pass did not complete"),
     }
+    let mut delivery_due = Instant::now() + delivery_backoff;
 
     let mut tasks = JoinSet::new();
     let poll = StdDuration::from_secs(config.worker.poll_interval_secs);
@@ -453,6 +518,21 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
                 }
             }
             _ = sleep(poll) => {}
+            _ = sleep_until(delivery_due) => {
+                let failures = match finish_pending_deliveries(&client, &config, &worker.id).await {
+                    Ok(failures) => failures,
+                    Err(error) => {
+                        warn!(%error, "delivery recovery pass did not complete");
+                        1
+                    }
+                };
+                delivery_backoff = if failures == 0 {
+                    retry
+                } else {
+                    (delivery_backoff * 2).min(MAX_DELIVERY_BACKOFF)
+                };
+                delivery_due = Instant::now() + delivery_backoff;
+            }
         }
     }
 }
@@ -476,12 +556,7 @@ async fn claim(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let capabilities = config
-        .worker
-        .capabilities
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let capabilities = worker.capabilities.iter().cloned().collect::<Vec<_>>();
     let claimed = client
         .claim(
             &worker.id,
@@ -495,11 +570,28 @@ async fn claim(
     Ok(claimed)
 }
 
-fn adapter_for<'a>(config: &'a Config, workload: &str, queue: &str) -> Option<&'a AdapterConfig> {
-    config
-        .adapters
+/// The single `profile:<id>` requirement a job carries, if any.
+fn job_profile(requirements: &BTreeSet<String>) -> Option<&str> {
+    let mut profiles = requirements
         .iter()
-        .find(|adapter| adapter.workload == workload && adapter.queues.contains(queue))
+        .filter_map(|requirement| requirement.strip_prefix(PROFILE_REQUIREMENT_PREFIX));
+    let profile = profiles.next()?;
+    profiles.next().is_none().then_some(profile)
+}
+
+/// The adapter that serves this job: workload, queue, and the job's profile.
+fn adapter_for<'a>(
+    config: &'a Config,
+    workload: &str,
+    queue: &str,
+    profile: Option<&str>,
+) -> Option<&'a AdapterConfig> {
+    let profile = profile?;
+    config.adapters.iter().find(|adapter| {
+        adapter.workload == workload
+            && adapter.queues.contains(queue)
+            && adapter.profiles.contains(profile)
+    })
 }
 
 fn staging_directory(config: &Config, job_id: &JobId, attempt: u32) -> PathBuf {
@@ -534,10 +626,24 @@ struct AdapterRun {
 }
 
 async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) -> Result<()> {
-    let adapter = adapter_for(&config, &job.workload, &job.queue)
-        .ok_or_else(|| anyhow!("no adapter for {}:{}", job.workload, job.queue))?
-        .clone();
     let lease = job.lease.clone();
+    // The job's `profile:<id>` requirement, not adapter order, selects the
+    // adapter. A job no configured adapter serves is invalid input.
+    let Some(adapter) = adapter_for(
+        &config,
+        &job.workload,
+        &job.queue,
+        job_profile(&job.requirements),
+    )
+    .cloned() else {
+        warn!(
+            job = %lease.job_id.as_str(),
+            workload = %job.workload,
+            queue = %job.queue,
+            "no configured adapter serves this job's profile"
+        );
+        return fail(&client, &lease, "invalid_input").await;
+    };
     let staging = staging_directory(&config, &lease.job_id, lease.attempt);
     let output_directory = staging.join("out");
     let cancel_path = staging.join("CANCEL");
@@ -671,6 +777,7 @@ async fn run_adapter(
     heartbeat.tick().await; // the first tick resolves immediately
     let mut cancel_ticker = interval(StdDuration::from_millis(250));
     let mut cancel_deadline: Option<Instant> = None;
+    let mut killed = false;
     let mut cancel_requested = false;
 
     let mut wait = Box::pin(child.wait_with_output());
@@ -710,23 +817,68 @@ async fn run_adapter(
                     }
                 }
             }
-            _ = cancel_ticker.tick(), if cancel_deadline.is_some() => {
+            _ = cancel_ticker.tick(), if cancel_deadline.is_some() && !killed => {
                 if cancel_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     warn!(
                         job = %lease.job_id.as_str(),
                         "adapter ignored SIGTERM; killing the process group"
                     );
                     signal_group(pid, libc::SIGKILL);
-                    cancel_deadline = None;
+                    killed = true;
                 }
             }
         }
     };
 
+    if cancel_requested {
+        // A descendant may outlive the group leader, so cancellation is only
+        // confirmed once the whole process group is gone.
+        terminate_group(pid, cancel_deadline, killed).await;
+    }
+
     Ok(AdapterRun {
         output,
         cancel_requested,
     })
+}
+
+/// Wait for the adapter's process group to empty, escalating to SIGKILL after
+/// the SIGTERM deadline. Confirmation happens only once no member remains.
+async fn terminate_group(pid: u32, term_deadline: Option<Instant>, killed: bool) {
+    let poll = StdDuration::from_millis(50);
+    if !killed {
+        if let Some(deadline) = term_deadline {
+            while !group_gone(pid) && Instant::now() < deadline {
+                sleep(poll).await;
+            }
+        }
+    }
+    if !group_gone(pid) {
+        signal_group(pid, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + GROUP_KILL_WAIT;
+    while !group_gone(pid) && Instant::now() < deadline {
+        sleep(poll).await;
+    }
+    if !group_gone(pid) {
+        warn!(
+            pid,
+            "adapter process group still has members after SIGKILL; confirming anyway"
+        );
+    }
+}
+
+/// True when no process remains in the adapter's process group.
+fn group_gone(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    // SAFETY: signal 0 only tests for existence, and the negative pid is the
+    // adapter's process group (it was spawned with `process_group(0)`).
+    if unsafe { libc::kill(-(pid as i32), 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 async fn release_busy(
@@ -821,6 +973,15 @@ async fn finish_success(
     };
 
     if !client.complete(lease, &stored).await? {
+        // A requested cancellation refuses completion, so the worker confirms
+        // the cancellation instead and uploads nothing.
+        if client.confirm_cancelled(lease).await? {
+            info!(
+                job = %lease.job_id.as_str(),
+                "cancellation confirmed instead of completion"
+            );
+            return Ok(());
+        }
         // Another attempt won the lease; its result is the only one uploaded.
         warn!(
             job = %lease.job_id.as_str(),
@@ -916,20 +1077,23 @@ fn remove_staging(staging: &Path) {
 }
 
 /// Deliver jobs this worker completed but did not upload, from retained
-/// staging. Missing staging fails the job as `staging_lost`.
+/// staging. Missing staging fails the job as `staging_lost`. Returns the number
+/// of jobs still undelivered.
 async fn finish_pending_deliveries(
     client: &WorkloadClient,
     config: &Config,
     worker: &WorkerId,
-) -> Result<()> {
+) -> Result<usize> {
     let pending = client.undelivered_succeeded(worker).await?;
     if pending.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     info!(jobs = pending.len(), "finishing interrupted deliveries");
     let http = delivery::http_client()?;
+    let mut failures = 0;
     for status in pending {
         if let Err(error) = finish_one_delivery(client, config, worker, &http, &status).await {
+            failures += 1;
             warn!(
                 job = %status.job_id.as_str(),
                 %error,
@@ -937,7 +1101,7 @@ async fn finish_pending_deliveries(
             );
         }
     }
-    Ok(())
+    Ok(failures)
 }
 
 async fn finish_one_delivery(
@@ -949,16 +1113,15 @@ async fn finish_one_delivery(
 ) -> Result<()> {
     let job_id = status.job_id.clone();
     let staging = staging_directory(config, &job_id, status.attempts);
-    let Some(adapter) = adapter_for(config, &status.workload, &status.queue) else {
-        bail!("no adapter for {}:{}", status.workload, status.queue);
-    };
     let Some(stored) = status.result.clone() else {
         client
             .mark_delivery_failed(&job_id, worker, DELIVERY_STAGING_LOST)
             .await?;
         return Ok(());
     };
-    if !adapter.artifacts {
+    // Only a validated adapter result carries artifacts; anything else was
+    // completed without uploads.
+    if stored.get("artifacts").is_none() {
         client.mark_delivered(&job_id, worker).await?;
         remove_staging(&staging);
         return Ok(());

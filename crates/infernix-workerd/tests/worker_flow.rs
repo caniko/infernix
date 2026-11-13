@@ -8,7 +8,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -48,28 +51,47 @@ impl StubHub {
     /// Artifacts whose `x-artifact-source` is listed answer `409 Conflict`,
     /// which the worker must treat as an accepted replay.
     async fn start(replay_sources: &[&str]) -> Self {
+        Self::start_with_failures(0, replay_sources).await
+    }
+
+    /// The first `fail_first` uploads answer `503`, as a transient hub outage.
+    async fn start_with_failures(fail_first: usize, replay_sources: &[&str]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let failures = Arc::new(AtomicUsize::new(fail_first));
         let replay = replay_sources
             .iter()
             .map(|source| (*source).to_owned())
             .collect::<Vec<_>>();
         let captured = Arc::clone(&requests);
+        let failing = Arc::clone(&failures);
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 let captured = Arc::clone(&captured);
+                let failing = Arc::clone(&failing);
                 let replay = replay.clone();
                 tokio::spawn(async move {
                     let Some((head, body)) = read_request(&mut socket).await else {
                         return;
                     };
                     let request = parse_request(&head, body);
+                    let failed = failing
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok();
                     let replayed = request
                         .headers
                         .get("x-artifact-source")
                         .is_some_and(|source| replay.contains(source));
-                    let status = if replayed { "409 Conflict" } else { "200 OK" };
+                    let status = if failed {
+                        "503 Service Unavailable"
+                    } else if replayed {
+                        "409 Conflict"
+                    } else {
+                        "200 OK"
+                    };
                     let response = format!(
                         "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                     );
@@ -199,6 +221,30 @@ impl Fixture {
 
     /// Write the worker config. `adapter` is the script path.
     fn write_config(&self, adapter: &Path) -> PathBuf {
+        self.write_config_for(&[("fixture-rocm", adapter)])
+    }
+
+    /// One adapter per `(profile id, script)` pair, all on animation:asset.
+    fn write_config_for(&self, adapters: &[(&str, &Path)]) -> PathBuf {
+        let blocks = adapters
+            .iter()
+            .map(|(profile, adapter)| {
+                format!(
+                    r#"
+[[adapters]]
+workload = "animation"
+queues = ["asset"]
+profiles = ["{profile}"]
+command = "{adapter}"
+artifacts = true
+environment = {{ INFX_COPIES = "{copies}" }}
+"#,
+                    profile = profile,
+                    adapter = adapter.display(),
+                    copies = self.copies.display(),
+                )
+            })
+            .collect::<String>();
         let config = format!(
             r#"
 database_url_env = "INFERNIX_WORKLOAD_DATABASE_URL"
@@ -207,25 +253,19 @@ database_url_env = "INFERNIX_WORKLOAD_DATABASE_URL"
 id = "atlas"
 boot_id = "boot-test"
 capabilities = ["gpu:test"]
+gpu_device = "test"
 concurrency = 1
 lease_duration_secs = 10
 heartbeat_interval_secs = 1
 poll_interval_secs = 1
+delivery_retry_secs = 1
 staging_root = "{staging}"
 cancel_grace_secs = 2
 max_busy_releases = 30
 busy_retry_delay_secs = 0
-
-[[adapters]]
-workload = "animation"
-queues = ["asset"]
-command = "{adapter}"
-artifacts = true
-environment = {{ INFX_COPIES = "{copies}" }}
-"#,
+{blocks}"#,
             staging = self.staging_root.display(),
-            adapter = adapter.display(),
-            copies = self.copies.display(),
+            blocks = blocks,
         );
         let path = self.directory.join("workerd.toml");
         std::fs::write(&path, config).unwrap();
@@ -369,7 +409,9 @@ fn job(id: &str) -> JobSpec {
             "seed": 0,
         }),
         priority: 0,
-        requirements: ["gpu:test".to_owned()].into_iter().collect(),
+        requirements: ["gpu:test".to_owned(), "profile:fixture-rocm".to_owned()]
+            .into_iter()
+            .collect(),
         max_attempts: 3,
     }
 }
@@ -406,6 +448,31 @@ while :; do
   sleep 0.1
 done
 "#;
+
+/// A descendant that ignores SIGTERM, so only a group-wide SIGKILL ends it.
+const STUBBORN_DESCENDANT_ADAPTER: &str = r#"#!/bin/sh
+set -eu
+staging="$INFERNIX_WORKLOAD_STAGING_DIRECTORY"
+trap 'exit 15' TERM
+cat > /dev/null
+sh -c 'trap "" TERM; while :; do sleep 0.2; done' &
+printf '%s' "$!" > "$staging/child.pid"
+while :; do
+  sleep 0.1
+done
+"#;
+
+/// Records that this adapter ran, then releases the job as busy.
+fn marker_adapter(marker: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+set -eu
+cat > /dev/null
+printf 'ran' > "$INFX_COPIES/{marker}"
+exit 10
+"#
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -506,6 +573,162 @@ async fn success_uploads_declared_artifacts_and_marks_delivered() {
     );
     // Staging is deleted only after delivery.
     assert!(!fixture.staging_root.join("job-success").exists());
+}
+
+#[tokio::test]
+async fn the_job_profile_selects_the_adapter() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("profiles", cluster.connection_string(&database));
+    // FLUX is configured first, so adapter order alone would pick it.
+    let flux = fixture.write_adapter("flux.sh", &marker_adapter("flux-ran"));
+    let sam = fixture.write_adapter("sam.sh", &marker_adapter("sam-ran"));
+    let config = fixture.write_config_for(&[("flux-rocm", &flux), ("sam-rocm", &sam)]);
+
+    let mut spec = job("job-profile");
+    spec.requirements = ["gpu:test".to_owned(), "profile:sam-rocm".to_owned()]
+        .into_iter()
+        .collect();
+    client.enqueue(&spec).await.unwrap();
+
+    fixture.run_once(&config).await;
+
+    assert!(
+        fixture.copies.join("sam-ran").is_file(),
+        "the adapter named by the job's profile must run"
+    );
+    assert!(
+        !fixture.copies.join("flux-ran").exists(),
+        "the first configured adapter must not serve another profile's job"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_adapter_profiles_are_rejected() {
+    let cluster = TestCluster::start();
+    let (database, _client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("duplicate", cluster.connection_string(&database));
+    let first = fixture.write_adapter("first.sh", &marker_adapter("first"));
+    let second = fixture.write_adapter("second.sh", &marker_adapter("second"));
+    let config = fixture.write_config_for(&[("sam-rocm", &first), ("sam-rocm", &second)]);
+
+    let output = fixture
+        .command(&config)
+        .arg("worker")
+        .arg("--once")
+        .output()
+        .await
+        .expect("run infernix-workerd");
+    assert!(
+        !output.status.success(),
+        "the ambiguous config must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("configured twice for profile sam-rocm"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn a_job_without_a_served_profile_fails_invalid_input() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("unserved", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", &marker_adapter("ran"));
+    let config = fixture.write_config(&adapter);
+
+    let mut spec = job("job-unserved");
+    // No profile requirement: the worker can claim it but no adapter serves it.
+    spec.requirements = ["gpu:test".to_owned()].into_iter().collect();
+    spec.max_attempts = 1;
+    client.enqueue(&spec).await.unwrap();
+
+    fixture.run_once(&config).await;
+
+    let status = client.status(&spec.id).await.unwrap().unwrap();
+    assert_eq!(status.state, JobState::Failed);
+    assert_eq!(status.error.as_deref(), Some("invalid_input"));
+    assert!(
+        !fixture.copies.join("ran").exists(),
+        "no adapter may run for a job it does not serve"
+    );
+}
+
+#[tokio::test]
+async fn cancel_kills_a_term_ignoring_descendant_before_confirming() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("stubborn", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", STUBBORN_DESCENDANT_ADAPTER);
+    let config = fixture.write_config(&adapter);
+
+    let spec = job("job-stubborn");
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+
+    let staging = fixture.staging_root.join("job-stubborn/1");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !staging.join("child.pid").is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the adapter never recorded its descendant"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    let pid = std::fs::read_to_string(staging.join("child.pid")).unwrap();
+    let pid: i32 = pid.trim().parse().expect("child pid");
+
+    fixture.cancel(&config, spec.id.as_str()).await;
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Cancelled)
+        .await;
+
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "cancellation must not be confirmed while a descendant still runs"
+    );
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn a_transient_hub_failure_is_retried_until_delivered() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("retry", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", SUCCESS_ADAPTER);
+    let config = fixture.write_config(&adapter);
+    let hub = StubHub::start_with_failures(1, &[]).await;
+
+    let mut spec = job("job-retry");
+    spec.payload["hubUrl"] = json!(hub.base_url());
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    let status = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(status) = client.status(&spec.id).await.unwrap() {
+                if status.delivered_at.is_some() {
+                    return status;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the retained delivery is retried until it succeeds");
+
+    assert_eq!(status.state, JobState::Succeeded);
+    assert!(status.delivered_at.is_some());
+    assert!(
+        hub.requests().len() >= 2,
+        "the 503 must be followed by a successful retry"
+    );
+    worker.stop().await;
 }
 
 #[tokio::test]

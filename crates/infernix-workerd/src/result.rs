@@ -1,0 +1,335 @@
+//! Adapter result validation (envelope v2, spec section 2).
+//!
+//! The worker trusts nothing an adapter prints. Every artifact must exist,
+//! stay inside the attempt staging directory, match its declared sha256 and
+//! size, and stay under the per-artifact cap. A rejected result fails the job
+//! with a stable, adapter-independent reason code.
+
+use std::{
+    path::{Component, Path, PathBuf},
+    str::FromStr,
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+/// Per-artifact cap from the plan: 256 MiB.
+pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The one JSON object an adapter prints on exit 0.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterResult {
+    pub artifacts: Vec<Artifact>,
+    #[serde(default)]
+    pub content_fingerprint: Option<String>,
+    #[serde(default)]
+    pub cache_hit: bool,
+    #[serde(default)]
+    pub telemetry: Option<Value>,
+    #[serde(default)]
+    pub validation: Option<Value>,
+}
+
+/// One artifact as declared by the adapter. `path` is relative to the attempt
+/// staging directory.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artifact {
+    pub source: String,
+    pub path: PathBuf,
+    pub sha256: String,
+    pub mime: String,
+    pub size: u64,
+}
+
+/// An artifact whose declared metadata was checked against the file on disk.
+#[derive(Clone, Debug)]
+pub struct ValidatedArtifact {
+    pub source: String,
+    pub path: PathBuf,
+    pub sha256: String,
+    pub mime: String,
+}
+
+/// A validated adapter result plus the raw JSON stored in the ledger.
+#[derive(Clone, Debug)]
+pub struct ValidatedResult {
+    pub value: Value,
+    pub artifacts: Vec<ValidatedArtifact>,
+}
+
+impl ValidatedResult {
+    /// Attach the hub coordinates the restart delivery pass needs.
+    pub fn with_delivery(mut self, hub_url: &str, generation_request_id: &str) -> Self {
+        if let Some(object) = self.value.as_object_mut() {
+            object.insert(
+                "delivery".to_owned(),
+                serde_json::json!({
+                    "hubUrl": hub_url,
+                    "generationRequestId": generation_request_id,
+                }),
+            );
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationError {
+    NotJson,
+    InvalidSource,
+    DuplicateSource,
+    InvalidDigest,
+    EmptyMime,
+    PathEscapesStaging,
+    MissingFile,
+    Unreadable,
+    SizeMismatch,
+    TooLarge,
+    HashMismatch,
+}
+
+impl ValidationError {
+    /// Stable, adapter-independent code stored in the job error.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotJson => "not_json",
+            Self::InvalidSource => "artifact_source",
+            Self::DuplicateSource => "artifact_source_duplicate",
+            Self::InvalidDigest => "artifact_digest",
+            Self::EmptyMime => "artifact_mime",
+            Self::PathEscapesStaging => "artifact_path",
+            Self::MissingFile => "artifact_missing",
+            Self::Unreadable => "artifact_unreadable",
+            Self::SizeMismatch => "artifact_size",
+            Self::TooLarge => "artifact_too_large",
+            Self::HashMismatch => "artifact_hash",
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+/// Parse and validate the adapter's stdout against the attempt staging
+/// directory. `staging` must already exist.
+pub fn validate_result(
+    stdout: &[u8],
+    staging: &Path,
+) -> std::result::Result<ValidatedResult, ValidationError> {
+    let value: Value = serde_json::from_slice(stdout).map_err(|_| ValidationError::NotJson)?;
+    let result: AdapterResult =
+        serde_json::from_value(value.clone()).map_err(|_| ValidationError::NotJson)?;
+
+    let canonical_staging = staging
+        .canonicalize()
+        .map_err(|_| ValidationError::MissingFile)?;
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut artifacts = Vec::with_capacity(result.artifacts.len());
+    for artifact in &result.artifacts {
+        if !valid_source(&artifact.source) {
+            return Err(ValidationError::InvalidSource);
+        }
+        if !seen.insert(artifact.source.clone()) {
+            return Err(ValidationError::DuplicateSource);
+        }
+        if !valid_sha256(&artifact.sha256) {
+            return Err(ValidationError::InvalidDigest);
+        }
+        if artifact.mime.trim().is_empty() || artifact.mime.len() > 255 {
+            return Err(ValidationError::EmptyMime);
+        }
+        if artifact.size > MAX_ARTIFACT_BYTES {
+            return Err(ValidationError::TooLarge);
+        }
+        let path = resolve_in_staging(&canonical_staging, &artifact.path)?;
+        let metadata = std::fs::metadata(&path).map_err(|_| ValidationError::MissingFile)?;
+        if !metadata.is_file() {
+            return Err(ValidationError::MissingFile);
+        }
+        if metadata.len() != artifact.size {
+            return Err(ValidationError::SizeMismatch);
+        }
+        let digest = sha256_file(&path)?;
+        if digest != artifact.sha256.to_ascii_lowercase() {
+            return Err(ValidationError::HashMismatch);
+        }
+        artifacts.push(ValidatedArtifact {
+            source: artifact.source.clone(),
+            path,
+            sha256: digest,
+            mime: artifact.mime.clone(),
+        });
+    }
+
+    Ok(ValidatedResult { value, artifacts })
+}
+
+/// Re-validate artifacts that were already accepted, from retained staging.
+pub fn retained_artifacts(
+    result: &Value,
+    staging: &Path,
+) -> std::result::Result<Vec<ValidatedArtifact>, ValidationError> {
+    let parsed: AdapterResult =
+        serde_json::from_value(result.clone()).map_err(|_| ValidationError::NotJson)?;
+    let canonical_staging = staging
+        .canonicalize()
+        .map_err(|_| ValidationError::MissingFile)?;
+    let mut artifacts = Vec::new();
+    for artifact in &parsed.artifacts {
+        if !valid_source(&artifact.source)
+            || !valid_sha256(&artifact.sha256)
+            || artifact.size > MAX_ARTIFACT_BYTES
+        {
+            return Err(ValidationError::InvalidDigest);
+        }
+        let path = resolve_in_staging(&canonical_staging, &artifact.path)?;
+        let metadata = std::fs::metadata(&path).map_err(|_| ValidationError::MissingFile)?;
+        if metadata.len() != artifact.size {
+            return Err(ValidationError::SizeMismatch);
+        }
+        let digest = sha256_file(&path)?;
+        if digest != artifact.sha256.to_ascii_lowercase() {
+            return Err(ValidationError::HashMismatch);
+        }
+        artifacts.push(ValidatedArtifact {
+            source: artifact.source.clone(),
+            path,
+            sha256: digest,
+            mime: artifact.mime.clone(),
+        });
+    }
+    Ok(artifacts)
+}
+
+/// `[a-z0-9][a-z0-9_.-]{0,62}` from spec section 2.
+fn valid_source(source: &str) -> bool {
+    let mut characters = source.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    let rest = characters.as_str();
+    rest.len() <= 62
+        && rest.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '.' | '-')
+        })
+}
+
+fn valid_sha256(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character))
+}
+
+/// Reject absolute paths, parent traversal, and any symlink escape before the
+/// resolved path is compared with the canonical staging directory.
+fn resolve_in_staging(
+    staging: &Path,
+    relative: &Path,
+) -> std::result::Result<PathBuf, ValidationError> {
+    if relative.as_os_str().is_empty() {
+        return Err(ValidationError::PathEscapesStaging);
+    }
+    let mut depth: i32 = 0;
+    for component in relative.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 1 {
+                    return Err(ValidationError::PathEscapesStaging);
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(ValidationError::PathEscapesStaging);
+            }
+        }
+    }
+    let candidate = staging.join(relative);
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|_| ValidationError::MissingFile)?;
+    if !resolved.starts_with(staging) {
+        return Err(ValidationError::PathEscapesStaging);
+    }
+    Ok(resolved)
+}
+
+pub fn sha256_file(path: &Path) -> std::result::Result<String, ValidationError> {
+    let bytes = std::fs::read(path).map_err(|_| ValidationError::Unreadable)?;
+    Ok(sha256_bytes(&bytes))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Reject a generation id that would change the upload URL.
+pub fn valid_generation_request_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        && uuid::Uuid::from_str(id).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_grammar_matches_the_contract() {
+        assert!(valid_source("audio"));
+        assert!(valid_source("line.01-final"));
+        assert!(!valid_source(""));
+        assert!(!valid_source("Audio"));
+        assert!(!valid_source("-audio"));
+        assert!(!valid_source("a/b"));
+        assert!(valid_source(&"a".repeat(63)));
+        assert!(!valid_source(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn generation_ids_must_be_uuid_shaped() {
+        assert!(valid_generation_request_id(
+            "0b6f9a52-4e0a-4b6e-9a1e-7f2b1f0a2c33"
+        ));
+        assert!(!valid_generation_request_id("../escape"));
+        assert!(!valid_generation_request_id(""));
+    }
+
+    #[test]
+    fn traversal_and_absolute_paths_do_not_resolve() {
+        let staging = std::env::temp_dir();
+        assert_eq!(
+            resolve_in_staging(&staging, Path::new("../etc/passwd")).unwrap_err(),
+            ValidationError::PathEscapesStaging
+        );
+        assert_eq!(
+            resolve_in_staging(&staging, Path::new("/etc/passwd")).unwrap_err(),
+            ValidationError::PathEscapesStaging
+        );
+    }
+}

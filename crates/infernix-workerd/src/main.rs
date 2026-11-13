@@ -1,17 +1,26 @@
+//! Fenced Infernix workload worker.
+//!
+//! One process claims jobs from the durable ledger, hands an envelope v2 to an
+//! adapter, watches its lease and the cancel flag, validates the adapter's
+//! result, and delivers staged artifacts to the hub only after the fenced
+//! completion was accepted.
+
+mod delivery;
+mod result;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-    process::Stdio,
-    sync::Arc,
+    path::{Path, PathBuf},
+    process::{Output, Stdio},
     time::Duration as StdDuration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use infernix_workload::{
-    JobId, Lease, LeaseToken, WorkerId, WorkloadProfile,
-    sql::{CLAIM, COMPLETE, HEARTBEAT, SCHEMA, WORKER_HEARTBEAT},
+    ClaimedJob, HeartbeatOutcome, InputFingerprint, JobId, JobSpec, JobState, JobStatus, WorkerId,
+    WorkerProfile, WorkloadProfile, postgres::WorkloadClient,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,11 +28,29 @@ use tokio::{
     io::AsyncWriteExt,
     process::Command,
     task::JoinSet,
-    time::{interval, sleep},
+    time::{Instant, interval, sleep},
 };
-use tokio_postgres::{Client, NoTls, Row};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+use crate::{
+    delivery::HubDelivery,
+    result::{ValidatedResult, validate_result},
+};
+
+/// Envelope protocol version (spec section 2).
+const PROTOCOL_VERSION: u32 = 2;
+
+/// Typed adapter exit codes (spec section 2).
+const EXIT_RESOURCE_BUSY: i32 = 10;
+const EXIT_GPU_UNAVAILABLE: i32 = 11;
+const EXIT_OOM: i32 = 12;
+const EXIT_BACKEND_MISMATCH: i32 = 13;
+const EXIT_INVALID_INPUT: i32 = 14;
+const EXIT_CANCELLED: i32 = 15;
+
+const DELIVERY_STAGING_LOST: &str = "staging_lost";
+const DELIVERY_METADATA_MISSING: &str = "delivery_metadata_missing";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,6 +78,16 @@ enum CommandKind {
     Drain,
     /// Enqueue one idempotent workload request.
     Enqueue(EnqueueArgs),
+    /// Print one job's ledger status as JSON.
+    Status {
+        #[arg(value_name = "JOB_ID")]
+        job_id: String,
+    },
+    /// Request cancellation and print the resulting ledger state as JSON.
+    Cancel {
+        #[arg(value_name = "JOB_ID")]
+        job_id: String,
+    },
 }
 
 #[derive(Debug, ClapArgs)]
@@ -99,6 +136,21 @@ struct WorkerConfig {
     poll_interval_secs: u64,
     #[serde(default = "default_staging_root")]
     staging_root: PathBuf,
+    /// Grace between SIGTERM and SIGKILL of the adapter process group.
+    #[serde(default = "default_cancel_grace_secs")]
+    cancel_grace_secs: u64,
+    /// Busy releases a job may spend before it fails as `resource_busy`.
+    #[serde(default = "default_max_busy_releases")]
+    max_busy_releases: u32,
+    /// `not_before` delay applied to a released busy job.
+    #[serde(default = "default_busy_retry_delay_secs")]
+    busy_retry_delay_secs: u64,
+    /// Environment variable naming the procedure-token file.
+    #[serde(default = "default_hub_token_file_env")]
+    hub_token_file_env: String,
+    /// Fallback hub base URL when the payload carries none.
+    #[serde(default)]
+    hub_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -112,8 +164,12 @@ struct AdapterConfig {
     working_directory: Option<PathBuf>,
     #[serde(default)]
     environment: BTreeMap<String, String>,
+    /// Validate a result manifest and deliver its artifacts.
+    #[serde(default)]
+    artifacts: bool,
 }
 
+/// Envelope v2: one JSON object on the adapter's stdin.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JobEnvelope {
@@ -121,16 +177,13 @@ struct JobEnvelope {
     workload: String,
     queue: String,
     job_id: JobId,
-    lease_token: LeaseToken,
+    lease_token: infernix_workload::LeaseToken,
     attempt: u32,
     input_fingerprint: String,
-    payload: Value,
     staging_directory: PathBuf,
-}
-
-struct ClaimedJob {
-    lease: Lease,
-    envelope: JobEnvelope,
+    output_directory: PathBuf,
+    cancel_path: PathBuf,
+    payload: Value,
 }
 
 fn default_database_url_env() -> String {
@@ -157,6 +210,22 @@ fn default_staging_root() -> PathBuf {
     PathBuf::from("/var/lib/infernix-workload/staging")
 }
 
+fn default_cancel_grace_secs() -> u64 {
+    30
+}
+
+fn default_max_busy_releases() -> u32 {
+    30
+}
+
+fn default_busy_retry_delay_secs() -> u64 {
+    30
+}
+
+fn default_hub_token_file_env() -> String {
+    delivery::DEFAULT_TOKEN_FILE_ENV.to_owned()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -173,6 +242,8 @@ async fn main() -> Result<()> {
         CommandKind::Worker { once } => run_worker(client, config, once).await,
         CommandKind::Drain => drain(&client, &config).await,
         CommandKind::Enqueue(args) => enqueue(&client, args).await,
+        CommandKind::Status { job_id } => status(&client, &job_id).await,
+        CommandKind::Cancel { job_id } => cancel(&client, &job_id).await,
     }
 }
 
@@ -197,6 +268,12 @@ fn validate_config(config: &Config) -> Result<()> {
     {
         bail!("worker.heartbeat_interval_secs must be less than lease_duration_secs")
     }
+    if config.worker.cancel_grace_secs == 0 {
+        bail!("worker.cancel_grace_secs must be greater than zero")
+    }
+    if config.worker.max_busy_releases == 0 {
+        bail!("worker.max_busy_releases must be greater than zero")
+    }
     if config.adapters.iter().any(|adapter| {
         adapter.workload.trim().is_empty()
             || adapter.queues.is_empty()
@@ -212,70 +289,43 @@ fn validate_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn connect(config: &Config) -> Result<Arc<Client>> {
+async fn connect(config: &Config) -> Result<WorkloadClient> {
     let url = std::env::var(&config.database_url_env).with_context(|| {
         format!(
             "read PostgreSQL URL from environment variable {}",
             config.database_url_env
         )
     })?;
-    let (client, connection) = tokio_postgres::connect(&url, NoTls)
+    WorkloadClient::connect(&url)
         .await
-        .context("connect to Infernix workload PostgreSQL")?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            error!(%error, "workload PostgreSQL connection failed");
-        }
-    });
-    Ok(Arc::new(client))
+        .context("connect to Infernix workload PostgreSQL")
 }
 
-async fn migrate(client: &Client) -> Result<()> {
+async fn migrate(client: &WorkloadClient) -> Result<()> {
     client
-        .batch_execute(SCHEMA)
+        .migrate()
         .await
         .context("apply Infernix workload schema")?;
     info!("Infernix workload schema is ready");
     Ok(())
 }
 
-async fn register_worker(client: &Client, config: &Config, boot_id: &str) -> Result<()> {
-    let worker = &config.worker;
-    let capabilities = worker.capabilities.iter().cloned().collect::<Vec<_>>();
-    client
-        .execute(
-            "INSERT INTO infernix_workload_workers
-                (id, boot_id, capabilities, concurrency, drained)
-             VALUES ($1, $2, $3, $4, FALSE)
-             ON CONFLICT (id, boot_id) DO UPDATE SET
-                capabilities = EXCLUDED.capabilities,
-                concurrency = EXCLUDED.concurrency,
-                drained = FALSE,
-                last_heartbeat = now()",
-            &[
-                &worker.id,
-                &boot_id,
-                &capabilities,
-                &(worker.concurrency as i32),
-            ],
-        )
-        .await
-        .context("register workload worker")?;
-    Ok(())
+fn worker_profile(config: &Config, boot_id: &str) -> Result<WorkerProfile> {
+    Ok(WorkerProfile {
+        id: WorkerId::new(config.worker.id.clone())
+            .map_err(|error| anyhow!("invalid worker id: {error}"))?,
+        boot_id: boot_id.to_owned(),
+        capabilities: config.worker.capabilities.clone(),
+        concurrency: config.worker.concurrency,
+        drained: false,
+    })
 }
 
-async fn drain(client: &Client, config: &Config) -> Result<()> {
+async fn drain(client: &WorkloadClient, config: &Config) -> Result<()> {
     let boot_id = resolve_boot_id(&config.worker)?;
-    let changed = client
-        .execute(
-            "UPDATE infernix_workload_workers
-                SET drained = TRUE, last_heartbeat = now()
-              WHERE id = $1 AND boot_id = $2",
-            &[&config.worker.id, &boot_id],
-        )
-        .await
-        .context("drain workload worker")?;
-    if changed == 0 {
+    let worker_id = WorkerId::new(config.worker.id.clone())
+        .map_err(|error| anyhow!("invalid worker id: {error}"))?;
+    if !client.drain_worker(&worker_id, &boot_id).await? {
         bail!(
             "worker {} is not registered for boot {boot_id}",
             config.worker.id
@@ -285,102 +335,122 @@ async fn drain(client: &Client, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn enqueue(client: &Client, args: EnqueueArgs) -> Result<()> {
+async fn enqueue(client: &WorkloadClient, args: EnqueueArgs) -> Result<()> {
     if args.workload.trim().is_empty() || args.queue.trim().is_empty() {
         bail!("workload and queue must not be empty")
-    }
-    if args.input_fingerprint.trim().is_empty() {
-        bail!("input-fingerprint must not be empty")
     }
     if args.max_attempts == 0 || args.max_attempts > i32::MAX as u32 {
         bail!("max-attempts must be between 1 and {}", i32::MAX)
     }
     let payload: Value = serde_json::from_str(&args.payload).context("parse enqueue payload")?;
-    let job_id = format!("{}-{}", args.workload, Uuid::new_v4());
-    let created = client
-        .query_opt(
-            "INSERT INTO infernix_workload_jobs
-                (id, workload, queue, input_fingerprint, payload, priority,
-                 requirements, max_attempts, state)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-             ON CONFLICT (workload, queue, input_fingerprint) DO NOTHING
-             RETURNING id",
-            &[
-                &job_id,
-                &args.workload,
-                &args.queue,
-                &args.input_fingerprint,
-                &payload,
-                &args.priority,
-                &args.requirements,
-                &(args.max_attempts as i32),
-            ],
-        )
-        .await
-        .context("enqueue workload")?;
-    let (id, was_created) = if let Some(row) = created {
-        (row.get::<_, String>("id"), true)
-    } else {
-        let row = client
-            .query_one(
-                "SELECT id FROM infernix_workload_jobs
-                  WHERE workload = $1 AND queue = $2 AND input_fingerprint = $3",
-                &[&args.workload, &args.queue, &args.input_fingerprint],
-            )
-            .await
-            .context("read existing workload after idempotent enqueue")?;
-        (row.get::<_, String>("id"), false)
+    let spec = JobSpec {
+        id: JobId::new(format!("{}-{}", args.workload, Uuid::new_v4()))?,
+        workload: args.workload,
+        queue: args.queue,
+        input_fingerprint: InputFingerprint::new(args.input_fingerprint)?,
+        payload,
+        priority: args.priority,
+        requirements: args.requirements.into_iter().collect(),
+        max_attempts: args.max_attempts,
+    };
+    let outcome = client.enqueue(&spec).await.context("enqueue workload")?;
+    let (job_id, created) = match outcome {
+        infernix_workload::EnqueueOutcome::Created(id) => (id, true),
+        infernix_workload::EnqueueOutcome::Existing(id) => (id, false),
     };
     println!(
         "{}",
-        serde_json::to_string(&json!({"jobId": id, "created": was_created}))?
+        serde_json::to_string(&json!({"jobId": job_id, "created": created}))?
     );
     Ok(())
 }
 
-async fn run_worker(client: Arc<Client>, config: Config, once: bool) -> Result<()> {
-    let boot_id = resolve_boot_id(&config.worker)?;
-    register_worker(&client, &config, &boot_id).await?;
+async fn status(client: &WorkloadClient, job_id: &str) -> Result<()> {
+    let job_id = JobId::new(job_id)?;
+    let status = client
+        .status(&job_id)
+        .await
+        .context("read workload status")?
+        .ok_or_else(|| anyhow!("job {} does not exist", job_id.as_str()))?;
+    println!("{}", serde_json::to_string_pretty(&status)?);
+    Ok(())
+}
 
-    let worker_id = WorkerId::new(config.worker.id.clone())
-        .map_err(|error| anyhow!("invalid worker id: {error}"))?;
+async fn cancel(client: &WorkloadClient, job_id: &str) -> Result<()> {
+    let job_id = JobId::new(job_id)?;
+    let outcome = client
+        .cancel(&job_id)
+        .await
+        .context("cancel workload")?
+        .ok_or_else(|| anyhow!("job {} does not exist", job_id.as_str()))?;
+    let deferred = outcome.state == JobState::Leased;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "jobId": job_id,
+            "previousState": outcome.previous_state,
+            "state": outcome.state,
+            "cancelRequestedAt": outcome.cancel_requested_at,
+            "deferred": deferred,
+        }))?
+    );
+    Ok(())
+}
+
+async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Result<()> {
+    let boot_id = resolve_boot_id(&config.worker)?;
+    let worker = worker_profile(&config, &boot_id)?;
+    client
+        .register_worker(&worker)
+        .await
+        .context("register workload worker")?;
+
+    // Finish delivery for jobs this worker completed before the restart.
+    if let Err(error) = finish_pending_deliveries(&client, &config, &worker.id).await {
+        warn!(%error, "delivery recovery pass did not complete");
+    }
+
     let mut tasks = JoinSet::new();
     let poll = StdDuration::from_secs(config.worker.poll_interval_secs);
 
     loop {
         while tasks.len() < config.worker.concurrency {
-            let Some(mut job) = claim(&client, &config, &worker_id, &boot_id).await? else {
+            let Some(job) = claim(&client, &config, &worker, &boot_id).await? else {
                 break;
             };
-            let staging_directory = config
-                .worker
-                .staging_root
-                .join(job.lease.job_id.as_str())
-                .join(job.lease.attempt.to_string());
-            std::fs::create_dir_all(&staging_directory).with_context(|| {
-                format!(
-                    "create workload staging directory {}",
-                    staging_directory.display()
-                )
-            })?;
-            job.envelope.staging_directory = staging_directory;
-            info!(job = %job.lease.job_id.as_str(), queue = %job.envelope.queue, "claimed workload");
+            info!(
+                job = %job.lease.job_id.as_str(),
+                queue = %job.queue,
+                attempt = job.lease.attempt,
+                "claimed workload"
+            );
             let client = client.clone();
             let config = config.clone();
-            let boot_id = boot_id.clone();
-            tasks.spawn(async move { execute_job(client, config, boot_id, job).await });
+            tasks.spawn(async move { execute_job(client, config, job).await });
         }
 
         if once {
             while let Some(result) = tasks.join_next().await {
-                result.context("workload task panicked")??;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => error!(%error, "workload task failed"),
+                    Err(error) => error!(%error, "workload task panicked"),
+                }
             }
             return Ok(());
         }
 
         tokio::select! {
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                result.context("workload task panicked")??;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        // Adapter stderr is untrusted and may contain
+                        // credentials or source data; log only our own chain.
+                        error!(%error, "workload task failed");
+                    }
+                    Err(error) => error!(%error, "workload task panicked"),
+                }
             }
             _ = sleep(poll) => {}
         }
@@ -388,13 +458,13 @@ async fn run_worker(client: Arc<Client>, config: Config, once: bool) -> Result<(
 }
 
 async fn claim(
-    client: &Client,
+    client: &WorkloadClient,
     config: &Config,
-    worker_id: &WorkerId,
+    worker: &WorkerProfile,
     boot_id: &str,
 ) -> Result<Option<ClaimedJob>> {
     // Claim only pairs an adapter can run, not the workload x queue product.
-    let (workloads, queues): (Vec<String>, Vec<String>) = config
+    let pairs = config
         .adapters
         .iter()
         .flat_map(|adapter| {
@@ -405,100 +475,159 @@ async fn claim(
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .unzip();
-    if workloads.is_empty() {
-        return Ok(None);
-    }
-
-    let token = LeaseToken::random();
-    let now = Utc::now();
-    let expires_at = now + Duration::seconds(config.worker.lease_duration_secs as i64);
+        .collect::<Vec<_>>();
     let capabilities = config
         .worker
         .capabilities
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-    let row = client
-        .query_opt(
-            CLAIM,
-            &[
-                &worker_id.as_str(),
-                &boot_id,
-                &capabilities,
-                &token.as_str(),
-                &expires_at,
-                &workloads,
-                &queues,
-            ],
+    let claimed = client
+        .claim(
+            &worker.id,
+            boot_id,
+            &capabilities,
+            &pairs,
+            Duration::seconds(config.worker.lease_duration_secs as i64),
         )
         .await
         .context("claim workload")?;
-    row.map(|row| row_to_claim(row, worker_id, boot_id, token, expires_at))
-        .transpose()
+    Ok(claimed)
 }
 
-fn row_to_claim(
-    row: Row,
-    worker_id: &WorkerId,
-    boot_id: &str,
-    token: LeaseToken,
-    expires_at: DateTime<Utc>,
-) -> Result<ClaimedJob> {
-    let job_id = JobId::new(row.get::<_, String>("id"))
-        .map_err(|error| anyhow!("invalid job id from database: {error}"))?;
-    let lease = Lease {
-        job_id: job_id.clone(),
-        worker_id: worker_id.clone(),
-        boot_id: boot_id.to_owned(),
-        token: token.clone(),
-        attempt: row.get("attempts"),
-        expires_at,
-    };
-    Ok(ClaimedJob {
-        lease,
-        envelope: JobEnvelope {
-            protocol_version: 1,
-            workload: row.get("workload"),
-            queue: row.get("queue"),
-            job_id,
-            lease_token: token,
-            attempt: row.get("attempts"),
-            input_fingerprint: row.get("input_fingerprint"),
-            payload: row.get("payload"),
-            staging_directory: PathBuf::new(),
-        },
-    })
-}
-
-async fn execute_job(
-    client: Arc<Client>,
-    config: Config,
-    boot_id: String,
-    job: ClaimedJob,
-) -> Result<()> {
-    let adapter = config
+fn adapter_for<'a>(config: &'a Config, workload: &str, queue: &str) -> Option<&'a AdapterConfig> {
+    config
         .adapters
         .iter()
-        .find(|adapter| {
-            adapter.workload == job.envelope.workload
-                && adapter.queues.contains(&job.envelope.queue)
-        })
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "no adapter for {}:{}",
-                job.envelope.workload,
-                job.envelope.queue
-            )
-        })?;
+        .find(|adapter| adapter.workload == workload && adapter.queues.contains(queue))
+}
 
+fn staging_directory(config: &Config, job_id: &JobId, attempt: u32) -> PathBuf {
+    config
+        .worker
+        .staging_root
+        .join(job_id.as_str())
+        .join(attempt.to_string())
+}
+
+fn signal_group(pid: u32, signal: i32) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: `pid` is the adapter's process-group leader (spawned with
+    // `process_group(0)`), so a negative pid signals the whole group. A
+    // failure (already exited) is not fatal here.
+    let result = unsafe { libc::kill(-(pid as i32), signal) };
+    if result != 0 {
+        warn!(
+            pid,
+            signal,
+            error = %std::io::Error::last_os_error(),
+            "failed to signal the adapter process group"
+        );
+    }
+}
+
+struct AdapterRun {
+    output: Output,
+    cancel_requested: bool,
+}
+
+async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) -> Result<()> {
+    let adapter = adapter_for(&config, &job.workload, &job.queue)
+        .ok_or_else(|| anyhow!("no adapter for {}:{}", job.workload, job.queue))?
+        .clone();
+    let lease = job.lease.clone();
+    let staging = staging_directory(&config, &lease.job_id, lease.attempt);
+    let output_directory = staging.join("out");
+    let cancel_path = staging.join("CANCEL");
+    std::fs::create_dir_all(&output_directory).with_context(|| {
+        format!(
+            "create workload staging directory {}",
+            output_directory.display()
+        )
+    })?;
+
+    let envelope = JobEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        workload: job.workload.clone(),
+        queue: job.queue.clone(),
+        job_id: lease.job_id.clone(),
+        lease_token: lease.token.clone(),
+        attempt: lease.attempt,
+        input_fingerprint: job.input_fingerprint.clone(),
+        staging_directory: staging.clone(),
+        output_directory: output_directory.clone(),
+        cancel_path: cancel_path.clone(),
+        payload: job.payload.clone(),
+    };
+
+    let run = run_adapter(&client, &config, &adapter, &lease, &envelope, &cancel_path).await?;
+
+    if run.cancel_requested {
+        if client.confirm_cancelled(&lease).await? {
+            info!(job = %lease.job_id.as_str(), "cancellation confirmed");
+        } else {
+            warn!(job = %lease.job_id.as_str(), "cancellation confirmation was fenced");
+        }
+        return Ok(());
+    }
+
+    let code = run.output.status.code();
+    match code {
+        Some(0) => {
+            finish_success(
+                &client,
+                &config,
+                &adapter,
+                &lease,
+                &staging,
+                &job.payload,
+                run.output,
+            )
+            .await
+        }
+        Some(EXIT_RESOURCE_BUSY) => {
+            release_busy(&client, &config, &lease).await?;
+            Ok(())
+        }
+        Some(EXIT_GPU_UNAVAILABLE) => fail(&client, &lease, "gpu_unavailable").await,
+        Some(EXIT_OOM) => fail(&client, &lease, "oom").await,
+        Some(EXIT_BACKEND_MISMATCH) => fail(&client, &lease, "backend_mismatch").await,
+        Some(EXIT_INVALID_INPUT) => fail(&client, &lease, "invalid_input").await,
+        Some(EXIT_CANCELLED) => {
+            if !client.confirm_cancelled(&lease).await? {
+                // The adapter cancelled without a ledger request: fail rather
+                // than leave the lease dangling until it expires.
+                return fail(&client, &lease, "cancelled").await;
+            }
+            info!(job = %lease.job_id.as_str(), "adapter-reported cancellation confirmed");
+            Ok(())
+        }
+        other => {
+            let error = format!("adapter exited with {other:?}");
+            fail(&client, &lease, &error).await?;
+            bail!("job {} failed: {error}", lease.job_id.as_str())
+        }
+    }
+}
+
+/// Spawn the adapter and supervise it until it exits, honouring cancellation.
+async fn run_adapter(
+    client: &WorkloadClient,
+    config: &Config,
+    adapter: &AdapterConfig,
+    lease: &infernix_workload::Lease,
+    envelope: &JobEnvelope,
+    cancel_path: &Path,
+) -> Result<AdapterRun> {
     let mut command = Command::new(&adapter.command);
     command
         .args(&adapter.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     if let Some(directory) = &adapter.working_directory {
         command.current_dir(directory);
@@ -506,113 +635,363 @@ async fn execute_job(
     command.envs(&adapter.environment);
     command.env(
         "INFERNIX_WORKLOAD_STAGING_DIRECTORY",
-        &job.envelope.staging_directory,
+        &envelope.staging_directory,
     );
+    command.env(
+        "INFERNIX_WORKLOAD_OUTPUT_DIRECTORY",
+        &envelope.output_directory,
+    );
+
     let mut child = command.spawn().with_context(|| {
         format!(
             "spawn adapter {} for {}",
             adapter.command.display(),
-            job.lease.job_id.as_str()
+            lease.job_id.as_str()
         )
     })?;
-    let mut stdin = child.stdin.take().context("adapter stdin was not piped")?;
-    stdin
-        .write_all(serde_json::to_string(&job.envelope)?.as_bytes())
-        .await
-        .context("write workload envelope")?;
-    stdin
-        .write_all(b"\n")
-        .await
-        .context("finish workload envelope")?;
-    stdin.shutdown().await.context("close workload envelope")?;
+    let pid = child.id().unwrap_or_default();
 
-    let mut wait = Box::pin(child.wait_with_output());
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(serde_json::to_string(envelope)?.as_bytes())
+            .await
+            .context("write workload envelope")?;
+        stdin
+            .write_all(b"\n")
+            .await
+            .context("finish workload envelope")?;
+        stdin.shutdown().await.context("close workload envelope")?;
+    }
+
+    let lease_duration = Duration::seconds(config.worker.lease_duration_secs as i64);
+    let grace = StdDuration::from_secs(config.worker.cancel_grace_secs);
     let mut heartbeat = interval(StdDuration::from_secs(
         config.worker.heartbeat_interval_secs,
     ));
+    heartbeat.tick().await; // the first tick resolves immediately
+    let mut cancel_ticker = interval(StdDuration::from_millis(250));
+    let mut cancel_deadline: Option<Instant> = None;
+    let mut cancel_requested = false;
+
+    let mut wait = Box::pin(child.wait_with_output());
     let output = loop {
         tokio::select! {
             output = &mut wait => break output.context("wait for workload adapter")?,
             _ = heartbeat.tick() => {
-                let affected = client.execute(
-                    HEARTBEAT,
-                    &[
-                        &job.lease.job_id.as_str(),
-                        &job.lease.worker_id.as_str(),
-                        &boot_id,
-                        &job.lease.token.as_str(),
-                        &(Utc::now() + Duration::seconds(config.worker.lease_duration_secs as i64)),
-                    ],
-                ).await.context("heartbeat workload lease")?;
-                if affected != 1 {
-                    bail!("lease for job {} is no longer current", job.lease.job_id.as_str())
+                match client.heartbeat(lease, lease_duration).await {
+                    Ok(HeartbeatOutcome::Renewed { cancel_requested_at }) => {
+                        if let Err(error) = client
+                            .worker_heartbeat(&lease.worker_id, &lease.boot_id)
+                            .await
+                        {
+                            warn!(%error, "workload worker heartbeat failed");
+                        }
+                        if cancel_requested_at.is_some() && !cancel_requested {
+                            cancel_requested = true;
+                            info!(job = %lease.job_id.as_str(), "cancel requested; stopping the adapter");
+                            if let Err(error) = delivery::request_cancel(cancel_path) {
+                                warn!(%error, "failed to write the adapter cancel file");
+                            }
+                            signal_group(pid, libc::SIGTERM);
+                            cancel_deadline = Some(Instant::now() + grace);
+                        }
+                    }
+                    Ok(HeartbeatOutcome::Fenced) => {
+                        signal_group(pid, libc::SIGKILL);
+                        bail!(
+                            "lease for job {} is no longer current",
+                            lease.job_id.as_str()
+                        )
+                    }
+                    Err(error) => {
+                        // A transient database error must not kill the adapter;
+                        // the next heartbeat retries within the lease window.
+                        warn!(%error, "workload heartbeat failed");
+                    }
                 }
-                client
-                    .execute(WORKER_HEARTBEAT, &[&job.lease.worker_id.as_str(), &boot_id])
-                    .await
-                    .context("heartbeat workload worker")?;
+            }
+            _ = cancel_ticker.tick(), if cancel_deadline.is_some() => {
+                if cancel_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    warn!(
+                        job = %lease.job_id.as_str(),
+                        "adapter ignored SIGTERM; killing the process group"
+                    );
+                    signal_group(pid, libc::SIGKILL);
+                    cancel_deadline = None;
+                }
             }
         }
     };
 
-    if !output.status.success() {
-        // Adapter stderr is untrusted and may contain credentials, source, or
-        // prompt data. Keep status/error records stable and metadata-only.
-        let error = format!("adapter exited with {}", output.status);
-        fail(&client, &job.lease, &error).await?;
-        bail!("job {} failed: {error}", job.lease.job_id.as_str())
-    }
+    Ok(AdapterRun {
+        output,
+        cancel_requested,
+    })
+}
 
-    let result = if output.stdout.is_empty() {
-        json!({"status": "completed"})
-    } else {
-        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| json!({"status": "completed"}))
-    };
-    let affected = client
-        .execute(
-            COMPLETE,
-            &[
-                &job.lease.job_id.as_str(),
-                &job.lease.worker_id.as_str(),
-                &boot_id,
-                &job.lease.token.as_str(),
-                &result,
-            ],
-        )
-        .await
-        .context("complete workload lease")?;
-    if affected != 1 {
-        bail!(
-            "completion for job {} was fenced",
-            job.lease.job_id.as_str()
-        )
+async fn release_busy(
+    client: &WorkloadClient,
+    config: &Config,
+    lease: &infernix_workload::Lease,
+) -> Result<()> {
+    let not_before = Utc::now() + Duration::seconds(config.worker.busy_retry_delay_secs as i64);
+    match client
+        .release_busy(lease, not_before, config.worker.max_busy_releases)
+        .await?
+    {
+        Some(infernix_workload::BusyReleaseOutcome::Released { busy_releases, .. }) => {
+            info!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "device busy; returned the job without spending its attempt"
+            );
+        }
+        Some(infernix_workload::BusyReleaseOutcome::Exhausted { busy_releases }) => {
+            warn!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "busy-release budget exhausted; job failed as resource_busy"
+            );
+        }
+        Some(infernix_workload::BusyReleaseOutcome::Cancelled { busy_releases }) => {
+            info!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "job was cancelled while the device was busy"
+            );
+        }
+        None => warn!(
+            job = %lease.job_id.as_str(),
+            "busy release was fenced"
+        ),
     }
-    info!(job = %job.lease.job_id.as_str(), "completed workload");
     Ok(())
 }
 
-async fn fail(client: &Client, lease: &Lease, error: &str) -> Result<()> {
-    let affected = client
-        .execute(
-            "UPDATE infernix_workload_jobs
-                SET state = CASE WHEN attempts < max_attempts THEN 'pending' ELSE 'failed' END,
-                    error = $5, lease_owner = NULL, lease_boot_id = NULL,
-                    lease_token = NULL, lease_expires_at = NULL, updated_at = now()
-              WHERE id = $1 AND state = 'leased' AND lease_owner = $2
-                AND lease_boot_id = $3 AND lease_token = $4",
-            &[
-                &lease.job_id.as_str(),
-                &lease.worker_id.as_str(),
-                &lease.boot_id,
-                &lease.token.as_str(),
-                &error,
-            ],
-        )
-        .await
-        .context("fail workload lease")?;
-    if affected != 1 {
+async fn fail(
+    client: &WorkloadClient,
+    lease: &infernix_workload::Lease,
+    error: &str,
+) -> Result<()> {
+    if client.fail(lease, error).await?.is_none() {
         warn!(job = %lease.job_id.as_str(), "failure report was fenced");
     }
+    Ok(())
+}
+
+async fn finish_success(
+    client: &WorkloadClient,
+    config: &Config,
+    adapter: &AdapterConfig,
+    lease: &infernix_workload::Lease,
+    staging: &Path,
+    payload: &Value,
+    output: Output,
+) -> Result<()> {
+    let job_id = lease.job_id.clone();
+    let validated = if adapter.artifacts {
+        match validate_result(&output.stdout, staging) {
+            Ok(validated) => Some(validated),
+            Err(error) => {
+                let reason = format!("invalid_result:{}", error.code());
+                fail(client, lease, &reason).await?;
+                bail!(
+                    "job {} produced an invalid result: {reason}",
+                    lease.job_id.as_str()
+                )
+            }
+        }
+    } else {
+        None
+    };
+
+    let stored = match &validated {
+        Some(validated) => {
+            let (hub_url, generation) = delivery_coordinates(config, payload)?;
+            validated.clone().with_delivery(&hub_url, &generation).value
+        }
+        None => {
+            if output.stdout.is_empty() {
+                json!({"status": "completed"})
+            } else {
+                serde_json::from_slice(&output.stdout)
+                    .unwrap_or_else(|_| json!({"status": "completed"}))
+            }
+        }
+    };
+
+    if !client.complete(lease, &stored).await? {
+        // Another attempt won the lease; its result is the only one uploaded.
+        warn!(
+            job = %lease.job_id.as_str(),
+            "completion was fenced; nothing is uploaded"
+        );
+        return Ok(());
+    }
+
+    if let Some(validated) = &validated {
+        let hub_url = stored["delivery"]["hubUrl"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let generation = stored["delivery"]["generationRequestId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        deliver_artifacts(
+            client,
+            config,
+            &job_id,
+            &lease.worker_id,
+            &hub_url,
+            &generation,
+            validated,
+        )
+        .await?;
+    } else {
+        client.mark_delivered(&job_id, &lease.worker_id).await?;
+    }
+
+    remove_staging(staging);
+    info!(job = %lease.job_id.as_str(), "completed and delivered workload");
+    Ok(())
+}
+
+async fn deliver_artifacts(
+    client: &WorkloadClient,
+    config: &Config,
+    job_id: &JobId,
+    worker: &WorkerId,
+    hub_url: &str,
+    generation: &str,
+    validated: &ValidatedResult,
+) -> Result<()> {
+    let token = delivery::read_token(&config.worker.hub_token_file_env)?;
+    let hub = HubDelivery::new(hub_url, generation, token)?;
+    let http = delivery::http_client()?;
+    let outcomes = delivery::deliver_all(&http, &hub, &validated.artifacts).await?;
+    client.mark_delivered(job_id, worker).await?;
+    info!(
+        job = %job_id.as_str(),
+        artifacts = validated.artifacts.len(),
+        replays = outcomes
+            .iter()
+            .filter(|outcome| **outcome == delivery::DeliveryOutcome::Replayed)
+            .count(),
+        "artifacts delivered"
+    );
+    Ok(())
+}
+
+/// Hub coordinates travel in the job payload (spec section 2), with the
+/// worker config as a fallback base URL.
+fn delivery_coordinates(config: &Config, payload: &Value) -> Result<(String, String)> {
+    let hub_url = payload
+        .get("hubUrl")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| config.worker.hub_url.clone())
+        .ok_or_else(|| anyhow!("the payload carries no hubUrl and no worker.hub_url is set"))?;
+    let generation = payload
+        .get("generationRequestId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("the payload carries no generationRequestId"))?
+        .to_owned();
+    if !result::valid_generation_request_id(&generation) {
+        bail!("the payload generationRequestId is not UUID-shaped");
+    }
+    Ok((hub_url, generation))
+}
+
+fn remove_staging(staging: &Path) {
+    if let Some(parent) = staging.parent() {
+        if let Err(error) = std::fs::remove_dir_all(parent) {
+            warn!(
+                directory = %parent.display(),
+                %error,
+                "failed to remove delivered staging"
+            );
+        }
+    }
+}
+
+/// Deliver jobs this worker completed but did not upload, from retained
+/// staging. Missing staging fails the job as `staging_lost`.
+async fn finish_pending_deliveries(
+    client: &WorkloadClient,
+    config: &Config,
+    worker: &WorkerId,
+) -> Result<()> {
+    let pending = client.undelivered_succeeded(worker).await?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    info!(jobs = pending.len(), "finishing interrupted deliveries");
+    let http = delivery::http_client()?;
+    for status in pending {
+        if let Err(error) = finish_one_delivery(client, config, worker, &http, &status).await {
+            warn!(
+                job = %status.job_id.as_str(),
+                %error,
+                "delivery recovery failed for this job"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn finish_one_delivery(
+    client: &WorkloadClient,
+    config: &Config,
+    worker: &WorkerId,
+    http: &reqwest::Client,
+    status: &JobStatus,
+) -> Result<()> {
+    let job_id = status.job_id.clone();
+    let staging = staging_directory(config, &job_id, status.attempts);
+    let Some(adapter) = adapter_for(config, &status.workload, &status.queue) else {
+        bail!("no adapter for {}:{}", status.workload, status.queue);
+    };
+    let Some(stored) = status.result.clone() else {
+        client
+            .mark_delivery_failed(&job_id, worker, DELIVERY_STAGING_LOST)
+            .await?;
+        return Ok(());
+    };
+    if !adapter.artifacts {
+        client.mark_delivered(&job_id, worker).await?;
+        remove_staging(&staging);
+        return Ok(());
+    }
+    let artifacts = match result::retained_artifacts(&stored, &staging) {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            warn!(
+                job = %job_id.as_str(),
+                reason = error.code(),
+                "retained staging is unusable"
+            );
+            client
+                .mark_delivery_failed(&job_id, worker, DELIVERY_STAGING_LOST)
+                .await?;
+            return Ok(());
+        }
+    };
+    let coordinates = stored.get("delivery").cloned().unwrap_or(Value::Null);
+    let hub_url = coordinates
+        .get("hubUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+    let generation = coordinates
+        .get("generationRequestId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+    let token = delivery::read_token(&config.worker.hub_token_file_env)?;
+    let hub = HubDelivery::new(hub_url, generation, token)?;
+    delivery::deliver_all(http, &hub, &artifacts).await?;
+    client.mark_delivered(&job_id, worker).await?;
+    remove_staging(&staging);
+    info!(job = %job_id.as_str(), "recovered delivery");
     Ok(())
 }
 

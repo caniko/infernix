@@ -23,9 +23,13 @@ left to confirm it.
 
 `RELEASE_BUSY` returns a leased job to `pending` with `attempts = attempts - 1`
 (the device was busy, the attempt did not run) and a short `not_before` delay.
-After `max_busy_releases` releases the job fails with `resource_busy`. A cancel
-flag outranks a retry: a busy release or a normal failure on a cancelled job
-resolves it to `cancelled`, because nothing would ever claim it again.
+After `max_busy_releases` releases the job fails with `resource_busy`.
+`RELEASE_PREEMPTED` is the same retry for a host-admission withdrawal: the
+attempt comes back and the delay applies, but it is not charged to that budget,
+because an idle-host probe that flaps must not fail a healthy job. A cancel
+flag outranks either retry: a busy release, a preempted release or a normal
+failure on a cancelled job resolves it to `cancelled`, because nothing would
+ever claim it again.
 
 `COMPLETE` is refused when `cancel_requested_at` is set: the worker then runs
 `CONFIRM_CANCELLED` instead of uploading, atomically. Like `HEARTBEAT`,
@@ -239,3 +243,41 @@ adapter fails as `invalid_input`. Two adapters serving the same
 limited to staging, cache and model directories, the hub token as a systemd
 credential, and the device-gate lock (`/run/infernix/gpu/<device>.lock`, group
 `render`, mode 0660).
+
+## GPU admission
+
+A worker on a shared desktop can refuse GPU work while the machine's owner uses
+it, and hand a running job back when the owner returns. The probe is
+host-specific; the worker only reads its exit status.
+
+```toml
+[worker.admission]
+command = ["/nix/store/…/bin/canix", "host", "gpu-admission", "check", "--device", "murph-a770"]
+recheck_secs = 15      # reuse one verdict for at most this long (default 15)
+timeout_secs = 10      # a slower probe is a deny (default 10)
+preempt = true         # stop a running adapter when the verdict flips (default false)
+```
+
+Exit 0 admits. Any other exit code, a signal, a timeout (the probe is killed) or
+a spawn failure denies: the worker fails closed. The logged reason is the first
+non-empty line of the probe's stdout, else its stderr, capped at 300 characters,
+and a verdict is logged only on an admit↔deny transition (and the first one).
+
+While the verdict is deny the worker claims nothing: delivery recovery and
+joining finished jobs keep running, and the poll interval still bounds the loop.
+A verdict is cached for `recheck_secs`, so a deny does not re-probe every poll.
+
+With `preempt = true` a running adapter is stopped when the verdict flips to
+deny: the attempt's `CANCEL` file is written, the process group gets `SIGTERM`,
+and `SIGKILL` follows after `worker.cancel_grace_secs`. The probe runs as its
+own future beside the lease heartbeat, so `heartbeat_interval_secs +
+admission.timeout_secs` must stay below `lease_duration_secs`. Whichever exit
+code the adapter reports, the group must be empty before the job is decided.
+The job then returns to `pending` via `RELEASE_PREEMPTED` without spending an
+attempt and without charging `max_busy_releases`; `busy_retry_delay_secs` still
+delays the retry. The release drops the `CANCEL` file first, because the
+reclaim reuses the same attempt staging directory. An adapter that exits 0
+before the signal lands still completes normally, and a ledger cancellation the
+worker observes first keeps the usual cancellation path.
+
+Without `[worker.admission]` the worker behaves exactly as before.

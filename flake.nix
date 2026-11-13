@@ -431,6 +431,12 @@
               databaseUrl = "postgres:///canix?host=/run/postgresql";
               workerId = "atlas";
               capabilities = ["cpu" "semantic"];
+              admission = {
+                command = ["/bin/canix" "host" "gpu-admission" "check" "--device" "murph-a770"];
+                recheckSecs = 20;
+                timeoutSecs = 3;
+                preempt = true;
+              };
               adapters.fixture = {
                 workload = "fixture";
                 queues = ["code" "semantic"];
@@ -1660,6 +1666,11 @@
         grep -Fq 'health_url = "http://127.0.0.1:8014/healthz"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         grep -Fq 'fixture-rocm' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         grep -Fq 'artifacts = true' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq '[worker.admission]' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'command = ["/bin/canix", "host", "gpu-admission", "check", "--device", "murph-a770"]' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'recheck_secs = 20' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'timeout_secs = 3' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'preempt = true' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         ! grep -Eiq 'opaque-fixture-reference|prompt|source' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         touch "$out"
       '';
@@ -1710,6 +1721,7 @@
           .Environment | index("INFERNIX_ADAPTER_CACHE_DIR=/var/lib/infernix-workload/cache")
         '
         grep -Fq 'gpu_device = "atlas-7900xtx"' "${gpuGateSample.config.services.infernix.workloadFabric.configFile}"
+        ! grep -Fq '[worker.admission]' "${gpuGateSample.config.services.infernix.workloadFabric.configFile}"
         touch "$out"
       '';
 

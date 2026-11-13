@@ -67,6 +67,39 @@ let
     };
   };
 
+  admissionSubmodule = types.submodule {
+    options = {
+      command = mkOption {
+        type = types.listOf types.str;
+        description = ''
+          Host admission probe. Exit 0 admits GPU work; any other exit code, a
+          signal, a timeout or a spawn failure denies (fail closed).
+        '';
+      };
+
+      recheckSecs = mkOption {
+        type = types.ints.positive;
+        default = 15;
+        description = "How long one cached verdict may be reused.";
+      };
+
+      timeoutSecs = mkOption {
+        type = types.ints.positive;
+        default = 10;
+        description = "A probe slower than this is a deny.";
+      };
+
+      preempt = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Stop a running adapter when the verdict flips to deny. The job
+          returns to `pending` without spending an attempt.
+        '';
+      };
+    };
+  };
+
   profileRouteSubmodule = types.submodule {
     options = {
       endpoint = mkOption {
@@ -265,6 +298,13 @@ let
       boot_id = cfg.bootId;
     } // lib.optionalAttrs (cfg.gpuDevice != null) {
       gpu_device = cfg.gpuDevice;
+    } // lib.optionalAttrs (cfg.admission != null) {
+      admission = {
+        command = cfg.admission.command;
+        recheck_secs = cfg.admission.recheckSecs;
+        timeout_secs = cfg.admission.timeoutSecs;
+        preempt = cfg.admission.preempt;
+      };
     };
     adapters = lib.mapAttrsToList
       (_name: adapter: {
@@ -428,6 +468,17 @@ in
       '';
     };
 
+    admission = mkOption {
+      type = types.nullOr admissionSubmodule;
+      default = null;
+      description = ''
+        Optional host admission probe. While it denies, the worker claims no
+        jobs; with `preempt` a running adapter is stopped and its job returns
+        to `pending`. The probe command is host-specific (for example a Canix
+        CLI check); the worker only reads its exit status.
+      '';
+    };
+
     adapters = mkOption {
       type = types.attrsOf adapterSubmodule;
       default = { };
@@ -471,6 +522,16 @@ in
       {
         assertion = cfg.heartbeatIntervalSecs < cfg.leaseDurationSecs;
         message = "services.infernix.workloadFabric.heartbeatIntervalSecs must be less than leaseDurationSecs.";
+      }
+      {
+        assertion = cfg.admission == null || cfg.admission.command != [ ];
+        message = "services.infernix.workloadFabric.admission.command must not be empty.";
+      }
+      {
+        assertion =
+          cfg.admission == null
+          || cfg.heartbeatIntervalSecs + cfg.admission.timeoutSecs < cfg.leaseDurationSecs;
+        message = "services.infernix.workloadFabric.heartbeatIntervalSecs + admission.timeoutSecs must be less than leaseDurationSecs: the probe runs beside the heartbeat, so one probe must fit inside the lease.";
       }
     ]
     ++ lib.mapAttrsToList

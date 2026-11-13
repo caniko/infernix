@@ -17,9 +17,9 @@ use crate::{
     WorkerProfile, WorkloadError,
     sql::{
         CANCEL, CLAIM, COMPLETE, CONFIRM_CANCELLED, ENQUEUE, ENQUEUE_EXISTING, FAIL,
-        FAIL_AFTER_COMPLETION, HEARTBEAT, MARK_DELIVERED, MIGRATIONS, RELEASE_BUSY, SCHEMA, STATUS,
-        STATUS_BY_FINGERPRINT, UNDELIVERED_SUCCEEDED, WORKER_DRAIN, WORKER_HEARTBEAT,
-        WORKER_UPSERT,
+        FAIL_AFTER_COMPLETION, HEARTBEAT, MARK_DELIVERED, MIGRATIONS, RELEASE_BUSY,
+        RELEASE_PREEMPTED, SCHEMA, STATUS, STATUS_BY_FINGERPRINT, UNDELIVERED_SUCCEEDED,
+        WORKER_DRAIN, WORKER_HEARTBEAT, WORKER_UPSERT,
     },
 };
 
@@ -341,6 +341,45 @@ impl WorkloadClient {
         Ok(Some(if state == JobState::Failed {
             BusyReleaseOutcome::Exhausted { busy_releases }
         } else if state == JobState::Cancelled {
+            BusyReleaseOutcome::Cancelled { busy_releases }
+        } else {
+            BusyReleaseOutcome::Released {
+                attempts: row.get::<_, i32>("attempts").max(0) as u32,
+                busy_releases,
+                not_before: row
+                    .get::<_, Option<DateTime<Utc>>>("not_before")
+                    .unwrap_or(not_before),
+            }
+        }))
+    }
+
+    /// `RELEASE_PREEMPTED`: like [`Self::release_busy`], but a host-admission
+    /// withdrawal costs no busy-release budget. `None` means the lease was
+    /// already fenced.
+    pub async fn release_preempted(
+        &self,
+        lease: &Lease,
+        not_before: DateTime<Utc>,
+    ) -> PgResult<Option<BusyReleaseOutcome>> {
+        let row = self
+            .client
+            .query_opt(
+                RELEASE_PREEMPTED,
+                &[
+                    &lease.job_id.as_str(),
+                    &lease.worker_id.as_str(),
+                    &lease.boot_id,
+                    &lease.token.as_str(),
+                    &not_before,
+                ],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let state = parse_state(row.get::<_, String>("state").as_str())?;
+        let busy_releases = row.get::<_, i32>("busy_releases").max(0) as u32;
+        Ok(Some(if state == JobState::Cancelled {
             BusyReleaseOutcome::Cancelled { busy_releases }
         } else {
             BusyReleaseOutcome::Released {

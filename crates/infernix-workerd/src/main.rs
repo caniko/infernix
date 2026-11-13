@@ -10,8 +10,14 @@ mod result;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration as StdDuration,
 };
 
@@ -28,7 +34,7 @@ use tokio::{
     io::AsyncWriteExt,
     process::Command,
     task::JoinSet,
-    time::{Instant, Interval, interval, sleep, sleep_until},
+    time::{Instant, Interval, interval, sleep, sleep_until, timeout},
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -57,6 +63,9 @@ const GROUP_KILL_RETRY: StdDuration = StdDuration::from_secs(1);
 
 /// Upper bound on the retained-delivery retry backoff.
 const MAX_DELIVERY_BACKOFF: StdDuration = StdDuration::from_secs(600);
+
+/// How much of an admission reason line reaches the log.
+const ADMISSION_REASON_MAX_CHARS: usize = 300;
 
 const DELIVERY_STAGING_LOST: &str = "staging_lost";
 const DELIVERY_METADATA_MISSING: &str = "delivery_metadata_missing";
@@ -169,6 +178,25 @@ struct WorkerConfig {
     /// Fallback hub base URL when the payload carries none.
     #[serde(default)]
     hub_url: Option<String>,
+    /// Host admission probe for this worker's GPU (optional).
+    #[serde(default)]
+    admission: Option<AdmissionConfig>,
+}
+
+/// A host-specific admission probe. Exit 0 admits GPU work; every other
+/// outcome is a deny (fail closed).
+#[derive(Clone, Debug, Deserialize)]
+struct AdmissionConfig {
+    command: Vec<String>,
+    /// How long one verdict may be reused.
+    #[serde(default = "default_admission_recheck_secs")]
+    recheck_secs: u64,
+    /// A slower probe is a deny.
+    #[serde(default = "default_admission_timeout_secs")]
+    timeout_secs: u64,
+    /// Stop a running adapter when the verdict flips to deny.
+    #[serde(default)]
+    preempt: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -251,6 +279,14 @@ fn default_hub_token_file_env() -> String {
     delivery::DEFAULT_TOKEN_FILE_ENV.to_owned()
 }
 
+fn default_admission_recheck_secs() -> u64 {
+    15
+}
+
+fn default_admission_timeout_secs() -> u64 {
+    10
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -301,6 +337,30 @@ fn validate_config(config: &Config) -> Result<()> {
     }
     if config.worker.delivery_retry_secs == 0 {
         bail!("worker.delivery_retry_secs must be greater than zero")
+    }
+    if let Some(admission) = &config.worker.admission {
+        if admission
+            .command
+            .first()
+            .is_none_or(|program| program.trim().is_empty())
+        {
+            bail!("worker.admission.command must name an executable")
+        }
+        if admission.recheck_secs == 0 {
+            bail!("worker.admission.recheck_secs must be greater than zero")
+        }
+        if admission.timeout_secs == 0 {
+            bail!("worker.admission.timeout_secs must be greater than zero")
+        }
+        // The probe runs beside the heartbeat, so the longest gap between two
+        // renewals is one heartbeat plus one whole probe.
+        if config.worker.heartbeat_interval_secs + admission.timeout_secs
+            >= config.worker.lease_duration_secs
+        {
+            bail!(
+                "worker.heartbeat_interval_secs + worker.admission.timeout_secs must be less than worker.lease_duration_secs"
+            )
+        }
     }
     if config.adapters.iter().any(|adapter| {
         adapter.workload.trim().is_empty()
@@ -459,6 +519,132 @@ async fn cancel(client: &WorkloadClient, job_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// One admission verdict: exit 0 admits, everything else denies.
+struct Verdict {
+    admit: bool,
+    reason: String,
+}
+
+/// Ask the host probe. A non-zero exit, a signal, a timeout, or a spawn
+/// failure denies (fail closed); `reason` is the first non-empty output line,
+/// capped for a log field.
+async fn admission_verdict(admission: &AdmissionConfig) -> Verdict {
+    let Some((program, args)) = admission.command.split_first() else {
+        return Verdict {
+            admit: false,
+            reason: "worker.admission.command is empty".to_owned(),
+        };
+    };
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let limit = StdDuration::from_secs(admission.timeout_secs);
+    // A probe slower than its limit is a deny; dropping the child kills it.
+    let output = match timeout(limit, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            return Verdict {
+                admit: false,
+                reason: format!("admission command failed: {error}"),
+            };
+        }
+        Err(_) => {
+            return Verdict {
+                admit: false,
+                reason: format!("admission command exceeded {limit:?}"),
+            };
+        }
+    };
+    let reason = first_line(&output.stdout)
+        .or_else(|| first_line(&output.stderr))
+        .unwrap_or_default();
+    Verdict {
+        admit: output.status.code() == Some(0),
+        reason,
+    }
+}
+
+/// The first non-empty line of a probe's output.
+fn first_line(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(ADMISSION_REASON_MAX_CHARS).collect())
+}
+
+/// The last logged verdict, so one transition is logged once even though the
+/// claim gate and every preempting run share the probe.
+#[derive(Clone, Default)]
+struct AdmissionLog(Arc<AtomicU8>);
+
+impl AdmissionLog {
+    fn record(&self, verdict: &Verdict) {
+        let state = u8::from(!verdict.admit) + 1;
+        if self.0.swap(state, Ordering::Relaxed) == state {
+            return;
+        }
+        if verdict.admit {
+            info!(reason = %verdict.reason, "host admission granted");
+        } else {
+            info!(reason = %verdict.reason, "host admission denied");
+        }
+    }
+
+    /// A run already saw a deny, so a cached admit is stale.
+    fn denied(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == 2
+    }
+}
+
+/// Cached admission verdicts for one probe.
+struct AdmissionGate {
+    admission: Option<AdmissionConfig>,
+    cached: Option<(Instant, bool)>,
+}
+
+impl AdmissionGate {
+    fn new(admission: Option<AdmissionConfig>) -> Self {
+        Self {
+            admission,
+            cached: None,
+        }
+    }
+
+    /// The current verdict, reusing one taken less than `recheck_secs` ago.
+    async fn admits(&mut self, log: &AdmissionLog) -> bool {
+        if let (Some(admission), Some((at, admit))) = (&self.admission, &self.cached) {
+            // A preempting run that already saw a deny outranks a cached admit.
+            if at.elapsed() < StdDuration::from_secs(admission.recheck_secs)
+                && (!*admit || !log.denied())
+            {
+                return *admit;
+            }
+        }
+        self.refresh(log).await
+    }
+
+    /// Ask the probe now, whatever the cache holds.
+    async fn refresh(&mut self, log: &AdmissionLog) -> bool {
+        let Some(admission) = self.admission.clone() else {
+            return true;
+        };
+        let verdict = admission_verdict(&admission).await;
+        self.observe(log, &verdict)
+    }
+
+    /// Record one verdict and report whether it admits.
+    fn observe(&mut self, log: &AdmissionLog, verdict: &Verdict) -> bool {
+        log.record(verdict);
+        self.cached = Some((Instant::now(), verdict.admit));
+        verdict.admit
+    }
+}
+
 async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Result<()> {
     let boot_id = resolve_boot_id(&config.worker)?;
     let worker = worker_profile(&config, &boot_id)?;
@@ -480,9 +666,14 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
 
     let mut tasks = JoinSet::new();
     let poll = StdDuration::from_secs(config.worker.poll_interval_secs);
+    let admission_log = AdmissionLog::default();
+    let mut admission = AdmissionGate::new(config.worker.admission.clone());
 
     loop {
-        while tasks.len() < config.worker.concurrency {
+        // A denied host yields no claims; delivery recovery and joining
+        // finished tasks keep working, and the poll sleep still bounds a deny.
+        let admitted = admission.admits(&admission_log).await;
+        while admitted && tasks.len() < config.worker.concurrency {
             let Some(job) = claim(&client, &config, &worker, &boot_id).await? else {
                 break;
             };
@@ -494,7 +685,8 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
             );
             let client = client.clone();
             let config = config.clone();
-            tasks.spawn(async move { execute_job(client, config, job).await });
+            let admission_log = admission_log.clone();
+            tasks.spawn(async move { execute_job(client, config, job, admission_log).await });
         }
 
         if once {
@@ -630,13 +822,20 @@ struct AdapterRun {
     pid: u32,
     /// When SIGTERM's grace ends; `None` means terminate the group now.
     kill_at: Option<Instant>,
+    /// Admission flipped to deny while this adapter ran.
+    preempted: bool,
     /// The supervision heartbeat. Termination keeps this interval (and its
     /// phase) instead of starting a new one, whose first tick would be a whole
     /// heartbeat away from the lease the last supervision tick renewed.
     heartbeat: Interval,
 }
 
-async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) -> Result<()> {
+async fn execute_job(
+    client: WorkloadClient,
+    config: Config,
+    job: ClaimedJob,
+    admission_log: AdmissionLog,
+) -> Result<()> {
     let lease = job.lease.clone();
     // The job's `profile:<id>` requirement, not adapter order, selects the
     // adapter. A job no configured adapter serves is invalid input.
@@ -679,7 +878,40 @@ async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) ->
         payload: job.payload.clone(),
     };
 
-    let mut run = run_adapter(&client, &config, &adapter, &lease, &envelope, &cancel_path).await?;
+    let mut run = run_adapter(
+        &client,
+        &config,
+        &adapter,
+        &lease,
+        &envelope,
+        &cancel_path,
+        &admission_log,
+    )
+    .await?;
+
+    // A preemption hands the job back without spending its attempt; the
+    // ledger's retry delay bounds the retries. Whatever the exit code, the
+    // adapter's group must be empty before this worker decides between
+    // completion and release, and the adapter exits 15 on SIGTERM, so this
+    // must never reach the cancellation path.
+    if run.preempted {
+        ensure_group_gone(
+            &client,
+            &config,
+            &lease,
+            run.pid,
+            run.kill_at,
+            &mut run.heartbeat,
+        )
+        .await?;
+        if run.output.status.code() != Some(0) {
+            // The reclaim reuses this attempt's staging directory, so the
+            // `CANCEL` written by the preemption must not survive the release.
+            clear_cancel(&cancel_path);
+            release_preempted(&client, &config, &lease).await?;
+            return Ok(());
+        }
+    }
 
     if run.cancel_requested {
         ensure_group_gone(
@@ -749,7 +981,8 @@ async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) ->
     }
 }
 
-/// Spawn the adapter and supervise it until it exits, honouring cancellation.
+/// Spawn the adapter and supervise it until it exits, honouring cancellation
+/// and, when configured, admission preemption.
 async fn run_adapter(
     client: &WorkloadClient,
     config: &Config,
@@ -757,6 +990,7 @@ async fn run_adapter(
     lease: &infernix_workload::Lease,
     envelope: &JobEnvelope,
     cancel_path: &Path,
+    admission_log: &AdmissionLog,
 ) -> Result<AdapterRun> {
     let mut command = Command::new(&adapter.command);
     command
@@ -812,6 +1046,27 @@ async fn run_adapter(
     let mut cancel_deadline: Option<Instant> = None;
     let mut killed = false;
     let mut cancel_requested = false;
+    // Preemption asks the admission probe on its own interval: the claim
+    // already asked once, so the first recheck is a whole period away.
+    let preempt_period = config
+        .worker
+        .admission
+        .as_ref()
+        .filter(|admission| admission.preempt)
+        .map(|admission| StdDuration::from_secs(admission.recheck_secs));
+    let mut preemption = AdmissionGate::new(
+        config
+            .worker
+            .admission
+            .clone()
+            .filter(|admission| admission.preempt),
+    );
+    let mut preemption_due = preempt_period.map(|period| Instant::now() + period);
+    // The probe is its own future inside this select, so a probe that runs to
+    // its timeout never stops the lease heartbeat, the cancel path, or output
+    // collection; `validate_config` keeps heartbeat + timeout inside the lease.
+    let mut probe: Option<Pin<Box<dyn Future<Output = Verdict> + Send>>> = None;
+    let mut preempted = false;
 
     let mut wait = Box::pin(child.wait_with_output());
     let output = loop {
@@ -833,6 +1088,41 @@ async fn run_adapter(
                     Renewal::Transient => {}
                 }
             }
+            _ = sleep_until_optional(preemption_due) => {
+                // Start the probe as its own future and keep supervising.
+                preemption_due = None;
+                if !cancel_requested {
+                    if let Some(admission) = preemption.admission.clone() {
+                        probe = Some(Box::pin(async move { admission_verdict(&admission).await }));
+                    }
+                }
+            }
+            verdict = async {
+                match probe.as_mut() {
+                    Some(probe) => probe.await,
+                    // No probe is in flight: keep this arm dormant.
+                    None => std::future::pending().await,
+                }
+            } => {
+                probe = None;
+                if cancel_requested {
+                    // The ledger's cancellation owns termination; admission
+                    // only preempts when it observed the deny first.
+                } else if preemption.observe(admission_log, &verdict) {
+                    preemption_due = preempt_period.map(|period| Instant::now() + period);
+                } else {
+                    info!(
+                        job = %lease.job_id.as_str(),
+                        "admission withdrawn; preempting the adapter"
+                    );
+                    if let Err(error) = delivery::request_cancel(cancel_path) {
+                        warn!(%error, "failed to write the adapter cancel file");
+                    }
+                    signal_group(pid, libc::SIGTERM);
+                    cancel_deadline = Some(Instant::now() + grace);
+                    preempted = true;
+                }
+            }
             _ = cancel_ticker.tick(), if cancel_deadline.is_some() && !killed => {
                 if cancel_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     warn!(
@@ -851,8 +1141,17 @@ async fn run_adapter(
         cancel_requested,
         pid,
         kill_at: cancel_deadline,
+        preempted,
         heartbeat,
     })
+}
+
+/// Resolve when the optional deadline arrives; never when there is none.
+async fn sleep_until_optional(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 enum Renewal {
@@ -1038,6 +1337,46 @@ async fn release_busy(
     Ok(())
 }
 
+/// Return a preempted job to `pending` without spending its attempt and without
+/// charging the busy-release budget: the host withdrew admission, so this is
+/// not the device being busy and a flapping probe must not fail the job.
+async fn release_preempted(
+    client: &WorkloadClient,
+    config: &Config,
+    lease: &infernix_workload::Lease,
+) -> Result<()> {
+    let not_before = Utc::now() + Duration::seconds(config.worker.busy_retry_delay_secs as i64);
+    match client.release_preempted(lease, not_before).await? {
+        Some(infernix_workload::BusyReleaseOutcome::Released { busy_releases, .. }) => {
+            info!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "host admission withdrawn; returned the job without spending its attempt"
+            );
+        }
+        Some(infernix_workload::BusyReleaseOutcome::Cancelled { busy_releases }) => {
+            info!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "job was cancelled while the host was busy"
+            );
+        }
+        Some(infernix_workload::BusyReleaseOutcome::Exhausted { busy_releases }) => {
+            // RELEASE_PREEMPTED has no budget, so this cannot happen.
+            warn!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "preempted release reported an exhausted budget"
+            );
+        }
+        None => warn!(
+            job = %lease.job_id.as_str(),
+            "preempted release was fenced"
+        ),
+    }
+    Ok(())
+}
+
 async fn fail(
     client: &WorkloadClient,
     lease: &infernix_workload::Lease,
@@ -1188,6 +1527,21 @@ fn delivery_coordinates(config: &Config, payload: &Value) -> Result<(String, Str
         bail!("the payload generationRequestId is not UUID-shaped");
     }
     Ok((hub_url, generation))
+}
+
+/// Drop a preemption's `CANCEL` file. A busy release keeps the attempt's
+/// staging directory, so the reclaimed adapter would otherwise see the stale
+/// cancel at startup and exit 15 before doing any work.
+fn clear_cancel(cancel_path: &Path) {
+    match std::fs::remove_file(cancel_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            path = %cancel_path.display(),
+            %error,
+            "failed to remove the preemption cancel file; the retry may start cancelled"
+        ),
+    }
 }
 
 fn remove_staging(staging: &Path) {
@@ -1376,5 +1730,138 @@ mod tests {
     async fn a_missing_group_is_gone() {
         let pid = 2_000_000_000u32; // far above pid_max: ESRCH
         assert!(group_gone(pid));
+    }
+
+    fn admission(command: &[&str]) -> AdmissionConfig {
+        AdmissionConfig {
+            command: command.iter().map(|word| (*word).to_owned()).collect(),
+            recheck_secs: 15,
+            timeout_secs: 10,
+            preempt: false,
+        }
+    }
+
+    fn config_with_admission(heartbeat_secs: u64, lease_secs: u64, timeout_secs: u64) -> Config {
+        toml::from_str(&format!(
+            r#"
+[worker]
+id = "atlas"
+lease_duration_secs = {lease_secs}
+heartbeat_interval_secs = {heartbeat_secs}
+
+[worker.admission]
+command = ["/bin/true"]
+timeout_secs = {timeout_secs}
+"#
+        ))
+        .expect("parse the worker config")
+    }
+
+    #[test]
+    fn a_probe_that_can_outlast_the_lease_is_refused() {
+        // The probe runs beside the heartbeat, so one renewal gap can be
+        // heartbeat + timeout; the lease must still cover it.
+        assert!(
+            validate_config(&config_with_admission(30, 45, 10)).is_ok(),
+            "40 seconds of gap fit a 45 second lease"
+        );
+        let error = validate_config(&config_with_admission(30, 40, 10))
+            .expect_err("40 seconds of gap must not fill a 40 second lease");
+        assert!(error.to_string().contains("lease_duration_secs"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn exit_zero_admits_with_its_reason() {
+        let verdict =
+            admission_verdict(&admission(&["sh", "-c", "echo owner is away; exit 0"])).await;
+        assert!(verdict.admit);
+        assert_eq!(verdict.reason, "owner is away");
+    }
+
+    #[tokio::test]
+    async fn a_non_zero_exit_denies_with_the_stdout_line() {
+        let verdict =
+            admission_verdict(&admission(&["sh", "-c", "echo owner is gaming; exit 1"])).await;
+        assert!(!verdict.admit);
+        assert_eq!(verdict.reason, "owner is gaming");
+    }
+
+    #[tokio::test]
+    async fn the_stderr_line_is_the_reason_when_stdout_is_empty() {
+        let verdict = admission_verdict(&admission(&[
+            "sh",
+            "-c",
+            "echo owner is gaming >&2; exit 1",
+        ]))
+        .await;
+        assert!(!verdict.admit);
+        assert_eq!(verdict.reason, "owner is gaming");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_denies() {
+        let mut admission = admission(&["sh", "-c", "sleep 30"]);
+        admission.timeout_secs = 1;
+        let verdict = admission_verdict(&admission).await;
+        assert!(!verdict.admit);
+        assert!(verdict.reason.contains("exceeded"), "{}", verdict.reason);
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_denies() {
+        let verdict =
+            admission_verdict(&admission(&["/nonexistent/infernix-admission-probe"])).await;
+        assert!(!verdict.admit);
+        assert!(!verdict.reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_verdict_is_cached_for_recheck_secs() {
+        let directory = std::env::temp_dir().join(format!(
+            "infx-admission-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let probes = directory.join("probes");
+        let script = format!(
+            "printf x >> '{}'; echo owner is gaming; exit 1",
+            probes.display()
+        );
+        let mut gate = AdmissionGate::new(Some(admission(&["sh", "-c", script.as_str()])));
+        let log = AdmissionLog::default();
+
+        assert!(!gate.admits(&log).await);
+        assert!(!gate.admits(&log).await, "a cached deny stays a deny");
+        assert_eq!(
+            std::fs::read_to_string(&probes).unwrap_or_default().len(),
+            1,
+            "the probe runs once inside one recheck window"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_deny_seen_by_a_run_invalidates_a_cached_admit() {
+        let probes = std::env::temp_dir().join(format!(
+            "infx-admission-{}-admit",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let script = format!("printf x >> '{}'; exit 0", probes.display());
+        let mut gate = AdmissionGate::new(Some(admission(&["sh", "-c", script.as_str()])));
+        let log = AdmissionLog::default();
+
+        assert!(gate.admits(&log).await);
+        assert_eq!(std::fs::read_to_string(&probes).unwrap().len(), 1);
+        log.record(&Verdict {
+            admit: false,
+            reason: "owner is back".to_owned(),
+        });
+        assert!(gate.admits(&log).await, "a fresh probe admits again");
+        assert_eq!(
+            std::fs::read_to_string(&probes).unwrap().len(),
+            2,
+            "a deny observed by a run must invalidate the cached admit"
+        );
+        std::fs::remove_file(&probes).unwrap();
     }
 }

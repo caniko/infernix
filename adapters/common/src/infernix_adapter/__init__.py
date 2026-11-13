@@ -4,7 +4,15 @@ Contract: interfaces sections 2, 4, 5 and 6 of the animation stack plan.
 """
 
 from .cancel import CancelWatcher
-from .checkpoint import local_file, pinned_source, revision, verify_files
+from .checkpoint import (
+    index_referenced_files,
+    local_file,
+    pinned_source,
+    refuse_unlisted_weights,
+    revision,
+    verify_directory,
+    verify_files,
+)
 from .envelope import Envelope, Input, parse
 from .exits import (
     BACKEND_MISMATCH,
@@ -72,6 +80,7 @@ __all__ = [
     "emit",
     "ensure_device",
     "from_manifest",
+    "index_referenced_files",
     "local_file",
     "open_output",
     "output_path",
@@ -79,6 +88,7 @@ __all__ = [
     "peak_rss_bytes",
     "pinned_source",
     "profile_digest",
+    "refuse_unlisted_weights",
     "revision",
     "build_result",
     "run",
@@ -86,5 +96,6 @@ __all__ = [
     "sha256_file",
     "STAGING_ROOT_ENV",
     "unload_tenants",
+    "verify_directory",
     "verify_files",
 ]

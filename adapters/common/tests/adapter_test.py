@@ -1170,6 +1170,100 @@ class CheckpointTests(Harness):
         self.assertIn("unlisted weight file", str(caught.exception))
         self.assertIn("weights.bin", str(caught.exception))
 
+    def test_a_weight_index_may_only_name_declared_shards(self):
+        root = self.directory / "indexed"
+        root.mkdir()
+        index = root / "model.safetensors.index.json"
+        index.write_text(
+            json.dumps({"weight_map": {"layer.0": "model-00002-of-00002.safetensors"}})
+        )
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source(
+                {
+                    "checkpoint": {
+                        "localPath": str(root),
+                        "files": [
+                            {
+                                "path": index.name,
+                                "sha256": hashlib.sha256(index.read_bytes()).hexdigest(),
+                            }
+                        ],
+                    }
+                }
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("model-00002-of-00002.safetensors", str(caught.exception))
+
+    def test_a_nested_weight_index_cannot_escape_the_checkpoint(self):
+        root = self.directory / "nested"
+        (root / "layers").mkdir(parents=True)
+        (self.directory / "outside.safetensors").write_bytes(b"outside")
+        index = root / "layers" / "model.safetensors.index.json"
+        index.write_text(
+            json.dumps({"weight_map": {"layer.0": "../../outside.safetensors"}})
+        )
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.index_referenced_files(root)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("not a relative path", str(caught.exception))
+        self.assertIn("outside.safetensors", str(caught.exception))
+
+    def test_a_weight_index_shard_may_not_contain_a_parent_component(self):
+        # Transformers joins the shard onto the index's directory and the kernel
+        # resolves the result: through a symlinked directory, "../shard" lands
+        # somewhere a lexical normalisation never sees. The name is refused
+        # before any normalisation.
+        outside = self.directory / "outside-parents"
+        (outside / "nested").mkdir(parents=True)
+        (outside / "shard.safetensors").write_bytes(b"smuggled")
+        root = self.directory / "linked-parents"
+        root.mkdir()
+        (root / "shard.safetensors").write_bytes(b"declared")
+        (root / "layers").symlink_to(outside / "nested")
+        (outside / "nested" / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"layer.0": "../shard.safetensors"}})
+        )
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.index_referenced_files(root)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("../shard.safetensors", str(caught.exception))
+
+    def test_a_weight_index_shard_may_not_be_absolute(self):
+        root = self.directory / "absolute-shard"
+        root.mkdir()
+        (root / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"layer.0": "/etc/passwd"}})
+        )
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.index_referenced_files(root)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("/etc/passwd", str(caught.exception))
+
+    def test_a_nested_weight_index_resolves_against_its_own_directory(self):
+        root = self.directory / "relative"
+        (root / "layers").mkdir(parents=True)
+        (root / "layers" / "shard.safetensors").write_bytes(b"shard")
+        (root / "layers" / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"layer.0": "shard.safetensors"}})
+        )
+        self.assertEqual(
+            checkpoint.index_referenced_files(root),
+            {"layers/shard.safetensors"},
+        )
+
+    def test_a_directory_can_require_every_file_to_be_declared(self):
+        root = self.directory / "snapshot"
+        root.mkdir()
+        config = root / "config.json"
+        config.write_text("{}")
+        entries = [{"path": "config.json", "sha256": hashlib.sha256(b"{}").hexdigest()}]
+        checkpoint.verify_directory(root, entries, suffixes=None)
+        (root / "tokenizer.json").write_text("{}")
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.verify_directory(root, entries, suffixes=None)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("tokenizer.json", str(caught.exception))
+
     def test_an_unlisted_weight_under_a_symlinked_directory_is_rejected(self):
         root = self.directory / "linked"
         root.mkdir()
@@ -1263,6 +1357,105 @@ class CheckpointTests(Harness):
             }
         )
         self.assertEqual((source, revision), (str(root), PINNED))
+
+    def test_a_huggingface_snapshot_with_a_shard_index_verifies(self):
+        # A real hub snapshot: the index is a regular file and every shard is a
+        # `../../blobs/<sha>` link. Both must verify, and the shard stays a
+        # declared file of the snapshot.
+        payload = b"shard-00001"
+        digest = hashlib.sha256(payload).hexdigest()
+        revision = "b" * 40
+        repository = self.directory / "hub" / "models--example--weights"
+        snapshot = repository / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        (repository / "blobs").mkdir()
+        (repository / "blobs" / digest).write_bytes(payload)
+        (snapshot / "model-00001-of-00001.safetensors").symlink_to(
+            repository / "blobs" / digest
+        )
+        index = {"weight_map": {"weight.0": "model-00001-of-00001.safetensors"}}
+        (snapshot / "model.safetensors.index.json").write_text(json.dumps(index))
+        entries = [
+            {
+                "path": "model.safetensors.index.json",
+                "sha256": hashlib.sha256(json.dumps(index).encode()).hexdigest(),
+            },
+            {"path": "model-00001-of-00001.safetensors", "sha256": digest},
+        ]
+        source, revision_out = checkpoint.pinned_source(
+            {
+                "checkpoint": {
+                    "revision": PINNED,
+                    "localPath": str(snapshot),
+                    "files": entries,
+                }
+            }
+        )
+        self.assertEqual((source, revision_out), (str(snapshot), PINNED))
+
+    def test_a_huggingface_shard_link_may_not_leave_the_repository_cache(self):
+        revision = "b" * 40
+        repository = self.directory / "hub" / "models--example--weights"
+        snapshot = repository / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        (repository / "blobs").mkdir()
+        payload = b"outside"
+        outside = self.directory / "outside.safetensors"
+        outside.write_bytes(payload)
+        (snapshot / "model-00001-of-00001.safetensors").symlink_to(outside)
+        index = {"weight_map": {"weight.0": "model-00001-of-00001.safetensors"}}
+        (snapshot / "model.safetensors.index.json").write_text(json.dumps(index))
+        entries = [
+            {
+                "path": "model.safetensors.index.json",
+                "sha256": hashlib.sha256(json.dumps(index).encode()).hexdigest(),
+            },
+            {
+                "path": "model-00001-of-00001.safetensors",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+        ]
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source(
+                {
+                    "checkpoint": {
+                        "revision": PINNED,
+                        "localPath": str(snapshot),
+                        "files": entries,
+                    }
+                }
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("escapes", str(caught.exception))
+
+    def test_a_weight_index_behind_a_symlinked_directory_is_discovered(self):
+        # The index exists only through the link; a discovery walk that ignores
+        # symlinked directories would never see the escaping shard it names.
+        elsewhere = self.directory / "elsewhere"
+        (elsewhere / "sub").mkdir(parents=True)
+        (self.directory / "outside.safetensors").write_bytes(b"outside")
+        (elsewhere / "sub" / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"layer.0": "../../../outside.safetensors"}})
+        )
+        root = self.directory / "linked-index"
+        root.mkdir()
+        (root / "config.json").write_text("{}")
+        (root / "linked").symlink_to(elsewhere)
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.index_referenced_files(root)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("not a relative path", str(caught.exception))
+        self.assertIn("outside.safetensors", str(caught.exception))
+
+    def test_a_declared_path_may_not_leave_the_checkpoint(self):
+        root = self.directory / "escaping"
+        root.mkdir()
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.verify_directory(
+                root, [{"path": "../outside.safetensors", "sha256": "0" * 64}]
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("relative path", str(caught.exception))
 
     def test_a_local_file_needs_a_matching_hash_entry(self):
         target = self.directory / "sam.pt"

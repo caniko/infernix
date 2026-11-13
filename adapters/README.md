@@ -19,6 +19,7 @@ the profile.
 | `sam2/` | `mask` | atlas (ROCm), murph (XPU) | hardware-tested (ROCm) |
 | `blender-cycles-hip/` | `render_preview` / `render_final` | atlas (HIP), nomad (OPTIX) | hardware-tested (preview fixture) |
 | `triposg/` | `geometry` | nomad (CUDA) | see evidence table |
+| `kimodo/` | `motion` | atlas (ROCm) | blocked: gated text encoder (see evidence) |
 | `audio2face/` | `face` | nomad (CUDA) | **blocked, not built** |
 
 `profile.example.json` in each directory is a section-5 profile. The examples
@@ -45,6 +46,12 @@ Adapters load only that checkpoint, and `checkpoint.py` enforces the pin:
   the walk follows symlinked directories (a Hugging Face cache is a
   `snapshots/<sha>/model.safetensors` → `blobs/<sha>` link farm) and hashes the
   file each declared path resolves to;
+- every `*.index.json` is found recursively — through a symlinked directory too —
+  and each shard it names resolves against that index's own directory. A shard
+  may be a Hugging Face `blobs/<sha>` link, which must still resolve inside the
+  repository cache holding the snapshot, and the path recorded is the path the
+  index names, so every shard must be a declared file: a nested index cannot
+  name `../../outside.safetensors`, and a link cannot reach another repository;
 - a local file (`checkpoint.localPath` for an adapter that loads one file) needs
   a matching `files` entry, or it is refused.
 
@@ -150,7 +157,7 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-101 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+113 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
 again when it drops to the CPU *after* generation); a tensor on the wrong GPU
 index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP or
@@ -162,15 +169,21 @@ fingerprint stability and sensitivity (params, seed, inputs, profile, checkpoint
 revision, runtime including installed package, torch, HIP, CUDA and XPU
 versions, an adapter-specific renderer version or source commit, and a null
 identity refused); full-sha, local-directory and local-file checkpoint
-resolution (branch/tag/short sha rejected, undeclared weights rejected);
-output-path traversal, realpath escapes and symlinks (also through
-`O_NOFOLLOW`); cache corruption/missing file forcing a recompute; and a cache
-hit restoring the stored validation. The XPU branches are covered without an
-Intel card: device selection and mismatch, `mem_get_info` and the fail-closed
-refusal when it is absent, i915 fdinfo parsing keyed by DRM client,
-duplicated-descriptor dedupe, fd reuse by another client, regressing counters,
-engine capacity and overlapping engines, the final snapshot in `stop()`, and
-the allocator peak merge.
+resolution (branch/tag/short sha rejected, undeclared weights, undeclared files
+and a weight index naming an undeclared shard rejected, a nested index escaping
+the checkpoint root rejected, an absolute or `..`-bearing shard name rejected
+before normalisation (also through a symlinked directory), a Hugging Face
+snapshot whose shards are
+`../../blobs/<sha>` links accepted while a link out of the repository cache and
+a weight index behind a symlinked directory are refused); output-path
+traversal, realpath escapes and
+symlinks (also through `O_NOFOLLOW`); cache corruption/missing file forcing a
+recompute; and a cache hit restoring the stored validation. The XPU branches
+are covered without an Intel card: device selection and mismatch, `mem_get_info`
+and the fail-closed refusal when it is absent, i915 fdinfo parsing keyed by DRM
+client, duplicated-descriptor dedupe, fd reuse by another client, regressing
+counters, engine capacity and overlapping engines, the final snapshot in
+`stop()`, and the allocator peak merge.
 
 Per-adapter suites (each needs that worker's venv: `numpy`, `torch`, `pillow`,
 and for TripoSG `trimesh`/`pymeshlab`):
@@ -214,6 +227,7 @@ with the desktop's 4 GiB). No run was skipped.
 | `triposg` | nomad 4090 Laptop | 1024² image + SAM mask → GLB | 188.32 s | 12.0 GiB | 179.26 | 188.22 | 88 | 81 | `hardware-tested` (hierarchical decoder, fp32) |
 | `qwen3-tts` | murph `A770` | 1 line → 24 kHz wav | — | — | — | — | — | — | not run: admission gate closed |
 | `sam2` | murph `A770` | 512², 1 point | — | — | — | — | — | — | not run: admission gate closed |
+| `kimodo` | atlas `gfx1100` | 3 s prompt → BVH | — | — | — | — | — | — | not run: gated text encoder |
 
 Notes that matter for a profile's `peakVramGib`:
 
@@ -244,6 +258,14 @@ Notes that matter for a profile's `peakVramGib`:
   `libze_intel_gpu`. `can` is not in `render`/`video`, but
   `/dev/dri/renderD128` is mode 0666, so the render node is accessible. The XPU
   backend stays `documented` in its profiles until a real run lands here.
+- Kimodo was **not** run end to end: its text encoder needs the gated
+  `meta-llama/Meta-Llama-3-8B-Instruct` weights, and the account behind the
+  worker token is not authorized for that repository (see "Blockers"). What did
+  run on atlas is a pipeline smoke test — the real pinned Kimodo weights and a
+  constant 4096-dim stub in place of the text encoder: 90 frames (3 s) at 100
+  denoising steps in 5.55 s after an 8.51 s load, 1.15 GiB allocator peak,
+  207 KB BVH, `Frames: 90`. The motion is conditioned on a constant embedding,
+  so it is not model output and is not in the table.
 
 ### Reproduce
 
@@ -348,6 +370,19 @@ sudo -u can $XPU_ROOT/.venvs/sam2/bin/python $XPU_ROOT/harness/run_job.py \
   --params '{"pointCoords":[[260,270]],"pointLabels":[1],"imageMime":"image/png"}'
 ```
 
+kimodo (atlas; the profile's `checkpoint.localPath` and
+`helpers[0].localPath` must point at the provisioned root, and the gated text
+encoder must be pinned and present first):
+
+```sh
+export DEV_ROOT=/data/nvme0/models/animation-dev
+$DEV_ROOT/.venvs/kimodo/bin/python harness/run_job.py \
+  --adapter $ADAPTERS/kimodo --python $DEV_ROOT/.venvs/kimodo/bin/python \
+  --profile $ADAPTERS/kimodo/profile.example.json --memory-max 24G \
+  --workdir $DEV_ROOT/runs/kimodo-1 --cache-root $DEV_ROOT/cache --lock-root $DEV_ROOT/locks \
+  --params '{"prompt":"a person walks forward and waves","durationSeconds":4.0}'
+```
+
 ### Environment build
 
 atlas (ROCm, PyTorch 2.14.1+rocm7.2, python 3.12):
@@ -400,7 +435,8 @@ the wheels still need the system Level Zero loader and Intel GPU driver:
 LD_LIBRARY_PATH=/run/opengl-driver/lib
 ```
 
-Weights (ungated Apache-2.0 / MIT only; nothing here accepts a licence gate):
+Weights (ungated Apache-2.0 / MIT only; nothing here accepts a licence gate
+except Kimodo's gated text encoder, provisioned separately below):
 
 ```sh
 python -c "from huggingface_hub import snapshot_download as d; d(repo_id='Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', local_dir='$ANIM_ROOT/weights/qwen3-tts-0.6b-customvoice')"
@@ -408,6 +444,75 @@ python -c "from huggingface_hub import snapshot_download as d; d(repo_id='black-
 python -c "from huggingface_hub import snapshot_download as d; d(repo_id='facebook/sam2.1-hiera-small', local_dir='$ANIM_ROOT/weights/sam2.1-hiera-small')"
 python -c "from huggingface_hub import snapshot_download as d; d(repo_id='VAST-AI/TripoSG', local_dir='$ANIM_ROOT/weights/triposg')"
 ```
+
+Kimodo is the one adapter whose text encoder sits behind a licence gate, so its
+weights are provisioned separately. `kimodo` also builds a C++17 pybind11
+extension (`motion_correction`, foot-skate post-processing; no CUDA) at install
+time, so `cmake`, `make` and a C++17 compiler must be on `PATH`:
+
+```sh
+uv sync --frozen --project $ADAPTERS/kimodo     # UV_PROJECT_ENVIRONMENT=<venv>
+export HF_HOME=$DEV_ROOT/kimodo/hf-cache HF_TOKEN="$(cat $XDG_RUNTIME_DIR/agenix/can_hugging_face)"
+python - <<'PY'
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+# Kimodo's own weights are a plain directory: upstream names a checkpoint folder
+# after the model, so the directory name is load-bearing.
+snapshot_download(
+    "nvidia/Kimodo-SOMA-RP-v1.2",
+    revision="0e3c89024d896064b6851201373f7834784a386b",
+    local_dir="/data/nvme0/models/animation-dev/kimodo/weights/Kimodo-SOMA-RP-v1.2",
+)
+# The adapter loads the encoder by snapshot path, never by repo id, so the cache
+# only has to hold the pinned snapshots; refs/main must match the pin byte for
+# byte.
+for repo, revision in [
+    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp", "31474e395ada192e8ed1586db6be79fb3b70c9c0"),
+    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised", "baa8ebf04a1c2500e61288e7dad65e8ae42601a7"),
+    ("meta-llama/Meta-Llama-3-8B-Instruct", "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2"),
+]:
+    path = Path(snapshot_download(repo, revision=revision, ignore_patterns=["original/*"]))
+    ref = path.parents[1] / "refs" / "main"
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_text(revision)
+PY
+```
+
+The first three downloads are ungated. The last one needs the Llama 3 licence
+acceptance on the account behind the token, and every file of each snapshot
+(weights, shard index, configs, adapter configs, tokenizer files, generation
+config, plus the README/licence/attributes the snapshot ships) must then be
+added to `helpers[0].checkpoints[i].files` with its sha256:
+
+```sh
+python - <<'PY'
+import hashlib, json
+from pathlib import Path
+
+cache = Path("/data/nvme0/models/animation-dev/kimodo/hf-cache")
+for repo, revision in [
+    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp", "31474e395ada192e8ed1586db6be79fb3b70c9c0"),
+    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised", "baa8ebf04a1c2500e61288e7dad65e8ae42601a7"),
+    ("meta-llama/Meta-Llama-3-8B-Instruct", "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2"),
+]:
+    root = cache / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
+    files = [
+        {"path": path.relative_to(root).as_posix(),
+         "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for path in sorted(root.rglob("*"))
+        if path.is_file() or path.is_symlink()
+    ]
+    print(repo, json.dumps(files, indent=2))
+PY
+```
+
+The adapter refuses to load a snapshot that declares no files, misses one of
+its loader files, or carries any file the profile does not declare; it also
+refuses a checkpoint whose `config.yaml` is not declared, because the config
+instantiates classes and picks weight paths. The initial profile keeps
+`helpers[0].checkpoints[0].files` empty, so a job fails closed with exit 14 and
+names the checkpoint rather than loading unverified weights.
 
 ### Per-adapter notes
 
@@ -511,6 +616,116 @@ result's `validation.findings`, never applied silently. Nomad has no CUDA
 toolkit, so it runs `hierarchical`/`fp32`; the numbers below are from that
 configuration.
 
+**kimodo.** Text-to-motion on the SOMA skeleton: Kimodo-SOMA-RP-v1.2 runs on
+the reduced `somaskel30` internally and the adapter emits `somaskel77`. It calls
+the low-level API rather than the CLI, with upstream's SOMA defaults:
+
+```python
+model([prompt], [frames], num_denoising_steps=100, multi_prompt=True,
+      num_samples=1, post_processing=True, return_numpy=True)
+```
+
+`post_processing=True` runs the `motion_correction` C++ extension (foot-skate
+cleanup, CPU). `params`: `prompt` (required, at most 1000 characters),
+`durationSeconds` (default 4, a finite number up to `limits.maxOutputSeconds`
+and `limits.maxFrames` at the model's 30 fps), `diffusionSteps` (default 100,
+1–1000), `outputName` (default `motion.bvh`, checked for traversal). The seed is
+`payload.seed` (0–2³²−1), applied by the shared runner before the checkpoint
+loads. Every parameter is validated before a model is built; a bad one is exit
+14.
+
+The output is one BVH (`application/x-bvh`): the somaskel77 hierarchy, root
+translation plus per-joint ZYX local rotations, `Frame Time: 1/30`, offsets and
+root motion in centimetres (metres × 100, the BONES-SEED convention), and the
+standard T-pose as rest pose (`standard_tpose=True`), which is what Blender's
+BVH importer wants for retargeting. Clips run up to 10 s (300 frames at 30 fps).
+
+The checkpoint must be a local directory from the profile: `checkpoint.localPath`
+is required and must be named `Kimodo-SOMA-RP-v1.2`, because upstream names a
+model folder `CHECKPOINT_DIR/<display name>`. A remote-only or misnamed
+checkpoint is `invalid_input` rather than a silent unpinned download.
+`pinned_source` verifies every declared sha256, refuses an undeclared weight,
+and requires every shard named by a weights index — including an index in a
+subdirectory, resolved against its own directory, and including a Hugging Face
+`blobs/<sha>` link that stays inside the repository cache — to be declared. A
+shard name must be plain and relative: an absolute entry or one with a `..`
+component is exit 14 before any normalisation, because Transformers joins it
+onto the index's directory and lets the filesystem resolve the rest.
+
+Every declared file of the checkpoint and of the three encoder snapshots is then
+materialised into one staging tree at
+`$INFERNIX_ADAPTER_CACHE_DIR/kimodo-staging/<sha256 of every pin>/` — an
+independent copy (a reflink where the filesystem has one, a byte copy otherwise,
+never a hardlink, so a write to the source cannot reach the staged bytes) — and
+hashed again against its declaration, so the bytes upstream reads are the bytes
+that were verified and a source that changed after verification is refused. Only
+declared files exist in that tree (no symlink, no extra file), every file is
+read-only including the configs the adapter writes itself, and the tree is
+published by renaming a fully built temporary directory, so a concurrent job
+reuses it instead of reading a partial one. It is reused only while every
+declared file still re-hashes to its manifest entry; a tampered tree is rebuilt.
+The process changes into the staging tree for the whole load, so a relative path
+cannot resolve anywhere else.
+
+`config.yaml` must be one of the declared files. It is read once from the staged
+copy, parsed with OmegaConf's own YAML loader (so a value has the type OmegaConf
+would give it and a duplicate key is exit 14, as it would be there), and turned
+into the one config Hydra instantiates: the adapter's own `checkpoint_dir` anchor
+becomes the staging directory, every
+other `${...}` interpolation — including an escaped `\${oc.env:…}` and a
+defaulted `${oc.select:checkpoint_dir,…}` — is refused, every `_target_` must be
+one of the four classes the shipped config names (`kimodo.model.Kimodo`,
+`kimodo.model.twostage_denoiser.TwostageDenoiser`,
+`kimodo.motion_rep.KimodoMotionRep`, `kimodo.skeleton.SOMASkeleton30`), and
+every string leaf is confined to the staging tree: a value that resolves inside
+it is pinned to its published absolute path, and one that resolves outside it,
+is an absolute path, or names nothing the tree holds is exit 14. That is what
+covers `folder`, `stats.folder`, `_args_` and any field added later, without a
+key list. Upstream never re-reads the file, so the bytes that were verified are
+the bytes that are instantiated.
+
+The text encoder is LLM2Vec over the gated Meta-Llama-3-8B-Instruct: the base
+8B weights plus two stacked LoRA adapters (mntp, then mntp-supervised). All
+three snapshots are pinned in `helpers[0].checkpoints` with full 40-hex
+revisions, resolved from the Hugging Face cache in `helpers[0].localPath`, and
+verified file by file: the loader's files (weights, shard index, config.json,
+adapter_config.json, tokenizer files, generation_config) must be declared, and
+every other file in the snapshot must be declared too. `refs/main` must match
+the pin byte for byte, with no newline tolerance and no case folding, and the
+cache may hold only the three declared repositories. Everything loads by path
+from the staged snapshots: the base Llama and both LoRAs are attached from their
+staged directories, so no `from_pretrained` call receives a repo id. The two
+LoRAs stack in LLM2Vec's own training order: the mntp adapter is attached from
+its staged directory and merged into the base, then the supervised adapter is
+attached to those merged weights. A PEFT warning about missing or unexpected
+adapter keys at either attach — or about a second adapter reusing the default
+name — is exit 14, so a checkpoint that silently failed to apply cannot look
+like a loaded one. A staged `adapter_config.json` we write ourselves names the
+staged base, and every path-bearing value of every staged snapshot config
+(`*_file`, `*_path`, `*_dir`, `*name_or_path`, and the `auto_map` entries) is
+confined to the tree the same way — a `tokenizer_file` outside it is exit 14, an
+internal one is pinned to its staged path. Tokenizer vocabulary, merges and
+added tokens are data, not paths, and are never confined: a merge such as `/ /`
+is accepted. `HF_HOME` and `HF_HUB_CACHE` point at empty directories inside the
+staging tree, `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set,
+`TEXT_ENCODERS_DIR` and `CHECKPOINT_DIR` are cleared, and `TEXT_ENCODER_DEVICE`
+is pinned to the selected GPU — upstream's `TEXT_ENCODER_DEVICE=cpu` path is
+never taken. Frame bounds are checked against the config's own `fps` before any
+model loads. The fingerprint covers the installed `kimodo` distribution's
+PEP 610 commit, the three encoder pins, the staging key (a change to the
+staged rewrites bumps `STAGING_VERSION`) and the encoder assembly version (a
+change to how the LoRAs are stacked bumps `ENCODER_ASSEMBLY_VERSION`), so
+a cache entry cannot be reused across a source, encoder or assembly change.
+
+ROCm: Kimodo is pure PyTorch plus that one CPU-only C++ extension, so nothing
+in it is CUDA-only. `torch.backends.cuda` TF32 and `torch.backends.cudnn` flags
+in `kimodo/tools.py` exist on ROCm builds too. Verified on atlas:
+`torch 2.14.1+rocm7.2` / `gfx1100` loads the pinned checkpoint, runs 100
+denoising steps and exports BVH. The denoiser runs in the checkpoint's own fp32
+dtype (the `bf16` in the profile is the text encoder's dtype, as upstream
+defaults it), which is why its allocator peak is only 1.15 GiB; the ~17 GiB the
+README quotes is the 8B text encoder.
+
 **audio2face.** Scaffold only. `README.md` in that directory carries the exact
 SDK build steps (CUDA 12.8–12.9, TensorRT 10.13–<11, python 3.8–3.10 for the
 model scripts) and the retarget blocker. The profile is `blocked`; a dispatch
@@ -519,13 +734,29 @@ engine.
 
 ## Blockers and deviations
 
+- **Kimodo's text encoder is gated and the worker token is not authorized.**
+  `meta-llama/Meta-Llama-3-8B-Instruct` answers 403 for the account behind
+  `can_hugging_face` (`canik0`): the Llama 3 licence acceptance exists, but the
+  account is not on the repository's authorized list, so the base 8B weights the
+  two LLM2Vec adapters sit on cannot be provisioned. The Kimodo weights and both
+  ungated LLM2Vec adapter snapshots are pinned and provisioned under
+  `/data/nvme0/models/animation-dev/kimodo`; the adapter fails closed with exit
+  14 and names the checkpoint rather than loading unverified weights. To finish:
+  grant that account access, download the four shards at `8afb486c`, add their
+  sha256s to `helpers[0].checkpoints[0].files`, and run the kimodo command under
+  "Reproduce". `peakVramGib` stays null and the profile stays `blocked` until
+  that run lands.
 - **Model root.** `/data/nvme0/models` and `/data/models` are root-owned on
   atlas and nomad. A `rops` request to create
   `/data/nvme0/models/animation` (atlas) and `/data/models/animation` (nomad)
   is queued. Until it lands, the runs above used
   `/data/nvme0/can/canix/ProjectState/models/animation` (atlas) and
   `/home/can/models/animation` (nomad); same filesystem, so the move is a
-  rename. The commands are written against `$ANIM_ROOT`.
+  rename. The commands are written against `$ANIM_ROOT`. Kimodo's development
+  root is the same story: `/data/nvme0/models/animation-dev` has its own queued
+  `rops` request, and until it lands the provisioned tree lives at
+  `/data/nvme0/can/canix/ProjectState/models/animation-dev` (same filesystem,
+  rename). The profile's `localPath`s name the final path.
 - **`diso` on nomad** is not built: it ships an sdist that needs a CUDA toolkit
   and there is none on that worker. TripoSG therefore runs the hierarchical
   (skimage) decoder; the flash decoder needs `diso` and is exited as

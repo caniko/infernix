@@ -1,0 +1,13 @@
+[project]
+name = "infernix-adapter"
+version = "0.1.0"
+description = "Shared runtime for infernix animation GPU adapters"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/infernix_adapter"]

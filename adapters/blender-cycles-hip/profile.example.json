@@ -1,0 +1,41 @@
+{
+  "id": "blender-cycles-hip-rocm",
+  "model": "blender-cycles",
+  "operation": "render_preview",
+  "state": "implemented",
+  "blockedReason": null,
+  "checkpoint": {
+    "repo": "blender/blender",
+    "revision": "e13b728c6880d3084d9d57c30031ed5df8b39dee",
+    "files": []
+  },
+  "code": {
+    "repo": "https://projects.blender.org/blender/blender",
+    "commit": "e13b728c6880d3084d9d57c30031ed5df8b39dee",
+    "package": "blender-5.2.3"
+  },
+  "licence": {
+    "code": "GPL-3.0-or-later",
+    "weights": "n/a",
+    "gated": false,
+    "evidence": [
+      "https://docs.blender.org/manual/en/latest/render/cycles/gpu_rendering.html"
+    ],
+    "acceptedBy": null
+  },
+  "helpers": [],
+  "backend": "rocm",
+  "device": "gpu:atlas-7900xtx",
+  "deviceMatch": "7900 XTX",
+  "precision": "fp32",
+  "cpuPolicy": "forbidden",
+  "cpuThreads": 4,
+  "peakVramGib": null,
+  "tenants": {
+    "llamaSwapUrl": "http://127.0.0.1:8013"
+  },
+  "limits": {
+    "maxInputSeconds": null
+  },
+  "evidence": []
+}

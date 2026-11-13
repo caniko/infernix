@@ -1,0 +1,39 @@
+{
+  "id": "flux2-klein-4b-rocm",
+  "model": "flux2-klein",
+  "operation": "image",
+  "state": "documented",
+  "blockedReason": null,
+  "checkpoint": {
+    "repo": "black-forest-labs/FLUX.2-klein-4B",
+    "revision": "e7b7dc27f91deacad38e78976d1f2b499d76a294",
+    "files": []
+  },
+  "code": {
+    "repo": "https://github.com/huggingface/diffusers",
+    "commit": null,
+    "package": "diffusers"
+  },
+  "licence": {
+    "code": "Apache-2.0",
+    "weights": "Apache-2.0",
+    "gated": false,
+    "evidence": ["https://huggingface.co/black-forest-labs/FLUX.2-klein-4B"],
+    "acceptedBy": null
+  },
+  "helpers": [],
+  "backend": "rocm",
+  "device": "gpu:atlas-7900xtx",
+  "deviceMatch": "gfx1100",
+  "precision": "bf16",
+  "cpuPolicy": "forbidden",
+  "cpuThreads": 4,
+  "peakVramGib": null,
+  "tenants": {
+    "llamaSwapUrl": "http://127.0.0.1:8013"
+  },
+  "limits": {
+    "maxInputSeconds": null
+  },
+  "evidence": []
+}

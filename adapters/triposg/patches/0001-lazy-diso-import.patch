@@ -1,0 +1,21 @@
+diff --git a/triposg/inference_utils.py b/triposg/inference_utils.py
+index 6ce292b..28de58d 100755
+--- a/triposg/inference_utils.py
++++ b/triposg/inference_utils.py
+@@ -4,7 +4,6 @@ import torch.nn as nn
+ import scipy.ndimage
+ from skimage import measure
+ from einops import repeat
+-from diso import DiffDMC
+ import torch.nn.functional as F
+ 
+ from triposg.utils.typing import *
+@@ -327,6 +326,8 @@ def flash_extract_geometry(
+     mini_grid_num: int = 4,
+     **kwargs,
+ ):
++    from diso import DiffDMC
++
+     geo_decoder = vae.decoder
+     device = latents.device
+     dtype = latents.dtype

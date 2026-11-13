@@ -1,0 +1,19 @@
+diff --git a/triposg/models/autoencoders/autoencoder_kl_triposg.py b/triposg/models/autoencoders/autoencoder_kl_triposg.py
+index f7ec6cd..ba970b8 100755
+--- a/triposg/models/autoencoders/autoencoder_kl_triposg.py
++++ b/triposg/models/autoencoders/autoencoder_kl_triposg.py
+@@ -8,7 +8,13 @@ from diffusers.models.attention_processor import Attention, AttentionProcessor
+ from diffusers.models.autoencoders.vae import DecoderOutput
+ from diffusers.models.modeling_outputs import AutoencoderKLOutput
+ from diffusers.models.modeling_utils import ModelMixin
+-from diffusers.models.normalization import FP32LayerNorm, LayerNorm
++from diffusers.models.normalization import FP32LayerNorm
++
++# Upstream imports `LayerNorm` from diffusers.models.normalization, which no
++# released diffusers exposes. Its two uses are `LayerNorm(dim)` output norms with
++# learnable affine parameters, i.e. torch.nn.LayerNorm (eps 1e-5 rather than
++# FP32LayerNorm's 1e-6).
++LayerNorm = nn.LayerNorm
+ from diffusers.utils import logging
+ from diffusers.utils.accelerate_utils import apply_forward_hook
+ from einops import repeat

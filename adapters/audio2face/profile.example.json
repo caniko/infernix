@@ -1,0 +1,41 @@
+{
+  "id": "audio2face-3d-v3.0-cuda",
+  "model": "audio2face",
+  "operation": "face",
+  "state": "blocked",
+  "blockedReason": "SDK not built on a CUDA 12.9 + TensorRT 10.13 host; v3.0 emits geometry on NVIDIA's Claire/James/Mark topology, so a per-character retarget is required before it can drive an MPFB/Rigify face. See adapters/audio2face/README.md.",
+  "checkpoint": {
+    "repo": "nvidia/Audio2Face-3D-v3.0",
+    "revision": "b74132732fd9a9d29b237bec193ded64c9745e91",
+    "files": []
+  },
+  "code": {
+    "repo": "https://github.com/NVIDIA/Audio2Face-3D-SDK",
+    "commit": null,
+    "package": "audio2face-sdk"
+  },
+  "licence": {
+    "code": "MIT",
+    "weights": "NVIDIA Open Model Licence",
+    "gated": false,
+    "evidence": [
+      "https://huggingface.co/nvidia/Audio2Face-3D-v3.0"
+    ],
+    "acceptedBy": null
+  },
+  "helpers": [],
+  "backend": "cuda",
+  "device": "gpu:nomad-4090l",
+  "deviceMatch": "4090",
+  "precision": "fp32",
+  "cpuPolicy": "forbidden",
+  "cpuThreads": 4,
+  "peakVramGib": null,
+  "tenants": {
+    "llamaSwapUrl": "http://127.0.0.1:8013"
+  },
+  "limits": {
+    "maxInputSeconds": null
+  },
+  "evidence": []
+}

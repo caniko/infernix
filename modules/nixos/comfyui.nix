@@ -8,6 +8,12 @@
   cfg = config.services.infernix.comfyui;
   gpuCfg = config.services.infernix.gpu;
   gpuLib = import ../../lib/gpu.nix {inherit lib;};
+  gpuGate = import ../../lib/gpu-gate.nix {inherit lib pkgs;};
+  # Default off: hosts without the workload fabric keep today's command line.
+  gpuGateCfg = lib.attrByPath ["services" "infernix" "gpuGate"] {
+    enable = false;
+    device = "";
+  } config;
 
   defaultExtraModelPaths = pkgs.writeText "comfyui-extra-model-paths.yaml" ''
     canix:
@@ -199,20 +205,23 @@ in {
           User = "comfyui";
           Group = "comfyui";
           WorkingDirectory = cfg.stateDir;
-          ExecStart = ''
-            ${package}/bin/comfyui \
-              --listen ${cfg.host} \
-              --port ${toString cfg.port} \
-              --base-directory ${cfg.stateDir} \
-              --database-url sqlite:///${cfg.stateDir}/user/comfyui.db \
-              --user-directory ${cfg.stateDir}/user \
-              --input-directory ${cfg.stateDir}/input \
-              --output-directory ${cfg.stateDir}/output \
-              --temp-directory ${cfg.stateDir}/temp \
-              --extra-model-paths-config ${extraModelPaths} \
-              --disable-auto-launch \
-              --log-stdout
-          '';
+          ExecStart = gpuGate.wrap {
+            inherit (gpuGateCfg) enable device;
+            command = ''
+              ${package}/bin/comfyui \
+                --listen ${cfg.host} \
+                --port ${toString cfg.port} \
+                --base-directory ${cfg.stateDir} \
+                --database-url sqlite:///${cfg.stateDir}/user/comfyui.db \
+                --user-directory ${cfg.stateDir}/user \
+                --input-directory ${cfg.stateDir}/input \
+                --output-directory ${cfg.stateDir}/output \
+                --temp-directory ${cfg.stateDir}/temp \
+                --extra-model-paths-config ${extraModelPaths} \
+                --disable-auto-launch \
+                --log-stdout
+            '';
+          };
           Restart = "on-failure";
           RestartSec = 5;
         }

@@ -1,0 +1,37 @@
+[project]
+name = "infernix-adapter-triposg"
+version = "0.1.0"
+description = "TripoSG image-to-3D adapter for infernix animation (nomad CUDA)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "diffusers>=0.36",
+  "einops",
+  "huggingface-hub>=0.30",
+  "infernix-adapter",
+  "jaxtyping",
+  "numpy>=2.0",
+  "omegaconf",
+  "opencv-python-headless",
+  "peft",
+  "pillow>=12",
+  "scikit-image",
+  "torch==2.14.1",
+  "torchvision==0.29.1",
+  "transformers",
+  "trimesh>=4",
+  "typeguard",
+]
+
+[tool.uv]
+package = false
+index-strategy = "unsafe-best-match"
+
+[tool.uv.sources]
+infernix-adapter = { path = "../common" }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

@@ -2,6 +2,7 @@
 members = [
   "crates/infernix-lb",
   "crates/infernix-workload",
+  "crates/infernix-workload-testing",
   "crates/infernix-workerd",
 ]
 resolver = "2"

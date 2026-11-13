@@ -1,0 +1,41 @@
+{
+  "id": "triposg-cuda",
+  "model": "triposg",
+  "operation": "geometry",
+  "state": "documented",
+  "blockedReason": null,
+  "checkpoint": {
+    "repo": "VAST-AI/TripoSG",
+    "revision": "2c1c516d22d58db486a058d98d31bb6177344e06",
+    "files": []
+  },
+  "code": {
+    "repo": "https://github.com/VAST-AI-Research/TripoSG",
+    "commit": "fc5c40990181e2a756c4e0b1c2f4d6b5202faf8c",
+    "package": "triposg"
+  },
+  "licence": {
+    "code": "MIT",
+    "weights": "MIT",
+    "gated": false,
+    "evidence": [
+      "https://huggingface.co/VAST-AI/TripoSG"
+    ],
+    "acceptedBy": null
+  },
+  "helpers": [],
+  "backend": "cuda",
+  "device": "gpu:nomad-4090l",
+  "deviceMatch": "4090",
+  "precision": "fp32",
+  "cpuPolicy": "forbidden",
+  "cpuThreads": 4,
+  "peakVramGib": null,
+  "tenants": {
+    "llamaSwapUrl": "http://127.0.0.1:8013"
+  },
+  "limits": {
+    "maxInputSeconds": null
+  },
+  "evidence": []
+}

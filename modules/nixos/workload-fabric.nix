@@ -7,6 +7,9 @@
 let
   inherit (lib) mkEnableOption mkIf mkOption types;
   cfg = config.services.infernix.workloadFabric;
+  gpuGateCfg = config.services.infernix.gpuGate;
+  gpuGate = import ../../lib/gpu-gate.nix {inherit lib pkgs;};
+  workerUser = "infernix-worker";
 
   adapterSubmodule = types.submodule {
     options = {
@@ -18,6 +21,25 @@ let
       queues = mkOption {
         type = types.listOf types.str;
         description = "Queues this adapter is willing to claim.";
+      };
+
+      profiles = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = ''
+          Model profile ids this adapter serves. A job's `profile:<id>`
+          requirement selects the adapter, and the worker advertises one
+          `profile:<id>` capability per entry.
+        '';
+      };
+
+      artifacts = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Validate the adapter's result manifest and deliver its artifacts.
+          Set for adapters that print envelope-v2 artifacts.
+        '';
       };
 
       command = mkOption {
@@ -241,11 +263,15 @@ let
       staging_root = toString cfg.stagingRoot;
     } // lib.optionalAttrs (cfg.bootId != null) {
       boot_id = cfg.bootId;
+    } // lib.optionalAttrs (cfg.gpuDevice != null) {
+      gpu_device = cfg.gpuDevice;
     };
     adapters = lib.mapAttrsToList
       (_name: adapter: {
         workload = adapter.workload;
         queues = adapter.queues;
+        profiles = adapter.profiles;
+        artifacts = adapter.artifacts;
         command = adapter.command;
         args = adapter.args;
         environment = adapter.environment;
@@ -348,6 +374,60 @@ in
       description = "Local immutable-artifact staging root for adapter attempts.";
     };
 
+    cacheRoot = mkOption {
+      type = types.path;
+      default = "/var/lib/infernix-workload/cache";
+      description = "Worker-local content-addressed cache root.";
+    };
+
+    modelDirectories = mkOption {
+      type = types.listOf types.path;
+      default = [ ];
+      description = ''
+        Model and checkpoint directories the worker may read and, for adapters
+        that stage weights, write. These join `stagingRoot` and `cacheRoot` in
+        the unit's ReadWritePaths.
+      '';
+    };
+
+    memoryMax = mkOption {
+      type = types.str;
+      default = "24G";
+      description = "MemoryMax for the worker unit: the adapter process tree is killed at this ceiling, not the host.";
+    };
+
+    cpuQuota = mkOption {
+      type = types.str;
+      default = "800%";
+      description = "CPUQuota for the worker unit.";
+    };
+
+    tasksMax = mkOption {
+      type = types.ints.positive;
+      default = 8192;
+      description = "TasksMax for the worker unit.";
+    };
+
+    hubTokenFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = ''
+        File holding the `procedure` hub token. Loaded as the systemd
+        credential `infernix-hub-token`; workerd reads it through
+        `INFERNIX_HUB_TOKEN_FILE` and never puts it in the adapter envelope.
+      '';
+    };
+
+    gpuDevice = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "atlas-7900xtx";
+      description = ''
+        Device id whose gate lock (`/run/infernix/gpu/<device>.lock`) this
+        worker's adapters hold. Created with group `render`, mode 0660.
+      '';
+    };
+
     adapters = mkOption {
       type = types.attrsOf adapterSubmodule;
       default = { };
@@ -362,6 +442,23 @@ in
         contains only endpoint facts and logical adapter names; credentials,
         source, prompts, and executable command lines are not serialized here.
       '';
+    };
+  };
+
+  options.services.infernix.gpuGate = {
+    enable = mkEnableOption "the shared Infernix GPU device gate for non-ledger GPU tenants";
+
+    device = mkOption {
+      type = types.str;
+      default = config.networking.hostName;
+      description = "Device id whose lock file tenants take shared (for example `atlas-7900xtx`).";
+    };
+
+    lockPath = mkOption {
+      type = types.str;
+      readOnly = true;
+      default = gpuGate.lockPath gpuGateCfg.device;
+      description = "Resolved per-device gate lock. Adapters take it exclusively.";
     };
   };
 
@@ -380,6 +477,12 @@ in
       (name: adapter: {
         assertion = adapter.queues != [ ];
         message = "services.infernix.workloadFabric.adapters.${name}.queues must not be empty.";
+      })
+      cfg.adapters
+    ++ lib.mapAttrsToList
+      (name: adapter: {
+        assertion = adapter.profiles != [ ];
+        message = "services.infernix.workloadFabric.adapters.${name}.profiles must not be empty: a job's profile:<id> requirement selects the adapter.";
       })
       cfg.adapters
     ++ lib.concatLists (lib.mapAttrsToList
@@ -415,6 +518,26 @@ in
       ])
       cfg.profiles);
 
+    users.groups.${workerUser} = { };
+
+    users.users.${workerUser} = {
+      isSystemUser = true;
+      group = workerUser;
+      # The render group owns the DRM nodes; video owns the encoder devices.
+      extraGroups = [ "render" "video" ];
+      home = "/var/lib/infernix-workload";
+      description = "Infernix workload adapter user";
+    };
+
+    systemd.tmpfiles.rules = lib.unique (
+      [
+        "d ${toString cfg.stagingRoot} 0750 ${workerUser} ${workerUser} -"
+        "d ${toString cfg.cacheRoot} 0750 ${workerUser} ${workerUser} -"
+      ]
+      ++ lib.optional gpuGateCfg.enable (gpuGate.tmpfilesRule gpuGateCfg.device)
+      ++ lib.optional (cfg.gpuDevice != null) (gpuGate.tmpfilesRule cfg.gpuDevice)
+    );
+
     systemd.services.infernix-workload-migrate = {
       description = "Prepare the Infernix durable workload schema";
       wantedBy = [ "multi-user.target" ];
@@ -441,9 +564,23 @@ in
       requires = [ "infernix-workload-migrate.service" ];
       serviceConfig = {
         ExecStart = "${workerExec} --config ${configFile} worker";
+        User = workerUser;
+        Group = workerUser;
         EnvironmentFile = databaseEnvironmentFile;
-        Environment = databaseEnvironment;
+        Environment = databaseEnvironment
+          ++ lib.optional (cfg.hubTokenFile != null)
+            "INFERNIX_HUB_TOKEN_FILE=/run/credentials/infernix-workerd.service/infernix-hub-token"
+          ++ lib.optional (cfg.gpuDevice != null) "INFERNIX_GPU_DEVICE=${cfg.gpuDevice}"
+          ++ [ "INFERNIX_ADAPTER_CACHE_DIR=${toString cfg.cacheRoot}" ];
+        LoadCredential =
+          lib.optional (cfg.hubTokenFile != null) "infernix-hub-token:${cfg.hubTokenFile}";
         StateDirectory = "infernix-workload";
+        # Containment: adapter processes are killed at the unit's ceiling, not
+        # the host's.
+        MemoryMax = cfg.memoryMax;
+        CPUQuota = cfg.cpuQuota;
+        TasksMax = cfg.tasksMax;
+        ReadWritePaths = [cfg.stagingRoot cfg.cacheRoot] ++ map toString cfg.modelDirectories;
         Restart = "on-failure";
         RestartSec = 5;
         NoNewPrivileges = true;

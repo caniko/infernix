@@ -69,20 +69,27 @@ def collect(staging_directory, output_directory, specs):
     return artifacts
 
 
-def output_path(output_directory, relative):
-    """Resolve one output name under `output_directory`, refusing escapes.
-
-    Adapters call this before writing anything, so an absolute path, `..`
-    traversal or symlink that resolves outside the output directory is rejected
-    (exit 14) instead of landing outside the attempt.
-    """
+def _relative_parts(relative):
+    """The safe path components of an output name, or exit 14."""
     name = Path(relative)
     if name.is_absolute():
         raise invalid(f"output path {relative!r} is absolute")
     if not name.parts or any(part in ("", ".", "..") for part in name.parts):
         raise invalid(f"output path {relative!r} escapes the output directory")
+    return name.parts
+
+
+def output_path(output_directory, relative):
+    """Resolve one output name under `output_directory`, refusing escapes.
+
+    Adapters call this before writing anything, so an absolute path, `..`
+    traversal or symlink that resolves outside the output directory is rejected
+    (exit 14) instead of landing outside the attempt. A writer that must not be
+    raced uses `open_output`, which never follows a component at all.
+    """
+    parts = _relative_parts(relative)
     output = Path(os.path.realpath(output_directory))
-    target = Path(output_directory) / name
+    target = Path(output_directory).joinpath(*parts)
     if target.is_symlink():
         raise invalid(f"output path {relative!r} is a symlink")
     if output not in Path(os.path.realpath(target)).parents:
@@ -90,12 +97,47 @@ def output_path(output_directory, relative):
     return target
 
 
+_DIRECTORY = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+
+
+def _child_directory(parent, name):
+    """Open `name` below `parent` as a real directory, creating it when missing."""
+    try:
+        return os.open(name, _DIRECTORY, dir_fd=parent)
+    except FileNotFoundError:
+        os.mkdir(name, 0o755, dir_fd=parent)
+        return os.open(name, _DIRECTORY, dir_fd=parent)
+
+
 def open_output(output_directory, relative):
-    """Open one output file for writing; `O_NOFOLLOW` refuses a planted symlink."""
-    target = output_path(output_directory, relative)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
-    return os.fdopen(os.open(target, flags, 0o644), "wb")
+    """Open one output file for writing, never following a planted symlink.
+
+    Every component is opened relative to its parent directory's descriptor with
+    `O_NOFOLLOW`, so a directory swapped for a symlink between the check and the
+    write cannot redirect the file outside the attempt.
+    """
+    parts = _relative_parts(relative)
+    try:
+        directory = os.open(output_directory, _DIRECTORY)
+        try:
+            for part in parts[:-1]:
+                child = _child_directory(directory, part)
+                os.close(directory)
+                directory = child
+            descriptor = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=directory,
+            )
+        finally:
+            os.close(directory)
+    except OSError as error:
+        raise invalid(
+            f"output path {relative!r} cannot be opened without following a symlink: "
+            f"{error.strerror}"
+        ) from None
+    return os.fdopen(descriptor, "wb")
 
 
 def from_manifest(manifest, output_name):

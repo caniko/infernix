@@ -325,6 +325,20 @@ class RenderTests(unittest.TestCase):
             adapter.render(self.context())
         self.assertEqual(caught.exception.code, 12)
 
+    def test_initialization_oom_without_the_guard_marker_exits_12(self):
+        def fake_run(command, env, log_path, cancel):
+            # HIP aborts during device initialization, before the guard runs.
+            Path(log_path).write_text(
+                "Blender 4.5.0\n"
+                "HIP error: out of memory while creating the device context\n"
+            )
+            return 1
+
+        adapter._run = fake_run
+        with self.assertRaises(AdapterError) as caught:
+            adapter.render(self.context())
+        self.assertEqual(caught.exception.code, 12)
+
     def test_frames_are_retained_and_reused_by_fingerprint(self):
         renders = []
 

@@ -7,11 +7,14 @@ the module even if a dependency tries to import it.
 
 import ast
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common" / "src"))
@@ -84,6 +87,31 @@ class Item:
         self.sha256 = sha256
 
 
+def temporary_checkout(root):
+    """A disposable clean checkout; returns the commit the profile can pin.
+
+    The commit is written with plumbing (`commit-tree`) so the checkout's
+    developer hooks and signing configuration do not apply to a temp fixture.
+    """
+    root.mkdir(parents=True)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    (root / "pipeline.py").write_text("SOURCE = 'pinned'\n")
+    git("add", "pipeline.py")
+    tree = git("write-tree")
+    commit = git("commit-tree", tree, "-m", "fixture")
+    git("update-ref", "refs/heads/main", commit)
+    return commit
+
+
 class FakeContext:
     def __init__(self, root, params, inputs):
         self.staging_directory = root / "staging"
@@ -154,11 +182,44 @@ class TripoTests(unittest.TestCase):
         self.assertEqual(recorded["revision"], PROFILE["checkpoint"]["revision"])
 
     def test_the_pinned_source_commit_enters_the_runtime_fingerprint(self):
-        envelope = types.SimpleNamespace(profile=PROFILE)
-        self.assertEqual(
-            adapter.runtime_versions(envelope),
-            {"triposg": PROFILE["code"]["commit"]},
-        )
+        checkout = self.root / "triposg-checkout"
+        head = temporary_checkout(checkout)
+        profile = {**PROFILE, "code": {**PROFILE["code"], "commit": head}}
+        with mock.patch.dict(os.environ, {"INFERNIX_TRIPOSG_CODE": str(checkout)}):
+            self.assertEqual(
+                adapter.runtime_versions(types.SimpleNamespace(profile=profile)),
+                {"triposg": head},
+            )
+
+    def test_a_checkout_at_another_commit_fails_fingerprinting(self):
+        checkout = self.root / "triposg-other"
+        temporary_checkout(checkout)
+        profile = {**PROFILE, "code": {**PROFILE["code"], "commit": "f" * 40}}
+        with mock.patch.dict(os.environ, {"INFERNIX_TRIPOSG_CODE": str(checkout)}):
+            with self.assertRaises(AdapterError) as caught:
+                adapter.runtime_versions(types.SimpleNamespace(profile=profile))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("code.commit", str(caught.exception))
+
+    def test_a_dirty_checkout_fails_fingerprinting(self):
+        checkout = self.root / "triposg-dirty"
+        head = temporary_checkout(checkout)
+        (checkout / "pipeline.py").write_text("SOURCE = 'edited'\n")
+        profile = {**PROFILE, "code": {**PROFILE["code"], "commit": head}}
+        with mock.patch.dict(os.environ, {"INFERNIX_TRIPOSG_CODE": str(checkout)}):
+            with self.assertRaises(AdapterError) as caught:
+                adapter.runtime_versions(types.SimpleNamespace(profile=profile))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("uncommitted", str(caught.exception))
+
+    def test_a_missing_checkout_fails_fingerprinting(self):
+        environment = dict(os.environ)
+        environment.pop("INFERNIX_TRIPOSG_CODE", None)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(AdapterError) as caught:
+                adapter.runtime_versions(types.SimpleNamespace(profile=PROFILE))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("INFERNIX_TRIPOSG_CODE", str(caught.exception))
 
     def test_a_null_source_commit_fails_fingerprinting(self):
         profile = {**PROFILE, "code": {"repo": "x", "commit": None, "package": "triposg"}}
@@ -288,8 +349,6 @@ class TripoTests(unittest.TestCase):
         self.assertFalse([name for name in imports if "bria" in name.lower()])
 
     def test_code_checkout_goes_on_sys_path(self):
-        import os
-
         code = self.root / "triposg-checkout"
         (code / "triposg").mkdir(parents=True)
         (code / "triposg" / "__init__.py").write_text("")

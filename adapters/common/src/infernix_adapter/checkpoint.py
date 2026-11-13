@@ -6,6 +6,7 @@ an unpinned or unverifiable checkpoint is invalid input. No adapter falls back
 to random or unpinned weights.
 """
 
+import os
 import re
 from pathlib import Path
 
@@ -59,7 +60,11 @@ def _local_revision(profile):
 
 
 def verify_files(profile, directory):
-    """Verify every declared file hash under `directory`."""
+    """Verify every declared file hash under `directory`.
+
+    A Hugging Face cache stores every snapshot file as a symlink into `blobs/`,
+    so the hash is taken from the realpath target the adapter will load.
+    """
     root = Path(directory)
     entries = _files(profile)
     for entry in entries:
@@ -68,24 +73,39 @@ def verify_files(profile, directory):
         path = root / relative
         if not path.is_file():
             raise invalid(f"pinned checkpoint file missing: {path}")
-        actual = sha256_file(path)
+        actual = sha256_file(Path(os.path.realpath(path)))
         if actual != str(expected).lower():
             raise invalid(f"checkpoint file {relative} sha256 {actual} != {expected}")
     return entries
 
 
 def _refuse_unlisted_weights(root, entries):
-    """A local directory may not smuggle weights the profile does not declare."""
+    """A local directory may not smuggle weights the profile does not declare.
+
+    Hugging Face caches are symlink farms (`snapshots/<sha>/model.safetensors`
+    -> `blobs/<sha>`), so the walk follows links and checks every weight file
+    under the path it is found at. The realpath set keeps a link cycle from
+    looping.
+    """
     declared = {Path(entry["path"]).as_posix() for entry in entries}
-    for candidate in sorted(root.rglob("*")):
-        if candidate.suffix.lower() not in WEIGHT_SUFFIXES or not candidate.is_file():
+    visited = set()
+    for base, directories, files in os.walk(root, followlinks=True):
+        real = os.path.realpath(base)
+        if real in visited:
+            directories[:] = []
             continue
-        relative = candidate.relative_to(root).as_posix()
-        if relative not in declared:
-            raise invalid(
-                f"checkpoint directory contains an unlisted weight file: {relative}; "
-                "every weight the adapter may load needs its sha256 in checkpoint.files"
-            )
+        visited.add(real)
+        directories.sort()
+        for name in sorted(files):
+            candidate = Path(base) / name
+            if candidate.suffix.lower() not in WEIGHT_SUFFIXES or not candidate.is_file():
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            if relative not in declared:
+                raise invalid(
+                    f"checkpoint directory contains an unlisted weight file: {relative}; "
+                    "every weight the adapter may load needs its sha256 in checkpoint.files"
+                )
 
 
 def pinned_source(profile):

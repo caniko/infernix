@@ -12,6 +12,7 @@ import importlib.abc
 import json
 import os
 import re
+import subprocess
 import sys
 
 import numpy as np
@@ -25,6 +26,7 @@ REPO = "VAST-AI/TripoSG"
 FORBIDDEN_MODULES = ("briarmbg", "briaai")
 PADDING = 0.1
 SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+CHECKOUT_ENV = "INFERNIX_TRIPOSG_CODE"
 
 
 class _BlockBackgroundRemoval(importlib.abc.MetaPathFinder):
@@ -60,7 +62,7 @@ def pipeline_dtype(profile, params):
 
 def load_pipeline(source, revision, dtype=torch.float16):
     # Upstream ships no pyproject.toml: the checkout goes on sys.path.
-    code = os.environ.get("INFERNIX_TRIPOSG_CODE")
+    code = os.environ.get(CHECKOUT_ENV)
     if code and code not in sys.path:
         sys.path.insert(0, code)
     # model_index.json names a custom scheduler; diffusers only loads a custom
@@ -199,6 +201,53 @@ def _simplify(mesh, faces_target):
     )
 
 
+def _git(checkout, *arguments):
+    done = subprocess.run(
+        ["git", "-C", checkout, *arguments],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return done.stdout
+
+
+def verified_head(commit):
+    """The verified HEAD of the TripoSG checkout the adapter actually imports.
+
+    Hashing a profile label is not provenance: the checkout on disk must be the
+    pinned commit and carry no uncommitted change, or the fingerprint would name
+    source the operation never loaded.
+    """
+    checkout = os.environ.get(CHECKOUT_ENV)
+    if not checkout:
+        raise AdapterError(
+            14,
+            f"{CHECKOUT_ENV} is required: the fingerprint must cover the TripoSG "
+            "checkout that is imported",
+        )
+    try:
+        head = _git(checkout, "rev-parse", "HEAD").strip().lower()
+        changes = _git(checkout, "status", "--porcelain")
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AdapterError(
+            14, f"cannot verify the TripoSG checkout {checkout}: {error}"
+        ) from error
+    if head != commit:
+        raise AdapterError(
+            14,
+            f"TripoSG checkout {checkout} is at {head or 'no commit'}, "
+            f"profile code.commit is {commit}",
+        )
+    if changes.strip():
+        raise AdapterError(
+            14,
+            f"TripoSG checkout {checkout} has uncommitted changes; the fingerprint "
+            "can only cover the pinned source",
+        )
+    return head
+
+
 def runtime_versions(envelope):
     """The pinned TripoSG source commit the content fingerprint must cover."""
     commit = ((envelope.profile or {}).get("code") or {}).get("commit")
@@ -209,7 +258,7 @@ def runtime_versions(envelope):
             "profile code.commit must be the pinned TripoSG source commit sha: "
             f"{commit!r} is not a full 40-hex commit",
         )
-    return {"triposg": digest}
+    return {"triposg": verified_head(digest)}
 
 
 def main():

@@ -621,6 +621,26 @@ class ResultTests(Harness):
         self.assertEqual(caught.exception.code, 14)
         self.assertEqual(secret.read_bytes(), b"untouched")
 
+    def test_open_output_refuses_an_intermediate_swapped_for_a_symlink(self):
+        out = self.staging / "out"
+        out.mkdir(exist_ok=True)
+        outside = self.directory / "outside"
+        outside.mkdir()
+
+        def swap(path, mode=0o777, *, dir_fd=None):
+            # The attacker wins the race exactly where the writer creates the
+            # missing intermediate: a symlink to `outside` appears instead of a
+            # directory, after the writer checked the name.
+            os.symlink(str(outside), path, dir_fd=dir_fd)
+
+        with mock.patch.object(os, "mkdir", swap):
+            with self.assertRaises(AdapterError) as caught:
+                result.open_output(out, "nested/line.wav")
+        self.assertEqual(caught.exception.code, 14)
+        self.assertEqual(
+            list(outside.iterdir()), [], "nothing may be written outside the attempt"
+        )
+
     def test_rejects_duplicate_sources(self):
         out = self.staging / "out"
         out.mkdir()
@@ -743,6 +763,56 @@ class CheckpointTests(Harness):
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("unlisted weight file", str(caught.exception))
         self.assertIn("weights.bin", str(caught.exception))
+
+    def test_an_unlisted_weight_under_a_symlinked_directory_is_rejected(self):
+        root = self.directory / "linked"
+        root.mkdir()
+        (root / "config.json").write_text("{}")
+        elsewhere = self.directory / "elsewhere"
+        (elsewhere / "transformer").mkdir(parents=True)
+        (elsewhere / "transformer" / "model.safetensors").write_bytes(b"smuggled")
+        (root / "transformer").symlink_to(elsewhere / "transformer")
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source(
+                {
+                    "checkpoint": {
+                        "localPath": str(root),
+                        "files": [
+                            {
+                                "path": "config.json",
+                                "sha256": hashlib.sha256(b"{}").hexdigest(),
+                            }
+                        ],
+                    }
+                }
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("unlisted weight file", str(caught.exception))
+        self.assertIn("transformer/model.safetensors", str(caught.exception))
+
+    def test_a_declared_file_behind_a_huggingface_blob_symlink_is_accepted(self):
+        root = self.directory / "hf-cache"
+        snapshot = root / "snapshots" / ("a" * 40)
+        snapshot.mkdir(parents=True)
+        blobs = root / "blobs"
+        blobs.mkdir()
+        payload = b"weights"
+        blob = blobs / hashlib.sha256(payload).hexdigest()
+        blob.write_bytes(payload)
+        relative = f"snapshots/{'a' * 40}/model.safetensors"
+        (snapshot / "model.safetensors").symlink_to(blob)
+        source, revision = checkpoint.pinned_source(
+            {
+                "checkpoint": {
+                    "revision": PINNED,
+                    "localPath": str(root),
+                    "files": [
+                        {"path": relative, "sha256": hashlib.sha256(payload).hexdigest()}
+                    ],
+                }
+            }
+        )
+        self.assertEqual((source, revision), (str(root), PINNED))
 
     def test_a_local_file_needs_a_matching_hash_entry(self):
         target = self.directory / "sam.pt"

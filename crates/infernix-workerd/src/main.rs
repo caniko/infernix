@@ -28,7 +28,7 @@ use tokio::{
     io::AsyncWriteExt,
     process::Command,
     task::JoinSet,
-    time::{Instant, interval, sleep, sleep_until},
+    time::{Instant, Interval, interval, sleep, sleep_until},
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -872,6 +872,8 @@ async fn renew_lease(
 /// SIGKILL is sent once the SIGTERM grace is over and retried on every cycle.
 /// A group that survives SIGKILL (a D-state member) keeps its lease: the worker
 /// heartbeats and retries instead of confirming a cancellation it cannot prove.
+/// One heartbeat spans the whole termination, so a lease shorter than a wait can
+/// never expire while this worker still owns the job.
 async fn ensure_group_gone(
     client: &WorkloadClient,
     config: &Config,
@@ -883,9 +885,9 @@ async fn ensure_group_gone(
         return Ok(());
     }
     let lease_duration = Duration::seconds(config.worker.lease_duration_secs as i64);
+    let mut heartbeat = interval(StdDuration::from_secs(config.worker.heartbeat_interval_secs));
+    heartbeat.tick().await; // the first tick resolves immediately
     if let Some(deadline) = term_deadline {
-        let mut heartbeat = interval(StdDuration::from_secs(config.worker.heartbeat_interval_secs));
-        heartbeat.tick().await; // the first tick resolves immediately
         while Instant::now() < deadline && !group_gone(pid) {
             tokio::select! {
                 _ = sleep(StdDuration::from_millis(50)) => {}
@@ -896,7 +898,16 @@ async fn ensure_group_gone(
         }
     }
     loop {
-        if kill_and_wait(pid, GROUP_KILL_WAIT).await {
+        let gone = kill_and_wait(
+            client,
+            lease,
+            lease_duration,
+            &mut heartbeat,
+            pid,
+            GROUP_KILL_WAIT,
+        )
+        .await?;
+        if gone {
             return Ok(());
         }
         warn!(
@@ -904,19 +915,38 @@ async fn ensure_group_gone(
             pid,
             "adapter process group survived SIGKILL; keeping the lease and retrying"
         );
-        renew_lease(client, lease, lease_duration, pid).await?;
-        sleep(GROUP_KILL_RETRY).await;
+        tokio::select! {
+            _ = sleep(GROUP_KILL_RETRY) => {}
+            _ = heartbeat.tick() => {
+                renew_lease(client, lease, lease_duration, pid).await?;
+            }
+        }
     }
 }
 
 /// SIGKILL the group and report whether ESRCH proves it empty before `wait`.
-async fn kill_and_wait(pid: u32, wait: StdDuration) -> bool {
+///
+/// Every cycle renews the lease and the worker heartbeat, so the wait itself
+/// cannot let a short lease expire.
+async fn kill_and_wait(
+    client: &WorkloadClient,
+    lease: &infernix_workload::Lease,
+    lease_duration: Duration,
+    heartbeat: &mut Interval,
+    pid: u32,
+    wait: StdDuration,
+) -> Result<bool> {
     signal_group(pid, libc::SIGKILL);
     let deadline = Instant::now() + wait;
     while !group_gone(pid) && Instant::now() < deadline {
-        sleep(StdDuration::from_millis(20)).await;
+        tokio::select! {
+            _ = sleep(StdDuration::from_millis(20)) => {}
+            _ = heartbeat.tick() => {
+                renew_lease(client, lease, lease_duration, pid).await?;
+            }
+        }
     }
-    group_gone(pid)
+    Ok(group_gone(pid))
 }
 
 /// True when no process remains in the adapter's process group.
@@ -1264,14 +1294,15 @@ mod tests {
             !group_gone(pid),
             "a zombie member keeps the process group alive"
         );
+        signal_group(pid, libc::SIGKILL);
         assert!(
-            !kill_and_wait(pid, StdDuration::from_millis(200)).await,
+            !group_gone(pid),
             "a group that survives SIGKILL must not be reported gone"
         );
 
         // Reaping the last member empties the group and ESRCH proves it.
         child.wait().await.expect("reap the group member");
-        assert!(kill_and_wait(pid, StdDuration::from_millis(200)).await);
+        assert!(group_gone(pid));
     }
 
     #[tokio::test]
@@ -1288,7 +1319,14 @@ mod tests {
         // its own zombie would keep the group alive forever.
         let (_, gone) = tokio::join!(
             async { child.wait().await.expect("reap the group leader") },
-            async { kill_and_wait(pid, StdDuration::from_secs(5)).await }
+            async {
+                signal_group(pid, libc::SIGKILL);
+                let deadline = Instant::now() + StdDuration::from_secs(5);
+                while !group_gone(pid) && Instant::now() < deadline {
+                    sleep(StdDuration::from_millis(20)).await;
+                }
+                group_gone(pid)
+            }
         );
         assert!(gone, "SIGKILL must clear a TERM-ignoring group");
     }
@@ -1297,6 +1335,5 @@ mod tests {
     async fn a_missing_group_is_gone() {
         let pid = 2_000_000_000u32; // far above pid_max: ESRCH
         assert!(group_gone(pid));
-        assert!(kill_and_wait(pid, StdDuration::from_millis(50)).await);
     }
 }

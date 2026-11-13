@@ -1021,3 +1021,81 @@ async fn a_group_that_survives_sigkill_keeps_its_lease_and_is_never_confirmed() 
         .await;
     worker.stop().await;
 }
+
+async fn lease_row(
+    client: &WorkloadClient,
+    job: &JobId,
+) -> (Option<String>, Option<chrono::DateTime<chrono::Utc>>) {
+    let row = client
+        .raw()
+        .query_one(
+            "SELECT lease_token, lease_expires_at FROM infernix_workload_jobs WHERE id = $1",
+            &[&job.as_str()],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1))
+}
+
+#[tokio::test]
+async fn a_short_lease_is_renewed_through_the_group_termination_wait() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("short-lease", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.py", SURVIVING_GROUP_ADAPTER);
+    // A 3 s lease with a 1 s heartbeat: the 10 s SIGKILL wait outlives the
+    // lease unless the wait itself heartbeats.
+    let config = fixture.write_config_timed(&[("fixture-rocm", &adapter)], 1, 3);
+
+    let spec = job("job-short-lease");
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+    let staging = fixture.staging_root.join("job-short-lease/1");
+    wait_for_file(&staging.join("ready")).await;
+
+    fixture.cancel(&config, spec.id.as_str()).await;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let status = client.status(&spec.id).await.unwrap().unwrap();
+            if status.cancel_requested_at.is_some() {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker never observed the cancellation");
+    let (token, _) = lease_row(&client, &spec.id).await;
+
+    // The SIGTERM grace (2 s) plus the whole SIGKILL wait: the lease must stay
+    // current, and the job must stay with this worker for the whole window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while std::time::Instant::now() < deadline {
+        let (current, expires) = lease_row(&client, &spec.id).await;
+        assert_eq!(current, token, "another claim took the job");
+        assert!(
+            expires.is_some_and(|value| value > chrono::Utc::now()),
+            "the lease expired during the group-termination wait"
+        );
+        let status = client.status(&spec.id).await.unwrap().unwrap();
+        assert_eq!(
+            status.state,
+            JobState::Leased,
+            "a live process group must never be confirmed as cancelled"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+    let status = client.status(&spec.id).await.unwrap().unwrap();
+    assert_eq!(status.attempts, 1, "the job was never re-claimed");
+
+    // Release the zombie; the group empties and the worker may confirm.
+    std::fs::write(staging.join("release"), b"").unwrap();
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Cancelled)
+        .await;
+    worker.stop().await;
+}

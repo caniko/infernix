@@ -42,6 +42,9 @@ Adapters load only that checkpoint, and `checkpoint.py` enforces the pin:
   sha256;
 - a local directory must not contain a weight file
   (`*.safetensors|*.bin|*.pt|*.pth|*.ckpt|*.gguf`) that `files` does not list;
+  the walk follows symlinked directories (a Hugging Face cache is a
+  `snapshots/<sha>/model.safetensors` → `blobs/<sha>` link farm) and hashes the
+  file each declared path resolves to;
 - a local file (`checkpoint.localPath` for an adapter that loads one file) needs
   a matching `files` entry, or it is refused.
 
@@ -100,8 +103,10 @@ buffered C output lands before the result rather than after it.
 
 The fingerprint covers an adapter-specific runtime identity as well: the
 Blender adapter hashes the parsed `blender --version` string, and the TripoSG
-adapter hashes the profile's pinned `code.commit`. A runtime identity the
-adapter cannot read is `invalid_input` (14) instead of being hashed as null.
+adapter hashes the `HEAD` of the checkout at `$INFERNIX_TRIPOSG_CODE` after
+proving it equals the profile's `code.commit` and `git status --porcelain` is
+empty. A runtime identity the adapter cannot read, or a checkout that is not the
+pinned source, is `invalid_input` (14) instead of being hashed as null.
 
 ### Tests
 
@@ -371,10 +376,11 @@ imports only the `triposg` package and installs an import blocker that refuses
 `briarmbg`/`briaai` at runtime; a test proves no BRIA loader is referenced in
 code.
 
-The content fingerprint covers the profile's pinned `code.commit` (the source
-checkout the adapter imports), so a different checkout can never reuse a cache
-entry. Three patches in `triposg/patches/` make the pinned checkout (fc5c409)
-runnable:
+The content fingerprint covers the verified checkout: the adapter resolves
+`$INFERNIX_TRIPOSG_CODE`, requires `git rev-parse HEAD` to equal the profile's
+`code.commit` and `git status --porcelain` to be empty, and hashes that `HEAD`,
+so a different or modified checkout can never reuse a cache entry. Three
+patches in `triposg/patches/` make the pinned checkout (fc5c409) runnable:
 
 1. `diso` import made lazy — only the flash decoder uses `DiffDMC`, and `diso`
    ships an sdist that needs a CUDA toolkit to build.

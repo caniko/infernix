@@ -259,19 +259,34 @@ def _read_log(path):
         return ""
 
 
+def _findings(text):
+    return [line for line in text.splitlines()[-20:] if line.strip()]
+
+
+def _oom_error(code, text):
+    """Blender ran out of memory, or None.
+
+    A driver out-of-memory can also exit 13, and an initialization OOM aborts
+    before the guard can print its marker, so OOM is classified on its own.
+    """
+    if code != 12 and not is_oom(RuntimeError(text)):
+        return None
+    return AdapterError(
+        12, f"blender ran out of memory (exit {code})", findings=_findings(text)
+    )
+
+
 def _classify_blender_exit(code, text):
     """Map the Blender subprocess exit before the generic failure branch."""
-    findings = [line for line in text.splitlines()[-20:] if line.strip()]
-    # OOM is classified first: a driver out-of-memory can also exit 13, and
-    # must not be recorded as a backend mismatch.
-    if code == 12 or is_oom(RuntimeError(text)):
-        return AdapterError(12, f"blender ran out of memory (exit {code})", findings=findings)
+    failure = _oom_error(code, text)
+    if failure is not None:
+        return failure
     if code == 13:
         return AdapterError(
-            13, "blender refused the operation (exit 13)", findings=findings
+            13, "blender refused the operation (exit 13)", findings=_findings(text)
         )
     if code != 0:
-        return AdapterError(1, f"blender exited {code}", findings=findings)
+        return AdapterError(1, f"blender exited {code}", findings=_findings(text))
     return None
 
 
@@ -329,11 +344,16 @@ def render(context):
         log_path = logs / "blender.log"
         code = _run(command, environment, log_path, context.cancel)
         text = _read_log(log_path)
+        # An initialization OOM aborts before the guard marker is printed; it is
+        # still an OOM (12), never a guard refusal (13).
+        failure = _oom_error(code, text)
+        if failure is not None:
+            raise failure
         if GUARD_OK not in text:
             raise adapter.AdapterError(
                 13,
                 f"Cycles {device_type} guard refused the operation (blender exit {code})",
-                findings=[line for line in text.splitlines()[-20:] if line.strip()],
+                findings=_findings(text),
             )
         failure = _classify_blender_exit(code, text)
         if failure is not None:

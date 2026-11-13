@@ -152,10 +152,12 @@ attempt's `CANCEL` file, sends `SIGTERM` to the adapter's process group, waits
 `kill(-pgid, 0)` until ESRCH proves the whole group is gone — a descendant that
 ignores `SIGTERM` is killed and reaped first — and only then runs
 `CONFIRM_CANCELLED`. A member that survives `SIGKILL` (for example a D-state
-process) keeps the lease: the worker renews it with each heartbeat cycle and
-retries `SIGKILL`; it never confirms a cancellation it cannot prove. A fenced
-completion that is refused because a cancellation was requested runs the same
-termination and ESRCH check before confirming. A job whose confirmation was
+process) keeps the lease: the worker renews it with each heartbeat cycle —
+during the `SIGTERM` grace and on every iteration of the `SIGKILL` wait — and
+retries `SIGKILL`; it never confirms a cancellation it cannot prove, and a lease
+shorter than a wait can never expire while the worker still owns the job. A
+fenced completion that is refused because a cancellation was requested runs the
+same termination and ESRCH check before confirming. A job whose confirmation was
 fenced is left to the worker that won the lease.
 
 ## Delivery

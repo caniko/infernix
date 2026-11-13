@@ -163,15 +163,16 @@ fingerprint stability and sensitivity (params, seed, inputs, profile, checkpoint
 revision, runtime including installed package, torch, HIP, CUDA and XPU
 versions, an adapter-specific renderer version or source commit, and a null
 identity refused); full-sha, local-directory and local-file checkpoint
-resolution (branch/tag/short sha rejected, undeclared weights rejected);
-output-path traversal, realpath escapes and symlinks (also through
-`O_NOFOLLOW`); cache corruption/missing file forcing a recompute; and a cache
-hit restoring the stored validation. The XPU branches are covered without an
-Intel card: device selection and mismatch, `mem_get_info` and the fail-closed
-refusal when it is absent, i915 fdinfo parsing keyed by DRM client,
-duplicated-descriptor dedupe, fd reuse by another client, regressing counters,
-engine capacity and overlapping engines, the final snapshot in `stop()`, and
-the allocator peak merge.
+resolution (branch/tag/short sha rejected, undeclared weights, undeclared files
+and a weight index naming an undeclared shard rejected, a nested index escaping
+the checkpoint root rejected); output-path traversal, realpath escapes and
+symlinks (also through `O_NOFOLLOW`); cache corruption/missing file forcing a
+recompute; and a cache hit restoring the stored validation. The XPU branches
+are covered without an Intel card: device selection and mismatch, `mem_get_info`
+and the fail-closed refusal when it is absent, i915 fdinfo parsing keyed by DRM
+client, duplicated-descriptor dedupe, fd reuse by another client, regressing
+counters, engine capacity and overlapping engines, the final snapshot in
+`stop()`, and the allocator peak merge.
 
 Per-adapter suites (each needs that worker's venv: `numpy`, `torch`, `pillow`,
 and for TripoSG `trimesh`/`pymeshlab`):
@@ -467,10 +468,39 @@ PY
 ```
 
 The first three downloads are ungated. The last one needs the Llama 3 licence
-acceptance on the account behind the token, and its four
-`model-*-of-00004.safetensors` sha256s must then be added to
-`helpers[0].checkpoints[0].files`; the adapter refuses to load a checkpoint that
-declares no hashes.
+acceptance on the account behind the token, and every file of each snapshot
+(weights, shard index, configs, adapter configs, tokenizer files, generation
+config, plus the README/licence/attributes the snapshot ships) must then be
+added to `helpers[0].checkpoints[i].files` with its sha256:
+
+```sh
+python - <<'PY'
+import hashlib, json
+from pathlib import Path
+
+cache = Path("/data/nvme0/models/animation-dev/kimodo/hf-cache")
+for repo, revision in [
+    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp", "31474e395ada192e8ed1586db6be79fb3b70c9c0"),
+    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised", "baa8ebf04a1c2500e61288e7dad65e8ae42601a7"),
+    ("meta-llama/Meta-Llama-3-8B-Instruct", "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2"),
+]:
+    root = cache / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
+    files = [
+        {"path": path.relative_to(root).as_posix(),
+         "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        for path in sorted(root.rglob("*"))
+        if path.is_file() or path.is_symlink()
+    ]
+    print(repo, json.dumps(files, indent=2))
+PY
+```
+
+The adapter refuses to load a snapshot that declares no files, misses one of
+its loader files, or carries any file the profile does not declare; it also
+refuses a checkpoint whose `config.yaml` is not declared, because Hydra
+instantiates classes and picks weight paths from it. The initial profile keeps
+`helpers[0].checkpoints[0].files` empty, so a job fails closed with exit 14 and
+names the checkpoint rather than loading unverified weights.
 
 ### Per-adapter notes
 
@@ -584,11 +614,13 @@ model([prompt], [frames], num_denoising_steps=100, multi_prompt=True,
 ```
 
 `post_processing=True` runs the `motion_correction` C++ extension (foot-skate
-cleanup, CPU). `params`: `prompt` (required), `durationSeconds` (default 4,
-bounded by `limits.maxOutputSeconds` and by `limits.maxFrames` at the model's
-30 fps), `diffusionSteps` (default 100), `outputName` (default `motion.bvh`).
-The seed is `payload.seed`, applied by the shared runner before the checkpoint
-loads.
+cleanup, CPU). `params`: `prompt` (required, at most 1000 characters),
+`durationSeconds` (default 4, a finite number up to `limits.maxOutputSeconds`
+and `limits.maxFrames` at the model's 30 fps), `diffusionSteps` (default 100,
+1–1000), `outputName` (default `motion.bvh`, checked for traversal). The seed is
+`payload.seed` (0–2³²−1), applied by the shared runner before the checkpoint
+loads. Every parameter is validated before a model is built; a bad one is exit
+14.
 
 The output is one BVH (`application/x-bvh`): the somaskel77 hierarchy, root
 translation plus per-joint ZYX local rotations, `Frame Time: 1/30`, offsets and
@@ -596,19 +628,30 @@ root motion in centimetres (metres × 100, the BONES-SEED convention), and the
 standard T-pose as rest pose (`standard_tpose=True`), which is what Blender's
 BVH importer wants for retargeting. Clips run up to 10 s (300 frames at 30 fps).
 
-The checkpoint is resolved without a Hub lookup: `checkpoint.localPath` must be
-the directory named `Kimodo-SOMA-RP-v1.2` because upstream resolves a model as
-`CHECKPOINT_DIR/<display name>`, so the name is load-bearing; a directory by
-another name is `invalid_input` rather than a silent unpinned download.
-`pinned_source` verifies every declared sha256 first.
+The checkpoint must be a local directory from the profile: `checkpoint.localPath`
+is required and must be named `Kimodo-SOMA-RP-v1.2`, because upstream resolves a
+model as `CHECKPOINT_DIR/<display name>`, so the name is load-bearing. A
+remote-only or misnamed checkpoint is `invalid_input` rather than a silent
+unpinned download. `pinned_source` verifies every declared sha256, refuses an
+undeclared weight, and requires every shard named by a weights index to be
+declared. `config.yaml` must be one of the declared files, because Hydra
+instantiates the classes (`_target_`) and the denoiser weights (`ckpt_path`)
+from it; every path the config resolves to must be a declared file inside the
+verified directory.
 
 The text encoder is LLM2Vec over the gated Meta-Llama-3-8B-Instruct: the base
 8B weights plus two stacked LoRA adapters (mntp, then mntp-supervised). All
-three snapshots are pinned in `helpers[0].checkpoints`, resolved from the
-Hugging Face cache in `helpers[0].localPath`, and verified file by file
-(every weight in the snapshot must be declared, and the cache must resolve each
-repo to the pinned snapshot). The process runs with `HF_HUB_OFFLINE=1`, so
-`from_pretrained` cannot reach the Hub at all, and `TEXT_ENCODER_DEVICE` is
+three snapshots are pinned in `helpers[0].checkpoints` with full 40-hex
+revisions, resolved from the Hugging Face cache in `helpers[0].localPath`, and
+verified file by file: the loader's files (weights, shard index, config.json,
+adapter_config.json, tokenizer files, generation_config) must be declared, and
+every other file in the snapshot must be declared too. Each loader call is
+bound to the verified snapshot's absolute path; the one repo id that remains
+(the LoRA's `base_model_name_or_path`) resolves offline from the same cache, and
+`adapter_config.json` may only name the declared base. The process clears
+`TEXT_ENCODERS_DIR` and pins `HF_HOME`, `HF_HUB_CACHE`,
+`HUGGINGFACE_CACHE_DIR`, `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` to the
+verified cache, so no resolution can reach the Hub, and `TEXT_ENCODER_DEVICE` is
 pinned to the selected GPU — upstream's `TEXT_ENCODER_DEVICE=cpu` path is never
 taken. The fingerprint covers the installed `kimodo` distribution's PEP 610
 commit and the three encoder pins, so a cache entry cannot be reused across a

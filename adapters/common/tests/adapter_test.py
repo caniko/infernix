@@ -1170,6 +1170,43 @@ class CheckpointTests(Harness):
         self.assertIn("unlisted weight file", str(caught.exception))
         self.assertIn("weights.bin", str(caught.exception))
 
+    def test_a_weight_index_may_only_name_declared_shards(self):
+        root = self.directory / "indexed"
+        root.mkdir()
+        index = root / "model.safetensors.index.json"
+        index.write_text(
+            json.dumps({"weight_map": {"layer.0": "model-00002-of-00002.safetensors"}})
+        )
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source(
+                {
+                    "checkpoint": {
+                        "localPath": str(root),
+                        "files": [
+                            {
+                                "path": index.name,
+                                "sha256": hashlib.sha256(index.read_bytes()).hexdigest(),
+                            }
+                        ],
+                    }
+                }
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("model-00002-of-00002.safetensors", str(caught.exception))
+
+    def test_a_directory_can_require_every_file_to_be_declared(self):
+        root = self.directory / "snapshot"
+        root.mkdir()
+        config = root / "config.json"
+        config.write_text("{}")
+        entries = [{"path": "config.json", "sha256": hashlib.sha256(b"{}").hexdigest()}]
+        checkpoint.verify_directory(root, entries, suffixes=None)
+        (root / "tokenizer.json").write_text("{}")
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.verify_directory(root, entries, suffixes=None)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("tokenizer.json", str(caught.exception))
+
     def test_an_unlisted_weight_under_a_symlinked_directory_is_rejected(self):
         root = self.directory / "linked"
         root.mkdir()

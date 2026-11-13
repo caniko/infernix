@@ -5,6 +5,7 @@ description = "Kimodo-SOMA text-to-motion adapter for infernix animation (atlas 
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "infernix-adapter",
+  "jinja2>=3.1",
   "kimodo @ git+https://github.com/nv-tlabs/kimodo@e1c219c99b4b94ba48be1fb6a1cbc64ecee4c954",
   "numpy>=2.0",
   "torch==2.14.1",
@@ -17,7 +18,14 @@ index-strategy = "unsafe-best-match"
 [tool.uv.sources]
 infernix-adapter = { path = "../common" }
 torch = { index = "pytorch-rocm" }
+# The ROCm index publishes jinja2's wheel without a sha256 link fragment, so a
+# lock entry taken from it carries no hash. Prefer PyPI, which publishes one.
+jinja2 = { index = "pypi" }
 
 [[tool.uv.index]]
 name = "pytorch-rocm"
 url = "https://download.pytorch.org/whl/rocm7.2"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"

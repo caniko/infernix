@@ -6,6 +6,7 @@ an unpinned or unverifiable checkpoint is invalid input. No adapter falls back
 to random or unpinned weights.
 """
 
+import json
 import os
 import re
 from pathlib import Path
@@ -14,6 +15,7 @@ from .exits import invalid
 from .hub import sha256_file
 
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+INDEX_SUFFIX = ".index.json"
 WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
 
 
@@ -59,14 +61,12 @@ def _local_revision(profile):
     return value.strip()
 
 
-def verify_files(profile, directory):
-    """Verify every declared file hash under `directory`.
+def _verify_entries(root, entries):
+    """Verify every declared file hash in `entries` under `root`.
 
     A Hugging Face cache stores every snapshot file as a symlink into `blobs/`,
     so the hash is taken from the realpath target the adapter will load.
     """
-    root = Path(directory)
-    entries = _files(profile)
     for entry in entries:
         relative = entry.get("path")
         expected = entry.get("sha256")
@@ -76,19 +76,54 @@ def verify_files(profile, directory):
         actual = sha256_file(Path(os.path.realpath(path)))
         if actual != str(expected).lower():
             raise invalid(f"checkpoint file {relative} sha256 {actual} != {expected}")
+
+
+def verify_files(profile, directory):
+    """Verify every declared checkpoint file hash under `directory`."""
+    entries = _files(profile)
+    _verify_entries(Path(directory), entries)
     return entries
 
 
-def _refuse_unlisted_weights(root, entries):
-    """A local directory may not smuggle weights the profile does not declare.
+def index_referenced_files(directory):
+    """Every shard a weight index names, relative to `directory`."""
+    root = Path(directory)
+    referenced = set()
+    for index in sorted(root.glob(f"*{INDEX_SUFFIX}")):
+        try:
+            document = json.loads(index.read_text())
+        except (OSError, ValueError) as error:
+            raise invalid(f"weight index {index.name} is unreadable: {error}") from error
+        weight_map = document.get("weight_map") if isinstance(document, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise invalid(f"weight index {index.name} declares no weight_map")
+        for shard in weight_map.values():
+            if (
+                not isinstance(shard, str)
+                or not shard
+                or shard in (".", "..")
+                or "/" in shard
+            ):
+                raise invalid(f"weight index {index.name} names an invalid shard {shard!r}")
+            referenced.add(shard)
+    return referenced
+
+
+def refuse_unlisted_weights(root, entries, suffixes=WEIGHT_SUFFIXES):
+    """A local directory may not smuggle files the profile does not declare.
+
+    `suffixes` limits the rule to weight files (the default); `None` requires
+    every file in the directory to be declared, which is how a Hugging Face
+    snapshot whose configs steer loading is verified.
 
     Hugging Face caches are symlink farms (`snapshots/<sha>/model.safetensors`
-    -> `blobs/<sha>`), so the walk follows links and checks every weight file
-    under the path it is found at. Cycles are cut by ancestry, not by a global
-    set of visited real directories: `transformer -> a` is a second relative
-    path onto the same directory, and a weight behind it is undeclared even
-    when `a/` was walked first.
+    -> `blobs/<sha>`), so the walk follows links and checks every file under
+    the path it is found at. Cycles are cut by ancestry, not by a global set of
+    visited real directories: `transformer -> a` is a second relative path onto
+    the same directory, and a weight behind it is undeclared even when `a/` was
+    walked first.
     """
+    root = Path(root)
     declared = {Path(entry["path"]).as_posix() for entry in entries}
     for base, directories, files in os.walk(root, followlinks=True):
         from_root = Path(os.path.relpath(base, root))
@@ -103,14 +138,37 @@ def _refuse_unlisted_weights(root, entries):
         directories.sort()
         for name in sorted(files):
             candidate = Path(base) / name
-            if candidate.suffix.lower() not in WEIGHT_SUFFIXES or not candidate.is_file():
+            if suffixes is not None and candidate.suffix.lower() not in suffixes:
+                continue
+            if not candidate.is_file():
                 continue
             relative = candidate.relative_to(root).as_posix()
             if relative not in declared:
+                kind = "weight file" if suffixes is not None else "file"
                 raise invalid(
-                    f"checkpoint directory contains an unlisted weight file: {relative}; "
-                    "every weight the adapter may load needs its sha256 in checkpoint.files"
+                    f"checkpoint directory contains an unlisted {kind}: {relative}; "
+                    "every file the adapter may load needs its sha256 in the declared files"
                 )
+
+
+def verify_directory(directory, entries, suffixes=WEIGHT_SUFFIXES):
+    """Hash-verify a directory and refuse anything it would load undeclared.
+
+    Declared hashes are checked, shard indexes may only name declared files,
+    and every matching file (weights by default, everything when `suffixes` is
+    `None`) must be declared.
+    """
+    root = Path(directory)
+    _verify_entries(root, entries)
+    refuse_unlisted_weights(root, entries, suffixes)
+    declared = {Path(entry["path"]).as_posix() for entry in entries}
+    missing = sorted(index_referenced_files(root) - declared)
+    if missing:
+        raise invalid(
+            f"weight index in {root} names undeclared shards: {', '.join(missing)}; "
+            "every shard a checkpoint loads needs its sha256 declared"
+        )
+    return entries
 
 
 def pinned_source(profile):
@@ -120,8 +178,7 @@ def pinned_source(profile):
         path = Path(local)
         if not path.is_dir():
             raise invalid(f"profile checkpoint.localPath is not a directory: {local}")
-        entries = verify_files(profile, path)
-        _refuse_unlisted_weights(path, entries)
+        verify_directory(path, _files(profile))
         return str(path), _local_revision(profile)
     repo = _checkpoint(profile).get("repo")
     if not isinstance(repo, str) or not repo.strip():

@@ -19,7 +19,7 @@ the profile.
 | `sam2/` | `mask` | atlas (ROCm), murph (XPU) | hardware-tested (ROCm) |
 | `blender-cycles-hip/` | `render_preview` / `render_final` | atlas (HIP), nomad (OPTIX) | hardware-tested (preview fixture) |
 | `triposg/` | `geometry` | nomad (CUDA) | see evidence table |
-| `kimodo/` | `motion` | atlas (ROCm) | blocked: gated text encoder (see evidence) |
+| `kimodo/` | `motion` | atlas (ROCm) | hardware-tested (encoder fetched from a hash-verified mirror) |
 | `audio2face/` | `face` | nomad (CUDA) | **blocked, not built** |
 
 `profile.example.json` in each directory is a section-5 profile. The examples
@@ -227,7 +227,7 @@ with the desktop's 4 GiB). No run was skipped.
 | `triposg` | nomad 4090 Laptop | 1024² image + SAM mask → GLB | 188.32 s | 12.0 GiB | 179.26 | 188.22 | 88 | 81 | `hardware-tested` (hierarchical decoder, fp32) |
 | `qwen3-tts` | murph `A770` | 1 line → 24 kHz wav | — | — | — | — | — | — | not run: admission gate closed |
 | `sam2` | murph `A770` | 512², 1 point | — | — | — | — | — | — | not run: admission gate closed |
-| `kimodo` | atlas `gfx1100` | 3 s prompt → BVH | — | — | — | — | — | — | not run: gated text encoder |
+| `kimodo` | atlas `gfx1100` | 4 s prompt → BVH, 100 steps | 54.70 s | 17.85 GiB | 5.35 | 51.10 | 43 | 219 | `hardware-tested` |
 
 Notes that matter for a profile's `peakVramGib`:
 
@@ -258,14 +258,12 @@ Notes that matter for a profile's `peakVramGib`:
   `libze_intel_gpu`. `can` is not in `render`/`video`, but
   `/dev/dri/renderD128` is mode 0666, so the render node is accessible. The XPU
   backend stays `documented` in its profiles until a real run lands here.
-- Kimodo was **not** run end to end: its text encoder needs the gated
-  `meta-llama/Meta-Llama-3-8B-Instruct` weights, and the account behind the
-  worker token is not authorized for that repository (see "Blockers"). What did
-  run on atlas is a pipeline smoke test — the real pinned Kimodo weights and a
-  constant 4096-dim stub in place of the text encoder: 90 frames (3 s) at 100
-  denoising steps in 5.55 s after an 8.51 s load, 1.15 GiB allocator peak,
-  207 KB BVH, `Frames: 90`. The motion is conditioned on a constant embedding,
-  so it is not model output and is not in the table.
+- Kimodo ran end to end on 2026-11-13 with the real LLM2Vec text encoder over
+  the pinned Llama 3 snapshot: "a person walks forward and waves", 4 s, gave
+  120 frames at 30 fps on `somaskel77` (validation `ok`), a 270 KB BVH. The
+  peak is device-wide with ~1.8 GB of desktop, so the job itself needs about
+  16.2 GiB; Atlas's admission limit for foreign VRAM must leave that free.
+  The Llama snapshot came from a mirror (see "Blockers and deviations").
 
 ### Reproduce
 
@@ -470,7 +468,6 @@ snapshot_download(
 for repo, revision in [
     ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp", "31474e395ada192e8ed1586db6be79fb3b70c9c0"),
     ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised", "baa8ebf04a1c2500e61288e7dad65e8ae42601a7"),
-    ("meta-llama/Meta-Llama-3-8B-Instruct", "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2"),
 ]:
     path = Path(snapshot_download(repo, revision=revision, ignore_patterns=["original/*"]))
     ref = path.parents[1] / "refs" / "main"
@@ -479,40 +476,20 @@ for repo, revision in [
 PY
 ```
 
-The first three downloads are ungated. The last one needs the Llama 3 licence
-acceptance on the account behind the token, and every file of each snapshot
-(weights, shard index, configs, adapter configs, tokenizer files, generation
-config, plus the README/licence/attributes the snapshot ships) must then be
-added to `helpers[0].checkpoints[i].files` with its sha256:
-
-```sh
-python - <<'PY'
-import hashlib, json
-from pathlib import Path
-
-cache = Path("/data/nvme0/models/animation-dev/kimodo/hf-cache")
-for repo, revision in [
-    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp", "31474e395ada192e8ed1586db6be79fb3b70c9c0"),
-    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised", "baa8ebf04a1c2500e61288e7dad65e8ae42601a7"),
-    ("meta-llama/Meta-Llama-3-8B-Instruct", "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2"),
-]:
-    root = cache / "hub" / f"models--{repo.replace('/', '--')}" / "snapshots" / revision
-    files = [
-        {"path": path.relative_to(root).as_posix(),
-         "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-        for path in sorted(root.rglob("*"))
-        if path.is_file() or path.is_symlink()
-    ]
-    print(repo, json.dumps(files, indent=2))
-PY
-```
+Both downloads are ungated. The Llama 3 base snapshot is gated for the worker
+account, so it is placed by hand: download the ten loader files the profile
+declares from the mirror named in `helpers[0].checkpoints[0].mirror`, check each
+against its declared sha256, and move them into
+`hub/models--meta-llama--Meta-Llama-3-8B-Instruct/snapshots/8afb486c…/` with
+`refs/main` holding the revision and no other file. Canix's provisioning unit
+does exactly this from the profile.
 
 The adapter refuses to load a snapshot that declares no files, misses one of
 its loader files, or carries any file the profile does not declare; it also
 refuses a checkpoint whose `config.yaml` is not declared, because the config
-instantiates classes and picks weight paths. The initial profile keeps
-`helpers[0].checkpoints[0].files` empty, so a job fails closed with exit 14 and
-names the checkpoint rather than loading unverified weights.
+instantiates classes and picks weight paths. A snapshot whose
+declared files are missing or differ fails closed with exit 14 and names the
+checkpoint rather than loading unverified weights.
 
 ### Per-adapter notes
 
@@ -734,18 +711,15 @@ engine.
 
 ## Blockers and deviations
 
-- **Kimodo's text encoder is gated and the worker token is not authorized.**
-  `meta-llama/Meta-Llama-3-8B-Instruct` answers 403 for the account behind
-  `can_hugging_face` (`canik0`): the Llama 3 licence acceptance exists, but the
-  account is not on the repository's authorized list, so the base 8B weights the
-  two LLM2Vec adapters sit on cannot be provisioned. The Kimodo weights and both
-  ungated LLM2Vec adapter snapshots are pinned and provisioned under
-  `/data/nvme0/models/animation-dev/kimodo`; the adapter fails closed with exit
-  14 and names the checkpoint rather than loading unverified weights. To finish:
-  grant that account access, download the four shards at `8afb486c`, add their
-  sha256s to `helpers[0].checkpoints[0].files`, and run the kimodo command under
-  "Reproduce". `peakVramGib` stays null and the profile stays `blocked` until
-  that run lands.
+- **Kimodo's Llama 3 snapshot comes from a mirror.**
+  `meta-llama/Meta-Llama-3-8B-Instruct` still answers 403 for the account
+  behind `can_hugging_face` (`canik0`) although the licence is accepted. The
+  profile pins Meta's revision `8afb486c` and Meta's hashes, and names
+  `NousResearch/Meta-Llama-3-8B-Instruct@53346005` only as download transport:
+  its four shard sha256 values reproduce the git blob ids of Meta's own LFS
+  pointers (`69e1a87`, `3a8b51f`, `706b3a1`, `280b920`, visible in Meta's tree
+  without access), and its six other loader files are git-blob-identical to
+  Meta's. Swap the mirror out once the account is authorized; the hashes stay.
 - **Model root.** `/data/nvme0/models` and `/data/models` are root-owned on
   atlas and nomad. A `rops` request to create
   `/data/nvme0/models/animation` (atlas) and `/data/models/animation` (nomad)

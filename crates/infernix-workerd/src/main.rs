@@ -52,6 +52,9 @@ const EXIT_CANCELLED: i32 = 15;
 /// How long a cancelled adapter group may take to disappear after SIGKILL.
 const GROUP_KILL_WAIT: StdDuration = StdDuration::from_secs(10);
 
+/// Pause between SIGKILL cycles while a group member survives (e.g. D-state).
+const GROUP_KILL_RETRY: StdDuration = StdDuration::from_secs(1);
+
 /// Upper bound on the retained-delivery retry backoff.
 const MAX_DELIVERY_BACKOFF: StdDuration = StdDuration::from_secs(600);
 
@@ -623,6 +626,10 @@ fn signal_group(pid: u32, signal: i32) {
 struct AdapterRun {
     output: Output,
     cancel_requested: bool,
+    /// The adapter's process-group leader, for ESRCH-proof termination.
+    pid: u32,
+    /// When SIGTERM's grace ends; `None` means terminate the group now.
+    kill_at: Option<Instant>,
 }
 
 async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) -> Result<()> {
@@ -671,6 +678,7 @@ async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) ->
     let run = run_adapter(&client, &config, &adapter, &lease, &envelope, &cancel_path).await?;
 
     if run.cancel_requested {
+        ensure_group_gone(&client, &config, &lease, run.pid, run.kill_at).await?;
         if client.confirm_cancelled(&lease).await? {
             info!(job = %lease.job_id.as_str(), "cancellation confirmed");
         } else {
@@ -682,16 +690,8 @@ async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) ->
     let code = run.output.status.code();
     match code {
         Some(0) => {
-            finish_success(
-                &client,
-                &config,
-                &adapter,
-                &lease,
-                &staging,
-                &job.payload,
-                run.output,
-            )
-            .await
+            finish_success(&client, &config, &adapter, &lease, &staging, &job.payload, run)
+                .await
         }
         Some(EXIT_RESOURCE_BUSY) => {
             release_busy(&client, &config, &lease).await?;
@@ -702,6 +702,9 @@ async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) ->
         Some(EXIT_BACKEND_MISMATCH) => fail(&client, &lease, "backend_mismatch").await,
         Some(EXIT_INVALID_INPUT) => fail(&client, &lease, "invalid_input").await,
         Some(EXIT_CANCELLED) => {
+            // The adapter reported cancellation itself: its group still has to
+            // be empty before the ledger records the cancellation.
+            ensure_group_gone(&client, &config, &lease, run.pid, run.kill_at).await?;
             if !client.confirm_cancelled(&lease).await? {
                 // The adapter cancelled without a ledger request: fail rather
                 // than leave the lease dangling until it expires.
@@ -747,6 +750,8 @@ async fn run_adapter(
         "INFERNIX_WORKLOAD_OUTPUT_DIRECTORY",
         &envelope.output_directory,
     );
+    // The staging root an adapter's persistent caches must never overlap.
+    command.env("INFERNIX_STAGING_ROOT", &config.worker.staging_root);
 
     let mut child = command.spawn().with_context(|| {
         format!(
@@ -785,14 +790,8 @@ async fn run_adapter(
         tokio::select! {
             output = &mut wait => break output.context("wait for workload adapter")?,
             _ = heartbeat.tick() => {
-                match client.heartbeat(lease, lease_duration).await {
-                    Ok(HeartbeatOutcome::Renewed { cancel_requested_at }) => {
-                        if let Err(error) = client
-                            .worker_heartbeat(&lease.worker_id, &lease.boot_id)
-                            .await
-                        {
-                            warn!(%error, "workload worker heartbeat failed");
-                        }
+                match renew_lease(client, lease, lease_duration, pid).await? {
+                    Renewal::Renewed { cancel_requested_at } => {
                         if cancel_requested_at.is_some() && !cancel_requested {
                             cancel_requested = true;
                             info!(job = %lease.job_id.as_str(), "cancel requested; stopping the adapter");
@@ -803,18 +802,7 @@ async fn run_adapter(
                             cancel_deadline = Some(Instant::now() + grace);
                         }
                     }
-                    Ok(HeartbeatOutcome::Fenced) => {
-                        signal_group(pid, libc::SIGKILL);
-                        bail!(
-                            "lease for job {} is no longer current",
-                            lease.job_id.as_str()
-                        )
-                    }
-                    Err(error) => {
-                        // A transient database error must not kill the adapter;
-                        // the next heartbeat retries within the lease window.
-                        warn!(%error, "workload heartbeat failed");
-                    }
+                    Renewal::Transient => {}
                 }
             }
             _ = cancel_ticker.tick(), if cancel_deadline.is_some() && !killed => {
@@ -830,42 +818,105 @@ async fn run_adapter(
         }
     };
 
-    if cancel_requested {
-        // A descendant may outlive the group leader, so cancellation is only
-        // confirmed once the whole process group is gone.
-        terminate_group(pid, cancel_deadline, killed).await;
-    }
-
     Ok(AdapterRun {
         output,
         cancel_requested,
+        pid,
+        kill_at: cancel_deadline,
     })
 }
 
-/// Wait for the adapter's process group to empty, escalating to SIGKILL after
-/// the SIGTERM deadline. Confirmation happens only once no member remains.
-async fn terminate_group(pid: u32, term_deadline: Option<Instant>, killed: bool) {
-    let poll = StdDuration::from_millis(50);
-    if !killed {
-        if let Some(deadline) = term_deadline {
-            while !group_gone(pid) && Instant::now() < deadline {
-                sleep(poll).await;
+enum Renewal {
+    Renewed {
+        cancel_requested_at: Option<chrono::DateTime<Utc>>,
+    },
+    /// A transient database error: the next heartbeat retries.
+    Transient,
+}
+
+/// Renew the job lease and the worker's liveness. A fenced lease is an error.
+async fn renew_lease(
+    client: &WorkloadClient,
+    lease: &infernix_workload::Lease,
+    lease_duration: Duration,
+    pid: u32,
+) -> Result<Renewal> {
+    match client.heartbeat(lease, lease_duration).await {
+        Ok(HeartbeatOutcome::Renewed { cancel_requested_at }) => {
+            if let Err(error) = client
+                .worker_heartbeat(&lease.worker_id, &lease.boot_id)
+                .await
+            {
+                warn!(%error, "workload worker heartbeat failed");
+            }
+            Ok(Renewal::Renewed { cancel_requested_at })
+        }
+        Ok(HeartbeatOutcome::Fenced) => {
+            signal_group(pid, libc::SIGKILL);
+            bail!(
+                "lease for job {} is no longer current",
+                lease.job_id.as_str()
+            )
+        }
+        Err(error) => {
+            // A transient database error must not kill the adapter; the next
+            // heartbeat retries within the lease window.
+            warn!(%error, "workload heartbeat failed");
+            Ok(Renewal::Transient)
+        }
+    }
+}
+
+/// Wait until ESRCH proves the adapter's process group is empty.
+///
+/// SIGKILL is sent once the SIGTERM grace is over and retried on every cycle.
+/// A group that survives SIGKILL (a D-state member) keeps its lease: the worker
+/// heartbeats and retries instead of confirming a cancellation it cannot prove.
+async fn ensure_group_gone(
+    client: &WorkloadClient,
+    config: &Config,
+    lease: &infernix_workload::Lease,
+    pid: u32,
+    term_deadline: Option<Instant>,
+) -> Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let lease_duration = Duration::seconds(config.worker.lease_duration_secs as i64);
+    if let Some(deadline) = term_deadline {
+        let mut heartbeat = interval(StdDuration::from_secs(config.worker.heartbeat_interval_secs));
+        heartbeat.tick().await; // the first tick resolves immediately
+        while Instant::now() < deadline && !group_gone(pid) {
+            tokio::select! {
+                _ = sleep(StdDuration::from_millis(50)) => {}
+                _ = heartbeat.tick() => {
+                    renew_lease(client, lease, lease_duration, pid).await?;
+                }
             }
         }
     }
-    if !group_gone(pid) {
-        signal_group(pid, libc::SIGKILL);
-    }
-    let deadline = Instant::now() + GROUP_KILL_WAIT;
-    while !group_gone(pid) && Instant::now() < deadline {
-        sleep(poll).await;
-    }
-    if !group_gone(pid) {
+    loop {
+        if kill_and_wait(pid, GROUP_KILL_WAIT).await {
+            return Ok(());
+        }
         warn!(
+            job = %lease.job_id.as_str(),
             pid,
-            "adapter process group still has members after SIGKILL; confirming anyway"
+            "adapter process group survived SIGKILL; keeping the lease and retrying"
         );
+        renew_lease(client, lease, lease_duration, pid).await?;
+        sleep(GROUP_KILL_RETRY).await;
     }
+}
+
+/// SIGKILL the group and report whether ESRCH proves it empty before `wait`.
+async fn kill_and_wait(pid: u32, wait: StdDuration) -> bool {
+    signal_group(pid, libc::SIGKILL);
+    let deadline = Instant::now() + wait;
+    while !group_gone(pid) && Instant::now() < deadline {
+        sleep(StdDuration::from_millis(20)).await;
+    }
+    group_gone(pid)
 }
 
 /// True when no process remains in the adapter's process group.
@@ -938,8 +989,14 @@ async fn finish_success(
     lease: &infernix_workload::Lease,
     staging: &Path,
     payload: &Value,
-    output: Output,
+    run: AdapterRun,
 ) -> Result<()> {
+    let AdapterRun {
+        output,
+        pid,
+        kill_at,
+        ..
+    } = run;
     let job_id = lease.job_id.clone();
     let validated = if adapter.artifacts {
         match validate_result(&output.stdout, staging) {
@@ -973,8 +1030,9 @@ async fn finish_success(
     };
 
     if !client.complete(lease, &stored).await? {
-        // A requested cancellation refuses completion, so the worker confirms
-        // the cancellation instead and uploads nothing.
+        // A requested cancellation refuses completion: the adapter's group must
+        // be empty (ESRCH) before the worker confirms the cancellation.
+        ensure_group_gone(client, config, lease, pid, kill_at).await?;
         if client.confirm_cancelled(lease).await? {
             info!(
                 job = %lease.job_id.as_str(),
@@ -1167,4 +1225,78 @@ fn resolve_boot_id(worker: &WorkerConfig) -> Result<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .context("read /proc/sys/kernel/random/boot_id")
         .map(|value| value.trim().to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wait until `pid` is a zombie and therefore still a process-group member.
+    async fn wait_for_zombie(pid: u32) -> bool {
+        for _ in 0..200 {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(") ").map(|(_, rest)| rest.to_owned()))
+                .and_then(|rest| rest.split_whitespace().next().map(str::to_owned));
+            if state.as_deref() == Some("Z") {
+                return true;
+            }
+            sleep(StdDuration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_group_that_survives_sigkill_is_never_reported_gone() {
+        // An unreaped child is a zombie but still a member of its process
+        // group: SIGKILL cannot remove it. That is the D-state analogue the
+        // worker must never confirm a cancellation over.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .process_group(0)
+            .spawn()
+            .expect("spawn a group member");
+        let pid = child.id().expect("child pid");
+        assert!(wait_for_zombie(pid).await, "the member never became a zombie");
+
+        assert!(
+            !group_gone(pid),
+            "a zombie member keeps the process group alive"
+        );
+        assert!(
+            !kill_and_wait(pid, StdDuration::from_millis(200)).await,
+            "a group that survives SIGKILL must not be reported gone"
+        );
+
+        // Reaping the last member empties the group and ESRCH proves it.
+        child.wait().await.expect("reap the group member");
+        assert!(kill_and_wait(pid, StdDuration::from_millis(200)).await);
+    }
+
+    #[tokio::test]
+    async fn a_killed_group_is_reported_gone() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 0.1; done")
+            .process_group(0)
+            .spawn()
+            .expect("spawn a stubborn group member");
+        let pid = child.id().expect("child pid");
+        assert!(!group_gone(pid));
+        // Reap the leader as the worker's `wait_with_output` does; otherwise
+        // its own zombie would keep the group alive forever.
+        let (_, gone) = tokio::join!(
+            async { child.wait().await.expect("reap the group leader") },
+            async { kill_and_wait(pid, StdDuration::from_secs(5)).await }
+        );
+        assert!(gone, "SIGKILL must clear a TERM-ignoring group");
+    }
+
+    #[tokio::test]
+    async fn a_missing_group_is_gone() {
+        let pid = 2_000_000_000u32; // far above pid_max: ESRCH
+        assert!(group_gone(pid));
+        assert!(kill_and_wait(pid, StdDuration::from_millis(50)).await);
+    }
 }

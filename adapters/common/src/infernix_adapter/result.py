@@ -1,7 +1,9 @@
 """Artifact manifest and the single-object result printer (interfaces section 2)."""
 
 import json
+import os
 import re
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +29,7 @@ class Artifact:
 def collect(staging_directory, output_directory, specs):
     """Hash and validate output files. `specs` is (source, output-relative path, mime)."""
     staging = Path(staging_directory).resolve()
-    output = Path(output_directory).resolve()
+    output = Path(os.path.realpath(output_directory))
     artifacts = []
     seen = set()
     for source, relative, mime in specs:
@@ -39,7 +41,14 @@ def collect(staging_directory, output_directory, specs):
         target = output_path(output_directory, relative)
         if output not in target.parents:
             raise invalid(f"artifact {source} escapes the output directory: {relative}")
-        if not target.is_file():
+        # A symlink planted in the output directory must never be followed.
+        try:
+            mode = target.lstat().st_mode
+        except OSError:
+            raise invalid(f"artifact {source} missing on disk: {relative}") from None
+        if stat.S_ISLNK(mode):
+            raise invalid(f"artifact {source} is a symlink: {relative}")
+        if not stat.S_ISREG(mode):
             raise invalid(f"artifact {source} missing on disk: {relative}")
         size = target.stat().st_size
         if size > MAX_ARTIFACT_BYTES:
@@ -63,15 +72,30 @@ def collect(staging_directory, output_directory, specs):
 def output_path(output_directory, relative):
     """Resolve one output name under `output_directory`, refusing escapes.
 
-    Adapters call this before writing anything, so an absolute path or `..`
-    traversal is rejected (exit 14) instead of landing outside the attempt.
+    Adapters call this before writing anything, so an absolute path, `..`
+    traversal or symlink that resolves outside the output directory is rejected
+    (exit 14) instead of landing outside the attempt.
     """
     name = Path(relative)
     if name.is_absolute():
         raise invalid(f"output path {relative!r} is absolute")
     if not name.parts or any(part in ("", ".", "..") for part in name.parts):
         raise invalid(f"output path {relative!r} escapes the output directory")
-    return Path(output_directory) / name
+    output = Path(os.path.realpath(output_directory))
+    target = Path(output_directory) / name
+    if target.is_symlink():
+        raise invalid(f"output path {relative!r} is a symlink")
+    if output not in Path(os.path.realpath(target)).parents:
+        raise invalid(f"output path {relative!r} escapes the output directory")
+    return target
+
+
+def open_output(output_directory, relative):
+    """Open one output file for writing; `O_NOFOLLOW` refuses a planted symlink."""
+    target = output_path(output_directory, relative)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    return os.fdopen(os.open(target, flags, 0o644), "wb")
 
 
 def from_manifest(manifest, output_name):

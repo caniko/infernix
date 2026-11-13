@@ -95,10 +95,11 @@ client.undelivered_succeeded(&WorkerId).await -> Vec<JobStatus>
 }
 ```
 
-The worker also exports `INFERNIX_WORKLOAD_STAGING_DIRECTORY` and
-`INFERNIX_WORKLOAD_OUTPUT_DIRECTORY`. The hub token is never in the envelope:
-adapters read their own token through `INFERNIX_HUB_TOKEN_FILE` when they need
-to fetch inputs.
+The worker also exports `INFERNIX_WORKLOAD_STAGING_DIRECTORY`,
+`INFERNIX_WORKLOAD_OUTPUT_DIRECTORY` and `INFERNIX_STAGING_ROOT` (the worker's
+staging root, which an adapter's persistent caches must never overlap). The hub
+token is never in the envelope: adapters read their own token through
+`INFERNIX_HUB_TOKEN_FILE` when they need to fetch inputs.
 
 An adapter writes outputs only under `outputDirectory` and prints exactly one
 result object on exit 0:
@@ -119,10 +120,13 @@ result object on exit 0:
 `[a-z0-9][a-z0-9_.-]{0,62}` and is unique. Each artifact is at most 256 MiB.
 `contentFingerprint` (64 lowercase hex), `cacheHit` (bool), `telemetry` (object)
 and `validation` (`state` one of `ok|warn|fail`, `findings` array) are
-required; extra keys are tolerated. The worker rejects a result that is missing
-a field, has the wrong type, whose artifact is missing, escapes staging, or
-mismatches its declared size or sha256, and fails the job with
-`invalid_result:<code>`.
+required; extra keys are tolerated. `telemetry` must carry `peakVramBytes`
+(u64), `gpuSeconds` (number ≥ 0), `cpuSeconds` (number ≥ 0), `peakRssBytes`
+(u64), `maxTempC` (number or null), `maxPowerW` (number or null), `device`
+(non-empty string) and `backend` (`rocm` or `cuda`). The worker rejects a result
+that is missing a field, has the wrong type, whose artifact is missing, is a
+symlink, escapes staging, or mismatches its declared size or sha256, and fails
+the job with `invalid_result:<code>`.
 
 `telemetry` is stored verbatim in the job result, so the hub reads resource
 numbers from the ledger manifest and not from worker logs.
@@ -145,10 +149,14 @@ numbers from the ledger manifest and not from worker logs.
 The worker learns about a cancellation from its lease heartbeat. It writes the
 attempt's `CANCEL` file, sends `SIGTERM` to the adapter's process group, waits
 `worker.cancel_grace_secs` (default 30 s), then sends `SIGKILL`. It polls
-`kill(-pgid, 0)` until the whole group is gone — a descendant that ignores
-`SIGTERM` is killed and reaped first — and only then runs
-`CONFIRM_CANCELLED`. A job whose confirmation was fenced is left to the worker
-that won the lease.
+`kill(-pgid, 0)` until ESRCH proves the whole group is gone — a descendant that
+ignores `SIGTERM` is killed and reaped first — and only then runs
+`CONFIRM_CANCELLED`. A member that survives `SIGKILL` (for example a D-state
+process) keeps the lease: the worker renews it with each heartbeat cycle and
+retries `SIGKILL`; it never confirms a cancellation it cannot prove. A fenced
+completion that is refused because a cancellation was requested runs the same
+termination and ESRCH check before confirming. A job whose confirmation was
+fenced is left to the worker that won the lease.
 
 ## Delivery
 

@@ -89,9 +89,8 @@ def produce(context):
     index = int(np.argmax(scores))
     mask = (masks[index] > 0.5).astype(np.uint8) * 255
     name = params.get("outputName") or "mask.png"
-    target = adapter.output_path(context.output_directory, name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(mask, mode="L").save(target)
+    with adapter.open_output(context.output_directory, name) as handle:
+        Image.fromarray(mask, mode="L").save(handle, format="PNG")
 
     report = {
         "score": float(scores[index]),
@@ -103,12 +102,12 @@ def produce(context):
             "box": None if box is None else box.tolist(),
         },
     }
-    report_path = adapter.output_path(context.output_directory, "mask.json")
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    with adapter.open_output(context.output_directory, "mask.json") as handle:
+        handle.write((json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
     return [
         context.artifact(params.get("artifactSource", "mask"), name, "image/png"),
-        context.artifact("maskmeta", report_path.name, "application/json"),
+        context.artifact("maskmeta", "mask.json", "application/json"),
     ]
 
 

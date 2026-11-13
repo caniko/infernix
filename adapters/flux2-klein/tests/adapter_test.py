@@ -21,7 +21,7 @@ PROFILE = {
     "device": "gpu:atlas-7900xtx",
     "deviceMatch": "gfx1100",
     "cpuPolicy": "forbidden",
-    "checkpoint": {"repo": REPO, "revision": "abc", "files": []},
+    "checkpoint": {"repo": REPO, "revision": "0123456789abcdef0123456789abcdef01234567", "files": []},
 }
 
 
@@ -137,7 +137,7 @@ class Flux2Tests(unittest.TestCase):
         adapter.generate = lambda pipe, params, seed: Image.new("RGB", (8, 8))
         adapter.produce(self.context(modelPath="/elsewhere/9B"))
         self.assertEqual(recorded["source"], REPO)
-        self.assertEqual(recorded["revision"], "abc")
+        self.assertEqual(recorded["revision"], "0123456789abcdef0123456789abcdef01234567")
         self.assertNotIn(
             "elsewhere",
             recorded["source"],
@@ -159,7 +159,7 @@ class Flux2Tests(unittest.TestCase):
             **PROFILE,
             "checkpoint": {
                 "repo": REPO,
-                "revision": "abc",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
                 "localPath": str(weights),
                 "files": [{"path": "model.safetensors", "sha256": "0" * 64}],
             },

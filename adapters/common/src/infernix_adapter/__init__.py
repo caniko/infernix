@@ -28,8 +28,16 @@ from .gpu import (
     unload_tenants,
 )
 from .hub import download_inputs, sha256_file
-from .result import Artifact, build_result, collect, emit, from_manifest, output_path
-from .runner import Context, run, seed_everything
+from .result import (
+    Artifact,
+    build_result,
+    collect,
+    emit,
+    from_manifest,
+    open_output,
+    output_path,
+)
+from .runner import STAGING_ROOT_ENV, Context, run, seed_everything
 from .threads import bound_threads
 from .telemetry import Sampler, cpu_seconds, peak_rss_bytes
 
@@ -63,6 +71,7 @@ __all__ = [
     "ensure_device",
     "from_manifest",
     "local_file",
+    "open_output",
     "output_path",
     "parse",
     "peak_rss_bytes",
@@ -73,6 +82,7 @@ __all__ = [
     "run",
     "seed_everything",
     "sha256_file",
+    "STAGING_ROOT_ENV",
     "unload_tenants",
     "verify_files",
 ]

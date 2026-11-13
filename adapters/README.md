@@ -27,16 +27,26 @@ resolved profile must also name the provisioned weights:
 
 ```json
 "checkpoint": {
-  "repo": "…", "revision": "…",
+  "repo": "…", "revision": "<40-hex commit>",
   "localPath": "/path/to/weights",
-  "files": [ { "path": "model.safetensors", "sha256": "…" } ]
+  "files": [ { "path": "model.safetensors", "sha256": "<64-hex>" } ]
 }
 ```
 
-Adapters load only that checkpoint: a repository is requested at `revision`,
-a local copy is verified against every declared file hash, and a missing
-`localPath`/`revision` is `invalid_input` (14). A payload `modelPath` is
-ignored, so a job cannot redirect an adapter to unapproved weights.
+Adapters load only that checkpoint, and `checkpoint.py` enforces the pin:
+
+- a remote `revision` must be a full 40-hex commit sha — a branch (`main`), a
+  tag (`v5.2.3`) or a short sha is `invalid_input` (14);
+- a `localPath` (file or directory) is `invalid_input` unless the profile
+  declares at least one `files` entry and every declared file matches its
+  sha256;
+- a local directory must not contain a weight file
+  (`*.safetensors|*.bin|*.pt|*.pth|*.ckpt|*.gguf`) that `files` does not list;
+- a local file (`checkpoint.localPath` for an adapter that loads one file) needs
+  a matching `files` entry, or it is refused.
+
+A payload `modelPath` is ignored, so a job cannot redirect an adapter to
+unapproved weights.
 
 ## `common/` — the shared runtime (`infernix_adapter`)
 
@@ -48,11 +58,11 @@ ignored, so a job cannot redirect an adapter to unapproved weights.
 | `threads.py` | `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `torch.set_num_threads` = `cpuThreads` |
 | `telemetry.py` | 1 s sampler: amdgpu sysfs or `nvidia-smi`; peak VRAM/temp/power, GPU-busy seconds, CPU seconds, peak RSS |
 | `hub.py` | `GET {hubUrl}/v1/assets/{id}/content` with the `INFERNIX_HUB_TOKEN_FILE` token, sha256 verified per input |
-| `fingerprint.py` | section-6 content fingerprint (canonical JSON, sha256) |
+| `fingerprint.py` | section-6 content fingerprint (canonical JSON, sha256), including every runtime identity the adapter reports |
 | `cache.py` | `<cacheRoot>/<fp>/manifest.json` + files; a hit re-verifies every sha256 before copying; a corrupt entry is deleted and recomputed |
 | `cancel.py` | cancel-file poll (1 s) and SIGTERM → exit 15 |
-| `result.py` | artifact manifest and the single-object stdout printer |
-| `runner.py` | the pipeline: parse → thread bounds → `assert_gpu` → fingerprint → cache → gate → `ensure_device` → sampler → operation → cache store → result |
+| `result.py` | artifact manifest, realpath/O_NOFOLLOW output paths (a symlink is refused) and the single-object stdout printer |
+| `runner.py` | the pipeline: parse → thread bounds → `assert_gpu` → runtime identity → fingerprint → cache → gate → `ensure_device` → sampler → operation → cache store → result |
 
 Environment knobs (all have production defaults):
 
@@ -63,6 +73,7 @@ Environment knobs (all have production defaults):
 | `INFERNIX_ADAPTER_CACHE_DIR` | `/var/cache/infernix/animation` | content cache |
 | `INFERNIX_HUB_TOKEN_FILE` | — | file holding the hub bearer token |
 | `INFERNIX_FRAMES_ROOT` | `$INFERNIX_ADAPTER_CACHE_DIR/frames` | persistent Blender frame root (params/profile `framesRoot` wins) |
+| `INFERNIX_STAGING_ROOT` | — | workerd's staging root, which `framesRoot` must not overlap |
 
 `assert_gpu` matches `deviceMatch` against the driver's device name **and** the
 `gcnArchName`. Measured reason: PyTorch on this ROCm 7.2 build reports the RX
@@ -84,6 +95,13 @@ rejects a tensor placed on a different GPU.
 `runner.run` reserves fd 1 for the result object: handler and library writes,
 including C-level `printf`, are redirected to stderr for the duration of the
 operation, so a chatty model cannot corrupt the one JSON object workerd reads.
+Both stdio buffers and libc's own buffer are flushed before fd 1 is restored, so
+buffered C output lands before the result rather than after it.
+
+The fingerprint covers an adapter-specific runtime identity as well: the
+Blender adapter hashes the parsed `blender --version` string, and the TripoSG
+adapter hashes the profile's pinned `code.commit`. A runtime identity the
+adapter cannot read is `invalid_input` (14) instead of being hashed as null.
 
 ### Tests
 
@@ -92,17 +110,33 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-53 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+66 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
 again when it drops to the CPU *after* generation); a tensor on the wrong GPU
 index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP
 "out of memory" message); gate timeout giving 10 while the handler never runs;
-a read-only gate inode; a cancel file giving 15; handler prints (Python and
-fd-level) staying out of the result; fingerprint stability and sensitivity
-(params, seed, inputs, profile, checkpoint revision, runtime including installed
-package, torch, HIP and CUDA versions); pinned-checkpoint resolution; output
-path traversal; cache corruption/missing file forcing a recompute; and a cache
-hit restoring the stored validation.
+a read-only gate inode; a cancel file giving 15; handler prints (Python,
+fd-level and buffered libc `printf`) staying out of the result; fingerprint
+stability and sensitivity (params, seed, inputs, profile, checkpoint revision,
+runtime including installed package, torch, HIP and CUDA versions, an
+adapter-specific renderer version or source commit, and a null identity
+refused); full-sha, local-directory and local-file checkpoint resolution
+(branch/tag/short sha rejected, undeclared weights rejected); output-path
+traversal, realpath escapes and symlinks (also through `O_NOFOLLOW`); cache
+corruption/missing file forcing a recompute; and a cache hit restoring the
+stored validation.
+
+Per-adapter suites (each needs that worker's venv: `numpy`, `torch`, `pillow`,
+and for TripoSG `trimesh`/`pymeshlab`):
+
+```sh
+cd adapters/<adapter>
+uv run python -m unittest discover -s tests -p '*_test.py'
+```
+
+`blender-cycles-hip` additionally runs one real-Blender test when `blender` and
+`/dev/kfd` are present: it registers the guard, loads a second `.blend`, and
+proves the `render_init` handler is still registered and still applies.
 
 ## Hardware evidence
 
@@ -308,9 +342,12 @@ marker line or raises. The same guard is installed as a `render_init` handler,
 so it re-runs on the scene the operation loaded, right before rendering, and
 refuses a scene that is not Cycles. The verify expression runs after the
 operation and re-asserts engine/device/denoise/device name on the scene that was
-actually rendered. A blender exit without the guard marker is exit 13
-(`backend_mismatch`); a python exit 13 stays 13, an OOM message or exit 12 is
-`oom` (12), and any other failure is an ordinary error. The
+actually rendered. The handler is registered with
+`@bpy.app.handlers.persistent`, so it survives loading another `.blend`; a real
+Blender test opens a second file and re-runs the handler. A blender exit without
+the guard marker is exit 13 (`backend_mismatch`); an OOM message is classified
+before the exit code, so exit 13 with an out-of-memory message is `oom` (12),
+and any other failure is an ordinary error. The
 operation receives its inputs through the environment (`INFERNIX_BLENDER_ARGS`
 JSON, `INFERNIX_STAGING_DIR`, `INFERNIX_FRAMES_DIR`, `INFERNIX_FRAME_START`,
 `INFERNIX_FRAME_END`, `INFERNIX_FPS`) and writes `####.png` frames. The adapter
@@ -320,8 +357,9 @@ then encodes the master with `ffmpeg -c:v hevc_vaapi` (atlas, render node from
 (`params.framesRoot`, profile `framesRoot`, `INFERNIX_FRAMES_ROOT`, else
 `$INFERNIX_ADAPTER_CACHE_DIR/frames`), content-addressed by the job fingerprint;
 a retained sequence is reused only when every frame still matches the recorded
-sha256, and a frames root inside staging is `invalid_input`. Only the master and
-the locator are artifacts.
+sha256. A frames root that is inside, equal to, or an ancestor of the attempt
+staging (or of `INFERNIX_STAGING_ROOT`) is `invalid_input` (14) after `realpath`
+comparison. Only the master and the locator are artifacts.
 `profile.id == "authoring"` (`cpuPolicy: authoring`) is the only case that skips
 the GPU guard, per the plan.
 
@@ -333,7 +371,10 @@ imports only the `triposg` package and installs an import blocker that refuses
 `briarmbg`/`briaai` at runtime; a test proves no BRIA loader is referenced in
 code.
 
-Three patches in `triposg/patches/` make the pinned checkout (fc5c409) runnable:
+The content fingerprint covers the profile's pinned `code.commit` (the source
+checkout the adapter imports), so a different checkout can never reuse a cache
+entry. Three patches in `triposg/patches/` make the pinned checkout (fc5c409)
+runnable:
 
 1. `diso` import made lazy — only the flash decoder uses `DiffDMC`, and `diso`
    ships an sdist that needs a CUDA toolkit to build.

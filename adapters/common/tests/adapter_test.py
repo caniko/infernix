@@ -4,6 +4,7 @@ No GPU and no model: torch is faked, the model is a stub, and the only
 external processes are a local HTTP stub for the hub.
 """
 
+import ctypes
 import hashlib
 import io
 import json
@@ -22,13 +23,15 @@ from infernix_adapter import cache, checkpoint, fingerprint, gpu, hub, parse, re
 from infernix_adapter.cancel import CancelWatcher
 from infernix_adapter.exits import AdapterError
 
+PINNED = "0123456789abcdef0123456789abcdef01234567"
+
 PROFILE = {
     "id": "test-rocm",
     "model": "test",
     "operation": "tts",
     "state": "implemented",
     "blockedReason": None,
-    "checkpoint": {"repo": "example/weights", "revision": "abc123", "files": []},
+    "checkpoint": {"repo": "example/weights", "revision": PINNED, "files": []},
     "code": {"repo": "https://example.invalid", "commit": "deadbeef", "package": "test==1"},
     "licence": {"code": "Apache-2.0", "weights": "Apache-2.0", "gated": False, "evidence": []},
     "helpers": [],
@@ -138,7 +141,7 @@ class Harness(unittest.TestCase):
         free.start()
         self.addCleanup(free.stop)
 
-    def execute(self, handler, document=None, *, torch_module=None, use_cache=True):
+    def execute(self, handler, document=None, *, torch_module=None, use_cache=True, runtime=None):
         """Run one adapter at the file-descriptor level, as workerd does.
 
         Capturing fd 1 and fd 2 (not just `sys.stdout`) is what proves the
@@ -158,6 +161,7 @@ class Harness(unittest.TestCase):
                 package="infernix-adapter",
                 torch_module=torch_module if torch_module is not None else fake_torch(),
                 use_cache=use_cache,
+                runtime=runtime,
                 stdin=io.BytesIO(raw),
             )
         finally:
@@ -445,6 +449,36 @@ class RuntimeFingerprintTests(Harness):
             fingerprint.content_fingerprint(runtime=second, **values),
         )
 
+    def test_extra_runtime_versions_enter_the_fingerprint(self):
+        values = {
+            "profile": PROFILE,
+            "operation": "render_preview",
+            "inputs": [],
+            "params": {},
+            "seed": 0,
+        }
+        base = runner._runtime_versions("demo-package", None)
+        blender = runner._runtime_versions("demo-package", None, {"blender": "5.2.3"})
+        self.assertEqual(blender["blender"], "5.2.3")
+        self.assertNotEqual(
+            fingerprint.content_fingerprint(runtime=base, **values),
+            fingerprint.content_fingerprint(runtime=blender, **values),
+        )
+
+    def test_a_null_runtime_version_fails_fingerprinting(self):
+        def handler(ctx):
+            (ctx.output_directory / "line.wav").write_bytes(b"audio")
+            return [("audio", "line.wav", "audio/wav")]
+
+        code = self.execute(handler, runtime=lambda envelope: {"blender": None})
+        self.assertEqual(code, 14)
+        self.assertIn("blender", self.stderr)
+        self.assertIn("fingerprint", self.stderr)
+
+        code = self.execute(handler, runtime={"triposg": ""})
+        self.assertEqual(code, 14)
+        self.assertIn("triposg", self.stderr)
+
 
 class CacheTests(Harness):
     def _producer(self, counter):
@@ -514,6 +548,19 @@ class CacheTests(Harness):
         self.assertFalse(self.payload()["cacheHit"])
         self.assertEqual(len(counter), 2)
 
+    def test_a_cache_hit_never_writes_through_a_symlink(self):
+        counter = []
+        handler = self._producer(counter)
+        self.execute(handler)
+        secret = self.directory / "secret.bin"
+        secret.write_bytes(b"keep")
+        destination = self.staging / "out" / "line.wav"
+        destination.unlink()
+        destination.symlink_to(secret)
+
+        self.assertEqual(self.execute(handler), 14)
+        self.assertEqual(secret.read_bytes(), b"keep")
+
 
 class ResultTests(Harness):
     def test_collect_rejects_a_path_outside_the_output(self):
@@ -532,6 +579,47 @@ class ResultTests(Harness):
             result.output_path(self.staging / "out", "line.wav"),
             self.staging / "out" / "line.wav",
         )
+
+    def test_output_path_rejects_an_escaping_symlink(self):
+        out = self.staging / "out"
+        out.mkdir(exist_ok=True)
+        secret = self.directory / "secret.txt"
+        secret.write_text("no")
+        (out / "link.wav").symlink_to(secret)
+        with self.assertRaises(AdapterError) as caught:
+            result.output_path(out, "link.wav")
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_output_path_rejects_a_symlinked_directory_escape(self):
+        out = self.staging / "out"
+        out.mkdir(exist_ok=True)
+        (out / "escape").symlink_to(self.directory)
+        with self.assertRaises(AdapterError) as caught:
+            result.output_path(out, "escape/secret.txt")
+        self.assertEqual(caught.exception.code, 14)
+
+    def test_collect_rejects_an_escaping_symlink(self):
+        out = self.staging / "out"
+        out.mkdir(exist_ok=True)
+        secret = self.directory / "outside.wav"
+        secret.write_bytes(b"audio")
+        (out / "link.wav").symlink_to(secret)
+        with self.assertRaises(AdapterError) as caught:
+            result.collect(self.staging, out, [("audio", "link.wav", "audio/wav")])
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_open_output_never_follows_a_symlink(self):
+        out = self.staging / "out"
+        out.mkdir(exist_ok=True)
+        secret = self.directory / "target.wav"
+        secret.write_bytes(b"untouched")
+        (out / "line.wav").symlink_to(secret)
+        with self.assertRaises(AdapterError) as caught:
+            result.open_output(out, "line.wav")
+        self.assertEqual(caught.exception.code, 14)
+        self.assertEqual(secret.read_bytes(), b"untouched")
 
     def test_rejects_duplicate_sources(self):
         out = self.staging / "out"
@@ -581,11 +669,20 @@ class CheckpointTests(Harness):
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("revision", str(caught.exception))
 
+    def test_a_branch_tag_or_short_sha_is_not_a_pin(self):
+        for revision in ("main", "v5.2.3", "abc123", "0123456789abcdef0123456789abcdef0123456"):
+            with self.assertRaises(AdapterError) as caught:
+                checkpoint.pinned_source(
+                    {"checkpoint": {"repo": "example/weights", "revision": revision}}
+                )
+            self.assertEqual(caught.exception.code, 14, revision)
+            self.assertIn("40-hex", str(caught.exception), revision)
+
     def test_repository_loads_at_the_pinned_revision(self):
         source, revision = checkpoint.pinned_source(
-            {"checkpoint": {"repo": "example/weights", "revision": "abc123"}}
+            {"checkpoint": {"repo": "example/weights", "revision": PINNED}}
         )
-        self.assertEqual((source, revision), ("example/weights", "abc123"))
+        self.assertEqual((source, revision), ("example/weights", PINNED))
 
     def test_local_copy_is_verified_against_the_declared_hashes(self):
         root = self.directory / "weights"
@@ -594,7 +691,7 @@ class CheckpointTests(Harness):
         profile = {
             "checkpoint": {
                 "repo": "example/weights",
-                "revision": "abc123",
+                "revision": PINNED,
                 "localPath": str(root),
                 "files": [
                     {
@@ -605,17 +702,87 @@ class CheckpointTests(Harness):
             }
         }
         source, revision = checkpoint.pinned_source(profile)
-        self.assertEqual((source, revision), (str(root), "abc123"))
+        self.assertEqual((source, revision), (str(root), PINNED))
 
         profile["checkpoint"]["files"][0]["sha256"] = "0" * 64
         with self.assertRaises(AdapterError) as caught:
             checkpoint.pinned_source(profile)
         self.assertEqual(caught.exception.code, 14)
 
+    def test_a_local_directory_needs_its_declared_hashes(self):
+        root = self.directory / "unhashed"
+        root.mkdir()
+        (root / "model.safetensors").write_bytes(b"weights")
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source(
+                {"checkpoint": {"repo": "example/weights", "localPath": str(root), "files": []}}
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("files", str(caught.exception))
+
+    def test_a_local_directory_rejects_an_unlisted_weight(self):
+        root = self.directory / "smuggled"
+        root.mkdir()
+        (root / "weights.bin").write_bytes(b"undeclared")
+        config = root / "config.json"
+        config.write_text("{}")
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source(
+                {
+                    "checkpoint": {
+                        "localPath": str(root),
+                        "files": [
+                            {
+                                "path": "config.json",
+                                "sha256": hashlib.sha256(b"{}").hexdigest(),
+                            }
+                        ],
+                    }
+                }
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("unlisted weight file", str(caught.exception))
+        self.assertIn("weights.bin", str(caught.exception))
+
+    def test_a_local_file_needs_a_matching_hash_entry(self):
+        target = self.directory / "sam.pt"
+        target.write_bytes(b"weights")
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.local_file(
+                {
+                    "checkpoint": {
+                        "localPath": str(target),
+                        "files": [
+                            {
+                                "path": "other.pt",
+                                "sha256": hashlib.sha256(b"weights").hexdigest(),
+                            }
+                        ],
+                    }
+                }
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("no checkpoint.files entry", str(caught.exception))
+
     def test_missing_local_file_is_invalid(self):
         with self.assertRaises(AdapterError) as caught:
-            checkpoint.local_file({"checkpoint": {"revision": "abc123"}})
+            checkpoint.local_file({"checkpoint": {"revision": PINNED}})
         self.assertEqual(caught.exception.code, 14)
+
+    def test_a_local_file_hash_mismatch_is_invalid(self):
+        target = self.directory / "model.pt"
+        target.write_bytes(b"weights")
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.local_file(
+                {
+                    "checkpoint": {
+                        "localPath": str(target),
+                        "files": [{"path": "model.pt", "sha256": "0" * 64}],
+                    }
+                }
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("sha256", str(caught.exception))
 
 
 class StdoutTests(Harness):
@@ -632,6 +799,22 @@ class StdoutTests(Harness):
         self.assertIn("python noise", self.stderr)
         self.assertIn("fd noise", self.stderr)
         self.assertNotIn("noise", self.stdout)
+
+    def test_c_level_buffered_printf_is_flushed_before_the_restore(self):
+        """Libc's stdout buffer belongs to the redirected fd 1 too."""
+        libc = ctypes.CDLL(None)
+
+        def handler(ctx):
+            # No newline: the text stays in libc's buffer until something
+            # flushes it, so restoring fd 1 first would append it to the result.
+            libc.printf(b"c-level noise without a newline")
+            (ctx.output_directory / "line.wav").write_bytes(b"audio")
+            return [("audio", "line.wav", "audio/wav")]
+
+        self.assertEqual(self.execute(handler), 0)
+        self.assertTrue(self.stdout.startswith("{"), self.stdout[:120])
+        self.assertNotIn("c-level noise", self.stdout)
+        self.assertIn("c-level noise", self.stderr)
 
 
 class ThreadTests(Harness):

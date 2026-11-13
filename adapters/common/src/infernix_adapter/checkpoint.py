@@ -1,43 +1,91 @@
 """Pinned checkpoint resolution (interfaces section 5).
 
-An adapter loads only weights its profile names: a repository is requested at
-the pinned revision, a local copy is verified against the declared file hashes,
-and a missing revision is invalid input. No adapter falls back to random or
-unpinned weights.
+An adapter loads only weights its profile names: a repository is requested at a
+full commit sha, a local copy is verified against every declared file hash, and
+an unpinned or unverifiable checkpoint is invalid input. No adapter falls back
+to random or unpinned weights.
 """
 
+import re
 from pathlib import Path
 
 from .exits import invalid
 from .hub import sha256_file
+
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
 
 
 def _checkpoint(profile):
     return (profile or {}).get("checkpoint") or {}
 
 
+def _files(profile):
+    """The declared file hashes: every file a checkpoint loads needs one."""
+    entries = _checkpoint(profile).get("files")
+    if not isinstance(entries, list) or not entries:
+        raise invalid(
+            "profile checkpoint.files is required: a local checkpoint must "
+            "declare the sha256 of every file it loads"
+        )
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("path") or not entry.get("sha256"):
+            raise invalid("profile checkpoint.files entries need path and sha256")
+    return entries
+
+
 def revision(profile):
-    """The pinned checkpoint revision; unpinned weights are refused."""
+    """The pinned remote checkpoint revision: a full 40-hex commit sha."""
     value = _checkpoint(profile).get("revision")
     if not isinstance(value, str) or not value.strip():
         raise invalid("profile checkpoint.revision is required: unpinned weights are refused")
-    return value
+    digest = value.strip().lower()
+    if not COMMIT.fullmatch(digest):
+        raise invalid(
+            f"profile checkpoint.revision {value!r} is not a full 40-hex commit sha: "
+            "branches, tags and short shas are not pinning"
+        )
+    return digest
+
+
+def _local_revision(profile):
+    """The provenance revision of a local copy; a local copy need not be remote-sha shaped."""
+    value = _checkpoint(profile).get("revision")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise invalid("profile checkpoint.revision must be a non-empty string when set")
+    return value.strip()
 
 
 def verify_files(profile, directory):
     """Verify every declared file hash under `directory`."""
     root = Path(directory)
-    for entry in _checkpoint(profile).get("files") or []:
+    entries = _files(profile)
+    for entry in entries:
         relative = entry.get("path")
         expected = entry.get("sha256")
-        if not relative or not expected:
-            raise invalid("profile checkpoint.files entries need path and sha256")
         path = root / relative
         if not path.is_file():
             raise invalid(f"pinned checkpoint file missing: {path}")
         actual = sha256_file(path)
         if actual != str(expected).lower():
             raise invalid(f"checkpoint file {relative} sha256 {actual} != {expected}")
+    return entries
+
+
+def _refuse_unlisted_weights(root, entries):
+    """A local directory may not smuggle weights the profile does not declare."""
+    declared = {Path(entry["path"]).as_posix() for entry in entries}
+    for candidate in sorted(root.rglob("*")):
+        if candidate.suffix.lower() not in WEIGHT_SUFFIXES or not candidate.is_file():
+            continue
+        relative = candidate.relative_to(root).as_posix()
+        if relative not in declared:
+            raise invalid(
+                f"checkpoint directory contains an unlisted weight file: {relative}; "
+                "every weight the adapter may load needs its sha256 in checkpoint.files"
+            )
 
 
 def pinned_source(profile):
@@ -47,8 +95,9 @@ def pinned_source(profile):
         path = Path(local)
         if not path.is_dir():
             raise invalid(f"profile checkpoint.localPath is not a directory: {local}")
-        verify_files(profile, path)
-        return str(path), revision(profile)
+        entries = verify_files(profile, path)
+        _refuse_unlisted_weights(path, entries)
+        return str(path), _local_revision(profile)
     repo = _checkpoint(profile).get("repo")
     if not isinstance(repo, str) or not repo.strip():
         raise invalid("profile checkpoint.repo is required")
@@ -56,7 +105,7 @@ def pinned_source(profile):
 
 
 def local_file(profile, label="checkpoint"):
-    """A required local checkpoint file, verified against declared hashes."""
+    """A required local checkpoint file, verified against its declared hash."""
     local = _checkpoint(profile).get("localPath")
     if not local:
         raise invalid(
@@ -66,12 +115,15 @@ def local_file(profile, label="checkpoint"):
     path = Path(local)
     if not path.is_file():
         raise invalid(f"pinned {label} not found: {local}")
-    for entry in _checkpoint(profile).get("files") or []:
-        relative = entry.get("path")
-        expected = entry.get("sha256")
-        if not relative or not expected or Path(relative).name != path.name:
-            continue
+    matches = [
+        entry for entry in _files(profile) if Path(entry["path"]).name == path.name
+    ]
+    if not matches:
+        raise invalid(
+            f"{label} {local} has no checkpoint.files entry declaring its sha256"
+        )
+    for entry in matches:
         actual = sha256_file(path)
-        if actual != str(expected).lower():
-            raise invalid(f"{label} {local} sha256 {actual} != {expected}")
+        if actual != str(entry["sha256"]).lower():
+            raise invalid(f"{label} {local} sha256 {actual} != {entry['sha256']}")
     return str(path)

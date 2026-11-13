@@ -88,6 +88,7 @@ pub enum ValidationError {
     InvalidDigest,
     EmptyMime,
     PathEscapesStaging,
+    Symlink,
     MissingFile,
     Unreadable,
     SizeMismatch,
@@ -109,6 +110,7 @@ impl ValidationError {
             Self::InvalidDigest => "artifact_digest",
             Self::EmptyMime => "artifact_mime",
             Self::PathEscapesStaging => "artifact_path",
+            Self::Symlink => "artifact_symlink",
             Self::MissingFile => "artifact_missing",
             Self::Unreadable => "artifact_unreadable",
             Self::SizeMismatch => "artifact_size",
@@ -225,9 +227,7 @@ fn check_result_document(result: &AdapterResult) -> std::result::Result<(), Vali
     if !valid_sha256(&result.content_fingerprint) {
         return Err(ValidationError::InvalidFingerprint);
     }
-    if !result.telemetry.is_object() {
-        return Err(ValidationError::InvalidTelemetry);
-    }
+    check_telemetry(&result.telemetry)?;
     let validation = result
         .validation
         .as_object()
@@ -241,6 +241,47 @@ fn check_result_document(result: &AdapterResult) -> std::result::Result<(), Vali
     }
     if !validation.get("findings").is_some_and(Value::is_array) {
         return Err(ValidationError::InvalidValidation);
+    }
+    Ok(())
+}
+
+/// Spec section 2: the telemetry object's fields and their types. Extra keys
+/// are tolerated, everything the hub reports must be present and typed.
+fn check_telemetry(telemetry: &Value) -> std::result::Result<(), ValidationError> {
+    let object = telemetry
+        .as_object()
+        .ok_or(ValidationError::InvalidTelemetry)?;
+    for key in ["peakVramBytes", "peakRssBytes"] {
+        if object.get(key).and_then(Value::as_u64).is_none() {
+            return Err(ValidationError::InvalidTelemetry);
+        }
+    }
+    for key in ["gpuSeconds", "cpuSeconds"] {
+        let seconds = object
+            .get(key)
+            .and_then(Value::as_f64)
+            .ok_or(ValidationError::InvalidTelemetry)?;
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(ValidationError::InvalidTelemetry);
+        }
+    }
+    for key in ["maxTempC", "maxPowerW"] {
+        match object.get(key) {
+            Some(Value::Null) => {}
+            Some(value) if value.as_f64().is_some() => {}
+            _ => return Err(ValidationError::InvalidTelemetry),
+        }
+    }
+    let device = object
+        .get("device")
+        .and_then(Value::as_str)
+        .ok_or(ValidationError::InvalidTelemetry)?;
+    if device.trim().is_empty() {
+        return Err(ValidationError::InvalidTelemetry);
+    }
+    match object.get("backend").and_then(Value::as_str) {
+        Some("rocm" | "cuda") => {}
+        _ => return Err(ValidationError::InvalidTelemetry),
     }
     Ok(())
 }
@@ -296,6 +337,14 @@ fn resolve_in_staging(
         }
     }
     let candidate = staging.join(relative);
+    // A symlink is refused outright, even one that resolves back inside: only
+    // regular files may be uploaded.
+    if std::fs::symlink_metadata(&candidate)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(ValidationError::Symlink);
+    }
     let resolved = candidate
         .canonicalize()
         .map_err(|_| ValidationError::MissingFile)?;
@@ -333,6 +382,7 @@ pub fn valid_generation_request_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn source_grammar_matches_the_contract() {
@@ -383,7 +433,16 @@ mod tests {
             }],
             "contentFingerprint": "a".repeat(64),
             "cacheHit": false,
-            "telemetry": {"peakVramBytes": 0},
+            "telemetry": {
+                "peakVramBytes": 4096,
+                "gpuSeconds": 1.5,
+                "cpuSeconds": 0.5,
+                "peakRssBytes": 1024,
+                "maxTempC": 61.0,
+                "maxPowerW": null,
+                "device": "gpu:test",
+                "backend": "rocm"
+            },
             "validation": {"state": "ok", "findings": []}
         });
         (staging, document)
@@ -439,8 +498,88 @@ mod tests {
         let (staging, mut document) = staging_fixture();
         document["delivery"] = serde_json::json!({"hubUrl": "http://127.0.0.1:1"});
         document["extra"] = Value::Bool(true);
+        document["telemetry"]["fanRpm"] = Value::Bool(true);
         let validated = validate_result(document.to_string().as_bytes(), &staging).unwrap();
         assert_eq!(validated.artifacts.len(), 1);
         assert_eq!(validated.value["extra"], true);
+    }
+
+    #[test]
+    fn telemetry_requires_every_contract_field() {
+        for key in [
+            "peakVramBytes",
+            "gpuSeconds",
+            "cpuSeconds",
+            "peakRssBytes",
+            "maxTempC",
+            "maxPowerW",
+            "device",
+            "backend",
+        ] {
+            let (staging, mut document) = staging_fixture();
+            document["telemetry"].as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                validate_result(document.to_string().as_bytes(), &staging).unwrap_err(),
+                ValidationError::InvalidTelemetry,
+                "{key} is required"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_fields_are_type_checked() {
+        let cases = [
+            ("peakVramBytes", json!(-1)),
+            ("peakVramBytes", json!("4096")),
+            ("peakRssBytes", json!(null)),
+            ("gpuSeconds", json!(-0.1)),
+            ("gpuSeconds", json!(null)),
+            ("cpuSeconds", json!("1.0")),
+            ("maxTempC", json!("61")),
+            ("maxPowerW", json!({})),
+            ("device", json!(7)),
+            ("device", json!("  ")),
+            ("backend", json!("xpu")),
+            ("backend", json!(null)),
+        ];
+        for (key, value) in cases {
+            let (staging, mut document) = staging_fixture();
+            document["telemetry"][key] = value.clone();
+            assert_eq!(
+                validate_result(document.to_string().as_bytes(), &staging).unwrap_err(),
+                ValidationError::InvalidTelemetry,
+                "{key} = {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn telemetry_temperature_and_power_may_be_null() {
+        let (staging, mut document) = staging_fixture();
+        document["telemetry"]["maxTempC"] = Value::Null;
+        document["telemetry"]["maxPowerW"] = Value::Null;
+        assert!(validate_result(document.to_string().as_bytes(), &staging).is_ok());
+    }
+
+    #[test]
+    fn an_artifact_symlink_is_rejected() {
+        let (staging, mut document) = staging_fixture();
+        let outside = std::env::temp_dir().join(format!("infernix-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, b"outside").unwrap();
+        let link = staging.join("out/link.wav");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        document["artifacts"][0]["path"] = json!("out/link.wav");
+        document["artifacts"][0]["sha256"] = json!(sha256_bytes(b"outside"));
+        document["artifacts"][0]["size"] = json!(7);
+        assert_eq!(
+            validate_result(document.to_string().as_bytes(), &staging).unwrap_err(),
+            ValidationError::Symlink
+        );
+        assert_eq!(
+            retained_artifacts(&document, &staging).unwrap_err(),
+            ValidationError::Symlink,
+            "a retained delivery must not follow a planted symlink either"
+        );
+        std::fs::remove_file(&outside).ok();
     }
 }

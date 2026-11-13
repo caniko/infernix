@@ -78,9 +78,8 @@ def produce(context):
     context.check_cancel()
 
     name = params.get("outputName") or "frame.png"
-    target = adapter.output_path(context.output_directory, name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    image.save(target, format="PNG")
+    with adapter.open_output(context.output_directory, name) as handle:
+        image.save(handle, format="PNG")
     return [context.artifact(params.get("artifactSource", "image"), name, "image/png")]
 
 

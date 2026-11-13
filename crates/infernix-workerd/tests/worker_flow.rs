@@ -221,11 +221,21 @@ impl Fixture {
 
     /// Write the worker config. `adapter` is the script path.
     fn write_config(&self, adapter: &Path) -> PathBuf {
-        self.write_config_for(&[("fixture-rocm", adapter)])
+        self.write_config_timed(&[("fixture-rocm", adapter)], 1, 10)
     }
 
     /// One adapter per `(profile id, script)` pair, all on animation:asset.
     fn write_config_for(&self, adapters: &[(&str, &Path)]) -> PathBuf {
+        self.write_config_timed(adapters, 1, 10)
+    }
+
+    /// The same config with explicit heartbeat and lease timings.
+    fn write_config_timed(
+        &self,
+        adapters: &[(&str, &Path)],
+        heartbeat_interval_secs: u32,
+        lease_duration_secs: u32,
+    ) -> PathBuf {
         let blocks = adapters
             .iter()
             .map(|(profile, adapter)| {
@@ -255,8 +265,8 @@ boot_id = "boot-test"
 # No explicit capabilities: gpu_device alone must advertise gpu:test.
 gpu_device = "test"
 concurrency = 1
-lease_duration_secs = 10
-heartbeat_interval_secs = 1
+lease_duration_secs = {lease}
+heartbeat_interval_secs = {heartbeat}
 poll_interval_secs = 1
 delivery_retry_secs = 1
 staging_root = "{staging}"
@@ -264,6 +274,8 @@ cancel_grace_secs = 2
 max_busy_releases = 30
 busy_retry_delay_secs = 0
 {blocks}"#,
+            lease = lease_duration_secs,
+            heartbeat = heartbeat_interval_secs,
             staging = self.staging_root.display(),
             blocks = blocks,
         );
@@ -420,6 +432,7 @@ const SUCCESS_ADAPTER: &str = r#"#!/bin/sh
 set -eu
 staging="$INFERNIX_WORKLOAD_STAGING_DIRECTORY"
 cat > "$staging/envelope.json"
+printf '%s' "$INFERNIX_STAGING_ROOT" > "$INFX_COPIES/staging-root"
 mkdir -p "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY"
 printf 'first artifact\n' > "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav"
 printf 'second artifact\n' > "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/second.wav"
@@ -525,6 +538,11 @@ async fn success_uploads_declared_artifacts_and_marks_delivered() {
             .ends_with("staging/job-success/1/CANCEL")
     );
     assert_eq!(envelope["payload"]["operation"], "tts");
+    assert_eq!(
+        std::fs::read_to_string(fixture.copies.join("staging-root")).unwrap(),
+        fixture.staging_root.display().to_string(),
+        "adapters learn the workerd staging root"
+    );
 
     // Both artifacts were uploaded once; the 409 replay counts as accepted.
     let requests = hub.wait_for_requests(2).await;
@@ -818,4 +836,188 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// A successful adapter whose TERM-ignoring descendant outlives it, so only a
+/// group-wide SIGKILL clears the group. It exits 0 only when `<staging>/go`
+/// appears, which lets a test hold the ledger's completion fence open.
+const LATE_CANCEL_ADAPTER: &str = r#"#!/bin/sh
+set -eu
+staging="$INFERNIX_WORKLOAD_STAGING_DIRECTORY"
+cat > /dev/null
+mkdir -p "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY"
+printf 'artifact\n' > "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav"
+sh -c 'exec </dev/null >/dev/null 2>&1; trap "" TERM; while :; do sleep 0.1; done' &
+printf '%s' "$!" > "$staging/child.pid"
+while [ ! -f "$staging/go" ]; do sleep 0.05; done
+sha=$(sha256sum "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav" | cut -d' ' -f1)
+size=$(stat -c %s "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav")
+printf '{"artifacts":[{"source":"audio","path":"out/line.wav","sha256":"%s","mime":"audio/wav","size":%s}],"contentFingerprint":"%s","cacheHit":false,"telemetry":{"peakVramBytes":1,"gpuSeconds":0.1,"cpuSeconds":0.1,"peakRssBytes":1,"maxTempC":null,"maxPowerW":null,"device":"gpu:test","backend":"rocm"},"validation":{"state":"ok","findings":[]}}\n' "$sha" "$size" "$sha"
+"#;
+
+/// An adapter whose process group can never empty: a keeper in another group
+/// holds an unreaped (zombie) member of the adapter's group until a test writes
+/// `<staging>/release`. SIGKILL cannot remove a zombie, which is the D-state
+/// analogue the worker must keep its lease for instead of confirming.
+const SURVIVING_GROUP_ADAPTER: &str = r#"#!/usr/bin/env python3
+import os
+import signal
+import sys
+import time
+
+staging = os.environ["INFERNIX_WORKLOAD_STAGING_DIRECTORY"]
+sys.stdin.buffer.read()
+
+
+def keep_zombie(adapter_pgid):
+    os.setpgid(0, 0)  # its own group, same session, so it survives the kill
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for descriptor in (0, 1, 2):
+        os.dup2(devnull, descriptor)
+    child = os.fork()
+    if child == 0:
+        os.setpgid(0, adapter_pgid)
+        os._exit(0)  # unreaped: a zombie that keeps the adapter group alive
+    with open(os.path.join(staging, "keeper.pid"), "w") as handle:
+        handle.write(str(os.getpid()))
+    while not os.path.exists(os.path.join(staging, "release")):
+        time.sleep(0.05)
+    os._exit(0)
+
+
+adapter_pgid = os.getpgid(0)
+keeper = os.fork()
+if keeper == 0:
+    keep_zombie(adapter_pgid)
+with open(os.path.join(staging, "ready"), "w"):
+    pass
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(15))
+while True:
+    time.sleep(0.1)
+"#;
+
+async fn wait_for_file(path: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture never wrote {}",
+            path.display()
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn late_cancellation_kills_the_group_before_confirming() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("late-cancel", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.py", LATE_CANCEL_ADAPTER);
+    // A long heartbeat keeps the run loop from seeing the cancel: it lands only
+    // after the adapter exited, so the completion is the path that is refused.
+    let config = fixture.write_config_timed(&[("fixture-rocm", &adapter)], 60, 300);
+
+    let mut spec = job("job-late-cancel");
+    spec.payload["hubUrl"] = json!("http://127.0.0.1:1");
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+
+    let staging = fixture.staging_root.join("job-late-cancel/1");
+    wait_for_file(&staging.join("child.pid")).await;
+    let child: i32 = std::fs::read_to_string(staging.join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("descendant pid");
+
+    // Hold the completion fence open, then let the adapter exit 0 and request
+    // the cancellation before the fenced completion resumes.
+    client.raw().batch_execute("BEGIN").await.unwrap();
+    client
+        .raw()
+        .query_one(
+            "SELECT id FROM infernix_workload_jobs WHERE id = $1 FOR UPDATE",
+            &[&spec.id.as_str()],
+        )
+        .await
+        .unwrap();
+    std::fs::write(staging.join("go"), b"").unwrap();
+    sleep(Duration::from_millis(500)).await;
+    client
+        .raw()
+        .execute(
+            "UPDATE infernix_workload_jobs SET cancel_requested_at = now() WHERE id = $1",
+            &[&spec.id.as_str()],
+        )
+        .await
+        .unwrap();
+    client.raw().batch_execute("COMMIT").await.unwrap();
+
+    let status = fixture
+        .wait_for_state(&client, &spec.id, JobState::Cancelled)
+        .await;
+    assert!(status.cancel_requested_at.is_some());
+    assert!(
+        !Path::new(&format!("/proc/{child}")).exists(),
+        "the late cancellation must not be confirmed while the group lives"
+    );
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn a_group_that_survives_sigkill_keeps_its_lease_and_is_never_confirmed() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("survivor", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.py", SURVIVING_GROUP_ADAPTER);
+    let config = fixture.write_config_timed(&[("fixture-rocm", &adapter)], 2, 60);
+
+    let spec = job("job-survivor");
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+    let staging = fixture.staging_root.join("job-survivor/1");
+    wait_for_file(&staging.join("ready")).await;
+
+    fixture.cancel(&config, spec.id.as_str()).await;
+
+    // The old worker "confirmed anyway" once its SIGKILL wait expired
+    // (cancel grace 2 s + a 10 s kill wait). Past that point the job must still
+    // be leased, because ESRCH never proved the group empty.
+    sleep(Duration::from_secs(14)).await;
+    let status = client.status(&spec.id).await.unwrap().unwrap();
+    assert_eq!(
+        status.state,
+        JobState::Leased,
+        "a surviving process group must keep the lease, never confirm a cancellation"
+    );
+    assert!(status.cancel_requested_at.is_some());
+    let row = client
+        .raw()
+        .query_one(
+            "SELECT lease_expires_at FROM infernix_workload_jobs WHERE id = $1",
+            &[&spec.id.as_str()],
+        )
+        .await
+        .unwrap();
+    let expires: Option<chrono::DateTime<chrono::Utc>> = row.get(0);
+    assert!(
+        expires.is_some_and(|value| value > chrono::Utc::now()),
+        "the worker keeps heartbeating while it retries termination"
+    );
+
+    // Release the zombie; the group empties and the worker may confirm.
+    std::fs::write(staging.join("release"), b"").unwrap();
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Cancelled)
+        .await;
+    worker.stop().await;
 }

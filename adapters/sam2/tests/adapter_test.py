@@ -23,7 +23,7 @@ PROFILE = {
     "device": "gpu:atlas-7900xtx",
     "deviceMatch": "gfx1100",
     "cpuPolicy": "forbidden",
-    "checkpoint": {"repo": "facebook/sam2.1-hiera-small", "revision": "abc", "files": []},
+    "checkpoint": {"repo": "facebook/sam2.1-hiera-small", "revision": "0123456789abcdef0123456789abcdef01234567", "files": []},
 }
 
 
@@ -174,7 +174,7 @@ class SamTests(unittest.TestCase):
         adapter.load_predictor = lambda path: loaded.append(path) or FakePredictor()
         profile = {
             **PROFILE,
-            "checkpoint": {"repo": "facebook/sam2.1-hiera-small", "revision": "abc"},
+            "checkpoint": {"repo": "facebook/sam2.1-hiera-small", "revision": "0123456789abcdef0123456789abcdef01234567"},
         }
         context = FakeContext(self.root, {"pointCoords": [[2, 2]]}, [], profile=profile)
         with self.assertRaises(AdapterError) as caught:
@@ -187,7 +187,7 @@ class SamTests(unittest.TestCase):
             **PROFILE,
             "checkpoint": {
                 "repo": "facebook/sam2.1-hiera-small",
-                "revision": "abc",
+                "revision": "0123456789abcdef0123456789abcdef01234567",
                 "localPath": str(self.root / "absent.pt"),
             },
         }

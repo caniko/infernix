@@ -3,11 +3,14 @@
 import contextlib
 import io
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common" / "src"))
@@ -88,6 +91,16 @@ class BlenderProgramTests(unittest.TestCase):
         self.assertEqual(scene.cycles.denoiser, "OPENIMAGEDENOISE")
         self.assertEqual(len(bpy.app.handlers.render_init), 1)
 
+    def test_guard_handler_is_persistent(self):
+        """The guard survives loading another .blend, as render_init handlers must."""
+        _, guard, _ = adapter.blender_program(PROFILE)
+        bpy = run_guard(guard, FakeScene())
+        handler = bpy.app.handlers.render_init[0]
+        self.assertTrue(
+            getattr(handler, "persistent", False),
+            "the handler is not registered with @bpy.app.handlers.persistent",
+        )
+
     def test_guard_refuses_a_scene_loaded_without_cycles(self):
         _, guard, _ = adapter.blender_program(PROFILE)
         bpy = run_guard(guard, FakeScene())
@@ -95,6 +108,28 @@ class BlenderProgramTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             handler(FakeScene(engine="BLENDER_EEVEE"))
         self.assertIn("engine", str(caught.exception))
+
+    def test_blender_version_is_parsed_from_the_binary(self):
+        done = types.SimpleNamespace(
+            stdout="Blender 5.2.3\n\tbuild date: 2026-10-01\n", returncode=0
+        )
+        with mock.patch.object(adapter.subprocess, "run", return_value=done) as called:
+            self.assertEqual(adapter.blender_version(), "5.2.3")
+        self.assertEqual(called.call_args.args[0], [adapter.BLENDER, "--version"])
+
+    def test_a_missing_blender_version_is_an_explicit_error(self):
+        done = types.SimpleNamespace(stdout="", returncode=0)
+        with mock.patch.object(adapter.subprocess, "run", return_value=done):
+            with self.assertRaises(AdapterError) as caught:
+                adapter.blender_version()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("version", str(caught.exception))
+
+    def test_oom_text_wins_over_exit_13(self):
+        failure = adapter._classify_blender_exit(
+            13, "HIP out of memory while allocating 2 GiB\n"
+        )
+        self.assertEqual(failure.code, 12)
 
     def test_cuda_uses_optix_and_nvenc(self):
         cuda = dict(PROFILE, backend="cuda", device="gpu:nomad-4090l", deviceMatch="4090")
@@ -147,8 +182,14 @@ def run_guard(guard, scene, devices=None):
         ),
         scene=scene,
     )
+
+    def persistent(function):
+        """`bpy.app.handlers.persistent` marks the handler, as Blender does."""
+        function.persistent = True
+        return function
+
     bpy.app = types.SimpleNamespace(
-        handlers=types.SimpleNamespace(render_init=[])
+        handlers=types.SimpleNamespace(render_init=[], persistent=persistent)
     )
     saved = sys.modules.get("bpy")
     sys.modules["bpy"] = bpy
@@ -322,6 +363,27 @@ class RenderTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, 14)
 
+    def test_frames_root_equal_to_staging_is_invalid(self):
+        with self.assertRaises(AdapterError) as caught:
+            adapter.render(self.context(framesRoot=str(self.root / "staging")))
+        self.assertEqual(caught.exception.code, 14)
+
+    def test_frames_root_ancestor_of_staging_is_invalid(self):
+        with self.assertRaises(AdapterError) as caught:
+            adapter.render(self.context(framesRoot=str(self.root)))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("ancestor", str(caught.exception))
+
+    def test_frames_root_inside_the_exported_staging_root_is_invalid(self):
+        exported = self.root / "exported-staging"
+        exported.mkdir()
+        with mock.patch.dict(
+            "os.environ", {"INFERNIX_STAGING_ROOT": str(exported)}
+        ):
+            with self.assertRaises(AdapterError) as caught:
+                adapter.render(self.context(framesRoot=str(exported / "frames")))
+        self.assertEqual(caught.exception.code, 14)
+
     def test_output_name_traversal_is_invalid(self):
         def fake_run(command, env, log_path, cancel):
             if command[0] == adapter.BLENDER:
@@ -355,3 +417,49 @@ class RenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(
+    shutil.which(adapter.BLENDER) and Path("/dev/kfd").exists(),
+    "needs a real Blender with a HIP device",
+)
+class RealBlenderTests(unittest.TestCase):
+    def test_the_render_init_guard_survives_loading_another_blend(self):
+        """The real handler list keeps the guard across `open_mainfile`."""
+        _, guard, _ = adapter.blender_program(PROFILE)
+        with tempfile.TemporaryDirectory(prefix="blender-guard-") as directory:
+            target = Path(directory) / "second.blend"
+            check = Path(directory) / "check.py"
+            check.write_text(
+                "import bpy\n"
+                f"bpy.ops.wm.save_as_mainfile(filepath={str(target)!r})\n"
+                f"bpy.ops.wm.open_mainfile(filepath={str(target)!r})\n"
+                "handlers = bpy.app.handlers.render_init\n"
+                "print('INFERNIX_HANDLERS', len(handlers))\n"
+                "handlers[0](bpy.context.scene)\n"
+                "print('INFERNIX_PERSISTED')\n"
+            )
+            done = subprocess.run(
+                [
+                    adapter.BLENDER,
+                    "--background",
+                    "--factory-startup",
+                    "--python-exit-code",
+                    "13",
+                    "--python-expr",
+                    guard,
+                    "--python",
+                    str(check),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertIn("INFERNIX_HANDLERS 1", done.stdout)
+        self.assertIn("INFERNIX_PERSISTED", done.stdout)
+        self.assertGreaterEqual(
+            done.stdout.count(adapter.GUARD_OK),
+            2,
+            "the guard must run once at registration and again after the load",
+        )

@@ -22,7 +22,7 @@ PROFILE = {
     "deviceMatch": "gfx1100",
     "cpuPolicy": "forbidden",
     "limits": {"maxInputSeconds": None},
-    "checkpoint": {"repo": adapter.MODEL, "revision": "abc", "files": []},
+    "checkpoint": {"repo": adapter.MODEL, "revision": "0123456789abcdef0123456789abcdef01234567", "files": []},
 }
 
 

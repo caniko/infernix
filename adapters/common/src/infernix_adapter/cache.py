@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 from .hub import sha256_file
+from .result import open_output
 
 CACHE_DIR_ENV = "INFERNIX_ADAPTER_CACHE_DIR"
 DEFAULT_CACHE_DIR = "/var/cache/infernix/animation"
@@ -58,9 +59,11 @@ def lookup(root, fingerprint, output_directory):
             shutil.rmtree(entry, ignore_errors=True)
         return None
     for artifact in manifest["artifacts"]:
-        destination = Path(output_directory) / artifact["path"]
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(entry / artifact["path"], destination)
+        # O_NOFOLLOW + realpath containment: a planted symlink cannot redirect
+        # the restore outside the attempt's output directory.
+        with open_output(output_directory, artifact["path"]) as destination:
+            with (entry / artifact["path"]).open("rb") as source:
+                shutil.copyfileobj(source, destination)
     return manifest
 
 

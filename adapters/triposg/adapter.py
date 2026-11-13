@@ -11,6 +11,7 @@ installs an import blocker that refuses `briarmbg` outright.
 import importlib.abc
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -23,6 +24,7 @@ from infernix_adapter import AdapterError, run
 REPO = "VAST-AI/TripoSG"
 FORBIDDEN_MODULES = ("briarmbg", "briaai")
 PADDING = 0.1
+SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 class _BlockBackgroundRemoval(importlib.abc.MetaPathFinder):
@@ -172,12 +174,12 @@ def produce(context):
             "guidanceScale": params.get("guidanceScale", 7.0),
         },
     }
-    report_path = adapter.output_path(context.output_directory, "geometry.json")
-    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    with adapter.open_output(context.output_directory, "geometry.json") as handle:
+        handle.write((json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
     return [
         context.artifact(params.get("artifactSource", "geometry"), name, "model/gltf-binary"),
-        context.artifact("geometrymeta", report_path.name, "application/json"),
+        context.artifact("geometrymeta", "geometry.json", "application/json"),
     ]
 
 
@@ -197,8 +199,21 @@ def _simplify(mesh, faces_target):
     )
 
 
+def runtime_versions(envelope):
+    """The pinned TripoSG source commit the content fingerprint must cover."""
+    commit = ((envelope.profile or {}).get("code") or {}).get("commit")
+    digest = commit.strip().lower() if isinstance(commit, str) else ""
+    if not SOURCE_COMMIT.match(digest):
+        raise AdapterError(
+            14,
+            "profile code.commit must be the pinned TripoSG source commit sha: "
+            f"{commit!r} is not a full 40-hex commit",
+        )
+    return {"triposg": digest}
+
+
 def main():
-    return run(produce, package="triposg")
+    return run(produce, package="triposg", runtime=runtime_versions)
 
 
 if __name__ == "__main__":

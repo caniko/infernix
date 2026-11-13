@@ -1,5 +1,6 @@
 """Adapter entrypoint: envelope in on stdin, one result object out on stdout."""
 
+import ctypes
 import importlib.metadata
 import os
 import platform
@@ -21,6 +22,10 @@ from .exits import (
 from .fingerprint import content_fingerprint
 from .result import collect
 from .threads import bound_threads
+
+# workerd exports the attempt staging root so an adapter can prove a persistent
+# cache never sits inside it (interfaces section 2).
+STAGING_ROOT_ENV = "INFERNIX_STAGING_ROOT"
 
 
 @dataclass
@@ -101,16 +106,31 @@ def _installed_version(distribution):
         return None
 
 
-def _runtime_versions(distribution, torch_module):
+def _runtime_versions(distribution, torch_module, runtime=None):
     """Fingerprint actual versions, never a label."""
     version = getattr(torch_module, "version", None) if torch_module is not None else None
-    return {
+    versions = {
         "python": platform.python_version(),
         "torch": getattr(torch_module, "__version__", None) if torch_module is not None else None,
         "hip": getattr(version, "hip", None),
         "cuda": getattr(version, "cuda", None),
         "package": _installed_version(distribution),
     }
+    if runtime:
+        versions.update(runtime)
+    return versions
+
+
+def _required_runtime(runtime):
+    """Refuse to fingerprint a runtime the adapter could not identify."""
+    for key, value in (runtime or {}).items():
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise AdapterError(
+                14,
+                f"runtime {key!r} is required for the content fingerprint; "
+                "an unidentified runtime must not be hashed as null",
+            )
+    return runtime or {}
 
 
 class _ReservedStdout:
@@ -127,6 +147,13 @@ class _ReservedStdout:
         os.dup2(2, 1)
 
     def _flush(self):
+        # C stdio buffers belong to the redirected fd 1 too: a handler's
+        # buffered `printf` must reach stderr before the result is printed, not
+        # after it once fd 1 is restored.
+        try:
+            ctypes.CDLL(None).fflush(None)
+        except (OSError, AttributeError):
+            pass
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
@@ -151,9 +178,15 @@ def run(
     torch_module=None,
     use_cache=True,
     torch_guard=True,
+    runtime=None,
     stdin=None,
 ):
-    """Run one adapter operation and return the process exit code."""
+    """Run one adapter operation and return the process exit code.
+
+    `runtime` is a mapping, or a callable taking the parsed envelope, of extra
+    runtime identities the fingerprint must cover (a renderer version, a
+    pinned source commit). A null value is an error, never a cache key.
+    """
     stdin = stdin or sys.stdin.buffer
     staging = None
     watcher = None
@@ -175,11 +208,12 @@ def run(
             torch = gpu.assert_gpu(envelope.profile, torch_module)
         elif requires_gpu:
             torch = torch_module
-        runtime = _runtime_versions(package, torch or torch_module)
+        extra = _required_runtime(runtime(envelope) if callable(runtime) else runtime)
+        installed = _runtime_versions(package, torch or torch_module, extra)
 
         fingerprint = content_fingerprint(
             profile=envelope.profile,
-            runtime=runtime,
+            runtime=installed,
             operation=envelope.operation,
             inputs=[item.sha256 for item in envelope.inputs],
             params=envelope.params,

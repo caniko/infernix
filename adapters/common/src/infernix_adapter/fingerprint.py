@@ -53,13 +53,9 @@ def content_fingerprint(
         "v": VERSION,
         "profile": profile_digest(profile),
         "checkpoint": checkpoint_key((profile or {}).get("checkpoint")),
-        "runtime": {
-            "python": runtime.get("python"),
-            "torch": runtime.get("torch"),
-            "hip": runtime.get("hip"),
-            "cuda": runtime.get("cuda"),
-            "package": runtime.get("package"),
-        },
+        # Every identity the adapter identified, including an adapter-specific
+        # renderer version or pinned source commit: nothing is silently dropped.
+        "runtime": {key: runtime[key] for key in sorted(runtime)},
         "operation": operation,
         "inputs": sorted(inputs),
         "params": params or {},

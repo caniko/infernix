@@ -28,6 +28,7 @@ after every frame matches the recorded sha256.
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -47,6 +48,7 @@ FFMPEG = os.environ.get("INFERNIX_FFMPEG", "ffmpeg")
 GUARD_OK = "INFERNIX_BLENDER_GUARD_OK"
 VERIFY_OK = "INFERNIX_BLENDER_VERIFY_OK"
 FRAMES_MANIFEST = "frames.json"
+VERSION_LINE = re.compile(r"^Blender\s+(\S+)")
 
 GUARD = """
 import bpy
@@ -89,6 +91,9 @@ def _infernix_apply(scene, strict):
     print(__OK__, json.dumps(enabled))
 
 
+# Persistent: the handler list survives loading another .blend scene, so the
+# guard still runs on whatever the operation loads right before rendering.
+@bpy.app.handlers.persistent
 def _infernix_gpu_guard(scene, *args):
     _infernix_apply(scene, True)
 
@@ -137,18 +142,55 @@ def blender_program(profile):
     return device_type, guard, verify
 
 
+def blender_version():
+    """The running Blender version, parsed from `blender --version`.
+
+    A fingerprint may not hash an unidentified renderer as null: a missing or
+    unparseable version is a typed failure.
+    """
+    try:
+        done = subprocess.run(
+            [BLENDER, "--version"], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AdapterError(1, f"cannot identify the Blender runtime: {error}") from error
+    for line in done.stdout.splitlines():
+        found = VERSION_LINE.match(line.strip())
+        if found:
+            return found.group(1)
+    raise AdapterError(
+        1,
+        f"{BLENDER} --version printed no version: {done.stdout.strip()[:200]!r}",
+    )
+
+
+def runtime_versions(envelope):
+    """The runtime identity the content fingerprint must cover."""
+    return {"blender": blender_version()}
+
+
 def frames_root(profile, params, staging_directory):
-    """The persistent frame-sequence root, never inside the attempt staging."""
+    """The persistent frame-sequence root, never overlapping the attempt staging."""
     configured = (
         params.get("framesRoot")
         or profile.get("framesRoot")
         or os.environ.get("INFERNIX_FRAMES_ROOT")
     )
     root = Path(configured) if configured else cache_root() / "frames"
-    staging = Path(staging_directory).resolve()
-    resolved = root.resolve()
-    if resolved == staging or staging in resolved.parents:
-        raise AdapterError(14, f"framesRoot {root} is inside the attempt staging directory")
+    resolved = Path(os.path.realpath(root))
+    protected = {Path(os.path.realpath(staging_directory))}
+    exported = os.environ.get(adapter.STAGING_ROOT_ENV)
+    if exported:
+        protected.add(Path(os.path.realpath(exported)))
+    for staging in protected:
+        if resolved == staging or staging in resolved.parents:
+            raise AdapterError(
+                14, f"framesRoot {root} is inside the attempt staging directory"
+            )
+        if resolved in staging.parents:
+            raise AdapterError(
+                14, f"framesRoot {root} is an ancestor of the attempt staging directory"
+            )
     return resolved
 
 
@@ -220,12 +262,14 @@ def _read_log(path):
 def _classify_blender_exit(code, text):
     """Map the Blender subprocess exit before the generic failure branch."""
     findings = [line for line in text.splitlines()[-20:] if line.strip()]
+    # OOM is classified first: a driver out-of-memory can also exit 13, and
+    # must not be recorded as a backend mismatch.
+    if code == 12 or is_oom(RuntimeError(text)):
+        return AdapterError(12, f"blender ran out of memory (exit {code})", findings=findings)
     if code == 13:
         return AdapterError(
             13, "blender refused the operation (exit 13)", findings=findings
         )
-    if code == 12 or is_oom(RuntimeError(text)):
-        return AdapterError(12, f"blender ran out of memory (exit {code})", findings=findings)
     if code != 0:
         return AdapterError(1, f"blender exited {code}", findings=findings)
     return None
@@ -325,12 +369,12 @@ def render(context):
         "encoder": encoder,
         "master": master.name,
     }
-    locator_path = adapter.output_path(context.output_directory, FRAMES_MANIFEST)
-    locator_path.write_text(json.dumps(locator, indent=2, sort_keys=True) + "\n")
+    with adapter.open_output(context.output_directory, FRAMES_MANIFEST) as handle:
+        handle.write((json.dumps(locator, indent=2, sort_keys=True) + "\n").encode("utf-8"))
 
     return [
         context.artifact(params.get("artifactSource", "preview"), output_name, "video/mp4"),
-        context.artifact("frames", locator_path.name, "application/json"),
+        context.artifact("frames", FRAMES_MANIFEST, "application/json"),
     ]
 
 
@@ -379,7 +423,12 @@ def _encode(encoder, frames, fps, start, master, logs, context):
 
 
 def main():
-    return run(render, package="blender-cycles-hip", torch_guard=False)
+    return run(
+        render,
+        package="blender-cycles-hip",
+        torch_guard=False,
+        runtime=runtime_versions,
+    )
 
 
 if __name__ == "__main__":

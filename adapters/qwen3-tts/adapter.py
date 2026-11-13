@@ -42,17 +42,17 @@ def assert_speech_tokenizer(model):
     adapter.assert_on_gpu(module, label="qwen3-tts speech_tokenizer")
 
 
-def write_wav(path, samples, sample_rate):
+def write_wav(handle, samples, sample_rate):
     data = np.asarray(samples, dtype=np.float32)
     peak = float(np.max(np.abs(data))) if data.size else 0.0
     if peak > 1.0:
         data = data / peak
     pcm = np.clip(data * 32767.0, -32768, 32767).astype("<i2")
-    with wave.open(str(path), "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(int(sample_rate))
-        handle.writeframes(pcm.tobytes())
+    with wave.open(handle, "wb") as sink:
+        sink.setnchannels(1)
+        sink.setsampwidth(2)
+        sink.setframerate(int(sample_rate))
+        sink.writeframes(pcm.tobytes())
 
 
 def produce(context):
@@ -92,9 +92,8 @@ def produce(context):
         findings.append(f"audio {duration:.2f}s exceeds profile limit {limit}s")
 
     name = params.get("outputName") or "line.wav"
-    target = adapter.output_path(context.output_directory, name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    write_wav(target, wavs[0], sample_rate or DEFAULT_SAMPLE_RATE)
+    with adapter.open_output(context.output_directory, name) as handle:
+        write_wav(handle, wavs[0], sample_rate or DEFAULT_SAMPLE_RATE)
 
     state = "warn" if findings else "ok"
     context.validation = {"state": state, "findings": findings}

@@ -6,12 +6,12 @@
   "blockedReason": null,
   "checkpoint": {
     "repo": "blender/blender",
-    "revision": "5.2.3",
+    "revision": "e13b728c6880d3084d9d57c30031ed5df8b39dee",
     "files": []
   },
   "code": {
     "repo": "https://projects.blender.org/blender/blender",
-    "commit": null,
+    "commit": "e13b728c6880d3084d9d57c30031ed5df8b39dee",
     "package": "blender-5.2.3"
   },
   "licence": {

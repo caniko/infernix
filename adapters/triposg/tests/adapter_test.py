@@ -29,7 +29,16 @@ PROFILE = {
     "deviceMatch": "4090",
     "cpuPolicy": "forbidden",
     "precision": "fp32",
-    "checkpoint": {"repo": "VAST-AI/TripoSG", "revision": "abc", "files": []},
+    "checkpoint": {
+        "repo": "VAST-AI/TripoSG",
+        "revision": "0123456789abcdef0123456789abcdef01234567",
+        "files": [],
+    },
+    "code": {
+        "repo": "https://github.com/VAST-AI-Research/TripoSG",
+        "commit": "fedcba9876543210fedcba9876543210fedcba98",
+        "package": "triposg",
+    },
 }
 
 
@@ -143,6 +152,20 @@ class TripoTests(unittest.TestCase):
         adapter.produce(self.context(params={"modelPath": "/elsewhere"}))
         self.assertEqual(recorded["source"], PROFILE["checkpoint"]["repo"])
         self.assertEqual(recorded["revision"], PROFILE["checkpoint"]["revision"])
+
+    def test_the_pinned_source_commit_enters_the_runtime_fingerprint(self):
+        envelope = types.SimpleNamespace(profile=PROFILE)
+        self.assertEqual(
+            adapter.runtime_versions(envelope),
+            {"triposg": PROFILE["code"]["commit"]},
+        )
+
+    def test_a_null_source_commit_fails_fingerprinting(self):
+        profile = {**PROFILE, "code": {"repo": "x", "commit": None, "package": "triposg"}}
+        with self.assertRaises(AdapterError) as caught:
+            adapter.runtime_versions(types.SimpleNamespace(profile=profile))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("code.commit", str(caught.exception))
 
     def test_unpinned_profile_is_invalid(self):
         profile = {**PROFILE, "checkpoint": {"repo": "VAST-AI/TripoSG", "files": []}}

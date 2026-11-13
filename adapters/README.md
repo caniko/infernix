@@ -375,6 +375,9 @@ UV_PROJECT_ENVIRONMENT=$XPU_ROOT/.venvs/<adapter> \
   uv sync --frozen --project $ADAPTERS/<adapter>/xpu --python 3.12
 ```
 
+The sam2 project has a `git+https` dependency, so `git` must be on `PATH` for
+that sync (on murph: `nix shell nixpkgs#uv nixpkgs#git -c uv sync …`).
+
 The XPU lock pins `torch==2.14.1+xpu`, `torchvision==0.29.1+xpu` and
 `torchaudio==2.11.0+xpu` from `https://download.pytorch.org/whl/xpu`. On NixOS
 the wheels still need the system Level Zero loader and Intel GPU driver:

@@ -652,6 +652,27 @@ class XpuTelemetryTests(unittest.TestCase):
             sampler._sample_xpu(root=self.root)["busy_ns"], 1_000_000_000, "two 0.5 s clients on render are 1 s"
         )
 
+    def test_stop_returns_when_the_sampler_hangs(self):
+        sampler = telemetry.Sampler("xpu", interval=0.01, fdinfo_root=self.root)
+        hung, release = threading.Event(), threading.Event()
+        real = sampler._sample_xpu
+
+        def stuck(root=None):
+            if threading.current_thread().name == "telemetry":
+                hung.set()
+                release.wait(30)
+            return real(root)
+
+        sampler._sample_xpu = stuck
+        self.addCleanup(release.set)
+        sampler.start()
+        self.assertTrue(hung.wait(5))
+        started = time.monotonic()
+        with mock.patch.object(threading.Thread, "join", lambda self, timeout=None: None):
+            summary = sampler.stop()
+        self.assertLess(time.monotonic() - started, 2, "stop() must not wait on a hung sampler")
+        self.assertEqual(summary["backend"], "xpu")
+
     def test_engine_deltas_become_gpu_seconds_and_resident_becomes_peak(self):
         sampler = telemetry.Sampler("xpu")
         first = sampler._sample_xpu(root=self.root)

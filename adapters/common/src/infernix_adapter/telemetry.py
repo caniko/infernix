@@ -260,11 +260,16 @@ class Sampler:
         if self._thread is not None:
             self._stop.set()
             self._thread.join(timeout=5)
+            hung = self._thread.is_alive()
             self._thread = None
-            if self.backend == "xpu":
-                # Final snapshot: a sub-second inference can finish between ticks.
-                # The lock waits out a sample in flight; the thread then exits
-                # without sampling again, so the summary is final.
+            # A sampler stuck in a /proc read holds the lock: return the last
+            # completed totals rather than block the adapter's result.
+            if self.backend == "xpu" and not hung:
+                # Final snapshot: a sub-second inference can finish between
+                # ticks. The thread has exited, so nothing samples after this.
+                # ponytail: this read is unbounded; it follows a clean thread
+                # exit, so /proc just answered. Move it onto a timed worker if
+                # fdinfo reads ever hang in practice.
                 with self._lock:
                     self._record(self._sample_xpu(), 0.0)
         return self.summary()

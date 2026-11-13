@@ -23,9 +23,13 @@ left to confirm it.
 
 `RELEASE_BUSY` returns a leased job to `pending` with `attempts = attempts - 1`
 (the device was busy, the attempt did not run) and a short `not_before` delay.
-After `max_busy_releases` releases the job fails with `resource_busy`. A cancel
-flag outranks a retry: a busy release or a normal failure on a cancelled job
-resolves it to `cancelled`, because nothing would ever claim it again.
+After `max_busy_releases` releases the job fails with `resource_busy`.
+`RELEASE_PREEMPTED` is the same retry for a host-admission withdrawal: the
+attempt comes back and the delay applies, but it is not charged to that budget,
+because an idle-host probe that flaps must not fail a healthy job. A cancel
+flag outranks either retry: a busy release, a preempted release or a normal
+failure on a cancelled job resolves it to `cancelled`, because nothing would
+ever claim it again.
 
 `COMPLETE` is refused when `cancel_requested_at` is set: the worker then runs
 `CONFIRM_CANCELLED` instead of uploading, atomically. Like `HEARTBEAT`,
@@ -265,10 +269,15 @@ A verdict is cached for `recheck_secs`, so a deny does not re-probe every poll.
 
 With `preempt = true` a running adapter is stopped when the verdict flips to
 deny: the attempt's `CANCEL` file is written, the process group gets `SIGTERM`,
-and `SIGKILL` follows after `worker.cancel_grace_secs`. The job returns to
-`pending` without spending an attempt (the same `RELEASE_BUSY` path as exit 10,
-so `max_busy_releases` and `busy_retry_delay_secs` bound the retries). An adapter
-that exits 0 before the signal lands still completes normally, and a ledger
-cancellation the worker observes first keeps the usual cancellation path.
+and `SIGKILL` follows after `worker.cancel_grace_secs`. The probe runs as its
+own future beside the lease heartbeat, so `heartbeat_interval_secs +
+admission.timeout_secs` must stay below `lease_duration_secs`. Whichever exit
+code the adapter reports, the group must be empty before the job is decided.
+The job then returns to `pending` via `RELEASE_PREEMPTED` without spending an
+attempt and without charging `max_busy_releases`; `busy_retry_delay_secs` still
+delays the retry. The release drops the `CANCEL` file first, because the
+reclaim reuses the same attempt staging directory. An adapter that exits 0
+before the signal lands still completes normally, and a ledger cancellation the
+worker observes first keeps the usual cancellation path.
 
 Without `[worker.admission]` the worker behaves exactly as before.

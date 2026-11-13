@@ -841,6 +841,40 @@ impl InMemoryQueue {
         })
     }
 
+    /// `RELEASE_PREEMPTED`: `RELEASE_BUSY` for a host-admission withdrawal. The
+    /// attempt comes back, the retry delay applies, and the busy-release budget
+    /// is untouched.
+    pub fn release_preempted(
+        &self,
+        lease: &Lease,
+        now: DateTime<Utc>,
+        retry_delay: Duration,
+    ) -> Result<BusyReleaseOutcome, WorkloadError> {
+        let mut state = self.lock_state();
+        let record = state
+            .jobs
+            .get_mut(&lease.job_id)
+            .ok_or_else(|| WorkloadError::UnknownJob(lease.job_id.as_str().to_owned()))?;
+        ensure_current_lease(record, lease)?;
+        record.attempts = record.attempts.saturating_sub(1);
+        record.lease = None;
+        if record.cancel_requested_at.is_some() {
+            record.state = JobState::Cancelled;
+            record.not_before = None;
+            return Ok(BusyReleaseOutcome::Cancelled {
+                busy_releases: record.busy_releases,
+            });
+        }
+        let not_before = now + retry_delay;
+        record.state = JobState::Pending;
+        record.not_before = Some(not_before);
+        Ok(BusyReleaseOutcome::Released {
+            attempts: record.attempts,
+            busy_releases: record.busy_releases,
+            not_before,
+        })
+    }
+
     /// `MARK_DELIVERED`: fenced on the worker that completed the job.
     pub fn mark_delivered(
         &self,
@@ -1271,6 +1305,33 @@ UPDATE infernix_workload_jobs
 RETURNING state, attempts, busy_releases, not_before;
 "#;
 
+    /// `RELEASE_PREEMPTED`: like `RELEASE_BUSY`, but host admission withdrawals
+    /// are not charged to the busy-release budget, because a flapping idle-host
+    /// probe must not turn a healthy job into `resource_busy`.
+    pub const RELEASE_PREEMPTED: &str = r#"
+UPDATE infernix_workload_jobs
+   SET attempts = GREATEST(attempts - 1, 0),
+       state = CASE
+                   WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
+                   ELSE 'pending'
+               END,
+       not_before = CASE
+                        WHEN cancel_requested_at IS NOT NULL THEN NULL
+                        ELSE $5::timestamptz
+                    END,
+       lease_owner = NULL,
+       lease_boot_id = NULL,
+       lease_token = NULL,
+       lease_expires_at = NULL,
+       updated_at = now()
+ WHERE id = $1
+   AND state = 'leased'
+   AND lease_owner = $2
+   AND lease_boot_id = $3
+   AND lease_token = $4
+RETURNING state, attempts, busy_releases, not_before;
+"#;
+
     /// `MARK_DELIVERED`: fenced on the worker that completed the job.
     ///
     /// The boot id is deliberately not part of the fence: restart recovery must
@@ -1546,6 +1607,15 @@ mod tests {
         assert!(sql::CLAIM.contains("cancel_requested_at IS NULL"));
         assert!(sql::HEARTBEAT.contains("RETURNING cancel_requested_at"));
         assert!(sql::RELEASE_BUSY.contains("GREATEST(attempts - 1, 0)"));
+        assert!(
+            !sql::RELEASE_PREEMPTED.contains("busy_releases + 1"),
+            "a host-admission withdrawal must not spend the busy-release budget"
+        );
+        assert!(sql::RELEASE_PREEMPTED.contains("GREATEST(attempts - 1, 0)"));
+        assert!(
+            sql::RELEASE_PREEMPTED.contains("cancel_requested_at IS NOT NULL"),
+            "a cancel still outranks a preempted retry"
+        );
         assert!(sql::MARK_DELIVERED.contains("state = 'succeeded'"));
     }
 
@@ -1713,6 +1783,39 @@ mod tests {
         let record = queue.get(&JobId::new("job").unwrap()).unwrap();
         assert_eq!(record.state, JobState::Failed);
         assert_eq!(record.error.as_deref(), Some(RESOURCE_BUSY));
+    }
+
+    #[test]
+    fn preemption_never_charges_the_busy_release_budget() {
+        let queue = InMemoryQueue::default();
+        queue.register_worker(worker("atlas", &[])).unwrap();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let now = Utc::now();
+
+        for cycle in 0..3 {
+            let lease = queue
+                .claim(
+                    &WorkerId::new("atlas").unwrap(),
+                    now + Duration::seconds(i64::from(cycle) * 60),
+                    Duration::minutes(5),
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("claim {cycle}"));
+            assert_eq!(
+                queue
+                    .release_preempted(&lease, now, Duration::seconds(1))
+                    .unwrap(),
+                BusyReleaseOutcome::Released {
+                    attempts: 0,
+                    busy_releases: 0,
+                    not_before: now + Duration::seconds(1),
+                }
+            );
+            let record = queue.get(&JobId::new("job").unwrap()).unwrap();
+            assert_eq!(record.state, JobState::Pending);
+            assert_eq!(record.busy_releases, 0, "the budget is never charged");
+            assert_eq!(record.attempts, 0, "the attempt comes back");
+        }
     }
 
     #[test]

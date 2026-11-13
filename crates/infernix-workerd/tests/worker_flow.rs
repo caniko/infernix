@@ -491,6 +491,48 @@ while :; do
 done
 "#;
 
+/// A cancellation-aware adapter: the first attempt runs until SIGTERM and the
+/// reclaim of the returned `pending` job succeeds. Like the real adapter
+/// runtime it refuses to start when the attempt's `CANCEL` file is already
+/// there, so it only completes if the release dropped that file.
+const RECLAIMABLE_ADAPTER: &str = r#"#!/bin/sh
+set -eu
+staging="$INFERNIX_WORKLOAD_STAGING_DIRECTORY"
+cat > /dev/null
+if [ -e "$staging/CANCEL" ]; then
+  printf 'cancelled\n'
+  exit 15
+fi
+if [ ! -e "$INFX_COPIES/attempted" ]; then
+  : > "$INFX_COPIES/attempted"
+  trap 'exit 15' TERM
+  while :; do sleep 0.05; done
+fi
+mkdir -p "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY"
+printf 'artifact\n' > "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav"
+sha=$(sha256sum "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav" | cut -d' ' -f1)
+size=$(stat -c %s "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav")
+printf '{"artifacts":[{"source":"audio","path":"out/line.wav","sha256":"%s","mime":"audio/wav","size":%s}],"contentFingerprint":"%s","cacheHit":false,"telemetry":{"peakVramBytes":1,"gpuSeconds":0.1,"cpuSeconds":0.1,"peakRssBytes":1,"maxTempC":null,"maxPowerW":null,"device":"gpu:test","backend":"rocm"},"validation":{"state":"ok","findings":[]}}\n' "$sha" "$size" "$sha"
+"#;
+
+/// An adapter that reports success but exits 0 on SIGTERM, leaving a
+/// TERM-ignoring descendant in its group. A preemption must still clear the
+/// group before the job completes.
+const EXITS_ZERO_WITH_DESCENDANT_ADAPTER: &str = r#"#!/bin/sh
+set -eu
+staging="$INFERNIX_WORKLOAD_STAGING_DIRECTORY"
+cat > /dev/null
+mkdir -p "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY"
+printf 'artifact\n' > "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav"
+sh -c 'exec </dev/null >/dev/null 2>&1; trap "" TERM; while :; do sleep 0.1; done' &
+printf '%s' "$!" > "$staging/child.pid"
+sha=$(sha256sum "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav" | cut -d' ' -f1)
+size=$(stat -c %s "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav")
+printf '{"artifacts":[{"source":"audio","path":"out/line.wav","sha256":"%s","mime":"audio/wav","size":%s}],"contentFingerprint":"%s","cacheHit":false,"telemetry":{"peakVramBytes":1,"gpuSeconds":0.1,"cpuSeconds":0.1,"peakRssBytes":1,"maxTempC":null,"maxPowerW":null,"device":"gpu:test","backend":"rocm"},"validation":{"state":"ok","findings":[]}}\n' "$sha" "$size" "$sha"
+trap 'exit 0' TERM
+while :; do sleep 0.05; done
+"#;
+
 /// A descendant that ignores SIGTERM, so only a group-wide SIGKILL ends it.
 const STUBBORN_DESCENDANT_ADAPTER: &str = r#"#!/bin/sh
 set -eu
@@ -870,25 +912,169 @@ async fn preemption_returns_the_job_to_pending_without_spending_an_attempt() {
         .wait_for_state(&client, &spec.id, JobState::Leased)
         .await;
 
-    // The owner comes back: the next admission recheck preempts the adapter.
+    // Two preemptions: host admission withdrawal is never charged to the
+    // busy-release budget, so the job stays pending however often it flaps.
+    for cycle in 0..2 {
+        // The owner comes back: the next admission recheck preempts the adapter.
+        std::fs::write(&marker, b"owner is back\n").unwrap();
+        let status = fixture
+            .wait_for_state(&client, &spec.id, JobState::Pending)
+            .await;
+        assert_eq!(status.attempts, 0, "preemption {cycle} spends no attempt");
+        let row = client
+            .raw()
+            .query_one(
+                "SELECT busy_releases FROM infernix_workload_jobs WHERE id = $1",
+                &[&spec.id.as_str()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<_, i32>("busy_releases"),
+            0,
+            "preemption {cycle} must not spend the busy-release budget"
+        );
+        assert!(
+            fixture.staging_root.join("job-preempt/1/sigterm").is_file(),
+            "preemption {cycle} must SIGTERM the adapter group"
+        );
+
+        if cycle == 0 {
+            // The host is idle again: the job is reclaimed for another run.
+            std::fs::remove_file(&marker).unwrap();
+            fixture
+                .wait_for_state(&client, &spec.id, JobState::Leased)
+                .await;
+        }
+    }
+
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn a_preempted_attempt_reclaims_its_staging_directory_cleanly() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("reclaim", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", RECLAIMABLE_ADAPTER);
+    let marker = fixture.copies.join("deny");
+    let config =
+        fixture.write_config_admission(&[("fixture-rocm", &adapter)], &preempt_admission(&marker));
+    let hub = StubHub::start(&[]).await;
+
+    let mut spec = job("job-reclaim");
+    spec.payload["hubUrl"] = json!(hub.base_url());
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
     std::fs::write(&marker, b"owner is back\n").unwrap();
-    let status = fixture
+    fixture
         .wait_for_state(&client, &spec.id, JobState::Pending)
         .await;
-    assert_eq!(status.attempts, 0, "a preemption spends no attempt");
-    let row = client
-        .raw()
-        .query_one(
-            "SELECT busy_releases FROM infernix_workload_jobs WHERE id = $1",
-            &[&spec.id.as_str()],
-        )
-        .await
-        .unwrap();
-    assert_eq!(row.get::<_, i32>("busy_releases"), 1);
     assert!(
-        fixture.staging_root.join("job-preempt/1/sigterm").is_file(),
-        "preemption must SIGTERM the adapter group"
+        !fixture.staging_root.join("job-reclaim/1/CANCEL").exists(),
+        "the release must drop the preemption's CANCEL: the reclaim reuses this staging directory"
     );
+
+    // The host is idle again, so the same attempt runs to completion.
+    std::fs::remove_file(&marker).unwrap();
+    let status = fixture
+        .wait_for_state(&client, &spec.id, JobState::Succeeded)
+        .await;
+    assert_eq!(status.attempts, 1, "the reclaim is the same attempt");
+    assert!(status.delivered_at.is_some());
+    hub.wait_for_requests(1).await;
+
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn a_preempted_adapter_that_exits_zero_still_clears_its_group() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("preempt-zero", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", EXITS_ZERO_WITH_DESCENDANT_ADAPTER);
+    let marker = fixture.copies.join("deny");
+    let config =
+        fixture.write_config_admission(&[("fixture-rocm", &adapter)], &preempt_admission(&marker));
+    let hub = StubHub::start(&[]).await;
+
+    let mut spec = job("job-preempt-zero");
+    spec.payload["hubUrl"] = json!(hub.base_url());
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+    let staging = fixture.staging_root.join("job-preempt-zero/1");
+    wait_for_file(&staging.join("child.pid")).await;
+    let child: i32 = std::fs::read_to_string(staging.join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("descendant pid");
+
+    std::fs::write(&marker, b"owner is back\n").unwrap();
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Succeeded)
+        .await;
+    assert!(
+        !Path::new(&format!("/proc/{child}")).exists(),
+        "an adapter that exits 0 on preemption still leaves no live descendants"
+    );
+
+    worker.stop().await;
+}
+
+/// A probe that answers immediately until `hold` exists, then blocks for its
+/// whole timeout.
+fn hold_admission(copies: &Path) -> String {
+    format!(
+        r#"
+[worker.admission]
+command = ["sh", "-c", "if [ -e '{copies}/hold' ]; then sleep 30; fi; exit 0"]
+recheck_secs = 1
+timeout_secs = 30
+preempt = true
+"#,
+        copies = copies.display()
+    )
+}
+
+#[tokio::test]
+async fn a_slow_admission_probe_never_stalls_cancellation() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("probe-cancel", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", CANCELLABLE_ADAPTER);
+    let config = fixture.write_config_admission(
+        &[("fixture-rocm", &adapter)],
+        &hold_admission(&fixture.copies),
+    );
+
+    let spec = job("job-probe-cancel");
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+    // Every probe from here on sits in its 30 s timeout, so a supervision
+    // loop that awaited one would not tick a 1 s heartbeat again in time.
+    std::fs::write(fixture.copies.join("hold"), b"").unwrap();
+    sleep(Duration::from_secs(2)).await;
+
+    fixture.cancel(&config, spec.id.as_str()).await;
+    timeout(
+        Duration::from_secs(10),
+        fixture.wait_for_state(&client, &spec.id, JobState::Cancelled),
+    )
+    .await
+    .expect("a cancellation must not wait for the admission probe's timeout");
 
     worker.stop().await;
 }

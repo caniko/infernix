@@ -527,6 +527,12 @@ in
         assertion = cfg.admission == null || cfg.admission.command != [ ];
         message = "services.infernix.workloadFabric.admission.command must not be empty.";
       }
+      {
+        assertion =
+          cfg.admission == null
+          || cfg.heartbeatIntervalSecs + cfg.admission.timeoutSecs < cfg.leaseDurationSecs;
+        message = "services.infernix.workloadFabric.heartbeatIntervalSecs + admission.timeoutSecs must be less than leaseDurationSecs: the probe runs beside the heartbeat, so one probe must fit inside the lease.";
+      }
     ]
     ++ lib.mapAttrsToList
       (name: adapter: {

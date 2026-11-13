@@ -10,7 +10,9 @@ mod result;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     process::{Output, Stdio},
     sync::{
         Arc,
@@ -350,6 +352,15 @@ fn validate_config(config: &Config) -> Result<()> {
         if admission.timeout_secs == 0 {
             bail!("worker.admission.timeout_secs must be greater than zero")
         }
+        // The probe runs beside the heartbeat, so the longest gap between two
+        // renewals is one heartbeat plus one whole probe.
+        if config.worker.heartbeat_interval_secs + admission.timeout_secs
+            >= config.worker.lease_duration_secs
+        {
+            bail!(
+                "worker.heartbeat_interval_secs + worker.admission.timeout_secs must be less than worker.lease_duration_secs"
+            )
+        }
     }
     if config.adapters.iter().any(|adapter| {
         adapter.workload.trim().is_empty()
@@ -619,11 +630,16 @@ impl AdmissionGate {
 
     /// Ask the probe now, whatever the cache holds.
     async fn refresh(&mut self, log: &AdmissionLog) -> bool {
-        let Some(admission) = &self.admission else {
+        let Some(admission) = self.admission.clone() else {
             return true;
         };
-        let verdict = admission_verdict(admission).await;
-        log.record(&verdict);
+        let verdict = admission_verdict(&admission).await;
+        self.observe(log, &verdict)
+    }
+
+    /// Record one verdict and report whether it admits.
+    fn observe(&mut self, log: &AdmissionLog, verdict: &Verdict) -> bool {
+        log.record(verdict);
         self.cached = Some((Instant::now(), verdict.admit));
         verdict.admit
     }
@@ -874,9 +890,11 @@ async fn execute_job(
     .await?;
 
     // A preemption hands the job back without spending its attempt; the
-    // ledger's busy-release budget and delay bound the retries. The adapter
-    // exits 15 on SIGTERM, so this must never reach the cancellation path.
-    if run.preempted && run.output.status.code() != Some(0) {
+    // ledger's retry delay bounds the retries. Whatever the exit code, the
+    // adapter's group must be empty before this worker decides between
+    // completion and release, and the adapter exits 15 on SIGTERM, so this
+    // must never reach the cancellation path.
+    if run.preempted {
         ensure_group_gone(
             &client,
             &config,
@@ -886,8 +904,13 @@ async fn execute_job(
             &mut run.heartbeat,
         )
         .await?;
-        release_busy(&client, &config, &lease).await?;
-        return Ok(());
+        if run.output.status.code() != Some(0) {
+            // The reclaim reuses this attempt's staging directory, so the
+            // `CANCEL` written by the preemption must not survive the release.
+            clear_cancel(&cancel_path);
+            release_preempted(&client, &config, &lease).await?;
+            return Ok(());
+        }
     }
 
     if run.cancel_requested {
@@ -1039,10 +1062,11 @@ async fn run_adapter(
             .filter(|admission| admission.preempt),
     );
     let mut preemption_due = preempt_period.map(|period| Instant::now() + period);
+    // The probe is its own future inside this select, so a probe that runs to
+    // its timeout never stops the lease heartbeat, the cancel path, or output
+    // collection; `validate_config` keeps heartbeat + timeout inside the lease.
+    let mut probe: Option<Pin<Box<dyn Future<Output = Verdict> + Send>>> = None;
     let mut preempted = false;
-    // The probe runs inside this select, so supervision (and the lease
-    // heartbeat with it) pauses for at most `timeout_secs`: keep leases longer
-    // than the probe's timeout.
 
     let mut wait = Box::pin(child.wait_with_output());
     let output = loop {
@@ -1065,11 +1089,26 @@ async fn run_adapter(
                 }
             }
             _ = sleep_until_optional(preemption_due) => {
+                // Start the probe as its own future and keep supervising.
+                preemption_due = None;
+                if !cancel_requested {
+                    if let Some(admission) = preemption.admission.clone() {
+                        probe = Some(Box::pin(async move { admission_verdict(&admission).await }));
+                    }
+                }
+            }
+            verdict = async {
+                match probe.as_mut() {
+                    Some(probe) => probe.await,
+                    // No probe is in flight: keep this arm dormant.
+                    None => std::future::pending().await,
+                }
+            } => {
+                probe = None;
                 if cancel_requested {
                     // The ledger's cancellation owns termination; admission
                     // only preempts when it observed the deny first.
-                    preemption_due = None;
-                } else if preemption.refresh(admission_log).await {
+                } else if preemption.observe(admission_log, &verdict) {
                     preemption_due = preempt_period.map(|period| Instant::now() + period);
                 } else {
                     info!(
@@ -1082,7 +1121,6 @@ async fn run_adapter(
                     signal_group(pid, libc::SIGTERM);
                     cancel_deadline = Some(Instant::now() + grace);
                     preempted = true;
-                    preemption_due = None;
                 }
             }
             _ = cancel_ticker.tick(), if cancel_deadline.is_some() && !killed => {
@@ -1299,6 +1337,46 @@ async fn release_busy(
     Ok(())
 }
 
+/// Return a preempted job to `pending` without spending its attempt and without
+/// charging the busy-release budget: the host withdrew admission, so this is
+/// not the device being busy and a flapping probe must not fail the job.
+async fn release_preempted(
+    client: &WorkloadClient,
+    config: &Config,
+    lease: &infernix_workload::Lease,
+) -> Result<()> {
+    let not_before = Utc::now() + Duration::seconds(config.worker.busy_retry_delay_secs as i64);
+    match client.release_preempted(lease, not_before).await? {
+        Some(infernix_workload::BusyReleaseOutcome::Released { busy_releases, .. }) => {
+            info!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "host admission withdrawn; returned the job without spending its attempt"
+            );
+        }
+        Some(infernix_workload::BusyReleaseOutcome::Cancelled { busy_releases }) => {
+            info!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "job was cancelled while the host was busy"
+            );
+        }
+        Some(infernix_workload::BusyReleaseOutcome::Exhausted { busy_releases }) => {
+            // RELEASE_PREEMPTED has no budget, so this cannot happen.
+            warn!(
+                job = %lease.job_id.as_str(),
+                busy_releases,
+                "preempted release reported an exhausted budget"
+            );
+        }
+        None => warn!(
+            job = %lease.job_id.as_str(),
+            "preempted release was fenced"
+        ),
+    }
+    Ok(())
+}
+
 async fn fail(
     client: &WorkloadClient,
     lease: &infernix_workload::Lease,
@@ -1449,6 +1527,21 @@ fn delivery_coordinates(config: &Config, payload: &Value) -> Result<(String, Str
         bail!("the payload generationRequestId is not UUID-shaped");
     }
     Ok((hub_url, generation))
+}
+
+/// Drop a preemption's `CANCEL` file. A busy release keeps the attempt's
+/// staging directory, so the reclaimed adapter would otherwise see the stale
+/// cancel at startup and exit 15 before doing any work.
+fn clear_cancel(cancel_path: &Path) {
+    match std::fs::remove_file(cancel_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            path = %cancel_path.display(),
+            %error,
+            "failed to remove the preemption cancel file; the retry may start cancelled"
+        ),
+    }
 }
 
 fn remove_staging(staging: &Path) {
@@ -1646,6 +1739,35 @@ mod tests {
             timeout_secs: 10,
             preempt: false,
         }
+    }
+
+    fn config_with_admission(heartbeat_secs: u64, lease_secs: u64, timeout_secs: u64) -> Config {
+        toml::from_str(&format!(
+            r#"
+[worker]
+id = "atlas"
+lease_duration_secs = {lease_secs}
+heartbeat_interval_secs = {heartbeat_secs}
+
+[worker.admission]
+command = ["/bin/true"]
+timeout_secs = {timeout_secs}
+"#
+        ))
+        .expect("parse the worker config")
+    }
+
+    #[test]
+    fn a_probe_that_can_outlast_the_lease_is_refused() {
+        // The probe runs beside the heartbeat, so one renewal gap can be
+        // heartbeat + timeout; the lease must still cover it.
+        assert!(
+            validate_config(&config_with_admission(30, 45, 10)).is_ok(),
+            "40 seconds of gap fit a 45 second lease"
+        );
+        let error = validate_config(&config_with_admission(30, 40, 10))
+            .expect_err("40 seconds of gap must not fill a 40 second lease");
+        assert!(error.to_string().contains("lease_duration_secs"), "{error}");
     }
 
     #[tokio::test]

@@ -434,6 +434,8 @@
               adapters.fixture = {
                 workload = "fixture";
                 queues = ["code" "semantic"];
+                profiles = ["fixture-rocm"];
+                artifacts = true;
                 command = "/bin/canix";
                 args = ["fixture" "run-job"];
               };
@@ -743,6 +745,7 @@
               adapters.fixture = {
                 workload = "animation";
                 queues = ["asset"];
+                profiles = ["fixture-rocm"];
                 command = "/bin/true";
               };
             };
@@ -1655,6 +1658,8 @@
         grep -Fq 'timeout_secs = 42' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         grep -Fq 'heartbeat_secs = 30' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         grep -Fq 'health_url = "http://127.0.0.1:8014/healthz"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'fixture-rocm' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'artifacts = true' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         ! grep -Eiq 'opaque-fixture-reference|prompt|source' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         touch "$out"
       '';
@@ -1701,6 +1706,10 @@
           .Environment | index("INFERNIX_HUB_TOKEN_FILE=/run/credentials/infernix-workerd.service/infernix-hub-token")
         '
         printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '.Environment | index("INFERNIX_GPU_DEVICE=atlas-7900xtx")'
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '
+          .Environment | index("INFERNIX_ADAPTER_CACHE_DIR=/var/lib/infernix-workload/cache")
+        '
+        grep -Fq 'gpu_device = "atlas-7900xtx"' "${gpuGateSample.config.services.infernix.workloadFabric.configFile}"
         touch "$out"
       '';
 

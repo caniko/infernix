@@ -23,6 +23,25 @@ let
         description = "Queues this adapter is willing to claim.";
       };
 
+      profiles = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = ''
+          Model profile ids this adapter serves. A job's `profile:<id>`
+          requirement selects the adapter, and the worker advertises one
+          `profile:<id>` capability per entry.
+        '';
+      };
+
+      artifacts = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Validate the adapter's result manifest and deliver its artifacts.
+          Set for adapters that print envelope-v2 artifacts.
+        '';
+      };
+
       command = mkOption {
         type = types.str;
         description = "Adapter executable. It receives one JSON job envelope on stdin.";
@@ -244,11 +263,15 @@ let
       staging_root = toString cfg.stagingRoot;
     } // lib.optionalAttrs (cfg.bootId != null) {
       boot_id = cfg.bootId;
+    } // lib.optionalAttrs (cfg.gpuDevice != null) {
+      gpu_device = cfg.gpuDevice;
     };
     adapters = lib.mapAttrsToList
       (_name: adapter: {
         workload = adapter.workload;
         queues = adapter.queues;
+        profiles = adapter.profiles;
+        artifacts = adapter.artifacts;
         command = adapter.command;
         args = adapter.args;
         environment = adapter.environment;
@@ -456,6 +479,12 @@ in
         message = "services.infernix.workloadFabric.adapters.${name}.queues must not be empty.";
       })
       cfg.adapters
+    ++ lib.mapAttrsToList
+      (name: adapter: {
+        assertion = adapter.profiles != [ ];
+        message = "services.infernix.workloadFabric.adapters.${name}.profiles must not be empty: a job's profile:<id> requirement selects the adapter.";
+      })
+      cfg.adapters
     ++ lib.concatLists (lib.mapAttrsToList
       (name: profile: [
         {
@@ -541,7 +570,8 @@ in
         Environment = databaseEnvironment
           ++ lib.optional (cfg.hubTokenFile != null)
             "INFERNIX_HUB_TOKEN_FILE=/run/credentials/infernix-workerd.service/infernix-hub-token"
-          ++ lib.optional (cfg.gpuDevice != null) "INFERNIX_GPU_DEVICE=${cfg.gpuDevice}";
+          ++ lib.optional (cfg.gpuDevice != null) "INFERNIX_GPU_DEVICE=${cfg.gpuDevice}"
+          ++ [ "INFERNIX_ADAPTER_CACHE_DIR=${toString cfg.cacheRoot}" ];
         LoadCredential =
           lib.optional (cfg.hubTokenFile != null) "infernix-hub-token:${cfg.hubTokenFile}";
         StateDirectory = "infernix-workload";

@@ -1205,8 +1205,39 @@ class CheckpointTests(Harness):
         with self.assertRaises(AdapterError) as caught:
             checkpoint.index_referenced_files(root)
         self.assertEqual(caught.exception.code, 14)
-        self.assertIn("escapes", str(caught.exception))
+        self.assertIn("not a relative path", str(caught.exception))
         self.assertIn("outside.safetensors", str(caught.exception))
+
+    def test_a_weight_index_shard_may_not_contain_a_parent_component(self):
+        # Transformers joins the shard onto the index's directory and the kernel
+        # resolves the result: through a symlinked directory, "../shard" lands
+        # somewhere a lexical normalisation never sees. The name is refused
+        # before any normalisation.
+        outside = self.directory / "outside-parents"
+        (outside / "nested").mkdir(parents=True)
+        (outside / "shard.safetensors").write_bytes(b"smuggled")
+        root = self.directory / "linked-parents"
+        root.mkdir()
+        (root / "shard.safetensors").write_bytes(b"declared")
+        (root / "layers").symlink_to(outside / "nested")
+        (outside / "nested" / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"layer.0": "../shard.safetensors"}})
+        )
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.index_referenced_files(root)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("../shard.safetensors", str(caught.exception))
+
+    def test_a_weight_index_shard_may_not_be_absolute(self):
+        root = self.directory / "absolute-shard"
+        root.mkdir()
+        (root / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"layer.0": "/etc/passwd"}})
+        )
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.index_referenced_files(root)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("/etc/passwd", str(caught.exception))
 
     def test_a_nested_weight_index_resolves_against_its_own_directory(self):
         root = self.directory / "relative"
@@ -1413,7 +1444,7 @@ class CheckpointTests(Harness):
         with self.assertRaises(AdapterError) as caught:
             checkpoint.index_referenced_files(root)
         self.assertEqual(caught.exception.code, 14)
-        self.assertIn("escapes", str(caught.exception))
+        self.assertIn("not a relative path", str(caught.exception))
         self.assertIn("outside.safetensors", str(caught.exception))
 
     def test_a_declared_path_may_not_leave_the_checkpoint(self):

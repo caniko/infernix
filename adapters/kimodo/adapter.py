@@ -27,6 +27,7 @@ the staged base, so no `from_pretrained` call receives a repository id.
 """
 
 import contextlib
+import fcntl
 import importlib.metadata
 import json
 import math
@@ -102,8 +103,10 @@ CHECKPOINT_TOKEN = "${oc.select:checkpoint_dir}"
 _ANCHOR_BODY = CHECKPOINT_TOKEN[2:]
 # The verified staging tree: one directory per pin digest, holding only declared
 # files, plus our manifest and the two empty Hugging Face cache directories.
+# v2: staged files are independent copies, never hardlinks, and every one of them
+# is sealed read-only — so no tree built by an earlier version may be reused.
 STAGING_DIRECTORY = "kimodo-staging"
-STAGING_VERSION = "1"
+STAGING_VERSION = "2"
 ENCODER_DIRECTORY = "encoders"
 HF_HOME_DIRECTORY = ".hf-home"
 HF_HUB_DIRECTORY = ".hf-hub"
@@ -113,6 +116,14 @@ MANIFEST = "manifest.json"
 # that resolves outside the staging tree is refused whatever its key.
 PATH_KEY = re.compile(r"(^|_)(path|paths|dir|dirs|file|files|folder|root|stats)$")
 PATH_VALUE = re.compile(r"\.(safetensors|npy|pt|bin|json|ya?ml)$")
+# A snapshot JSON key that names a file or directory a loader opens. `tokenizer_file`,
+# `vocab_file`, `merges_file` and `model_file` all end in `_file`, and
+# `base_model_name_or_path` ends in `name_or_path`. Every other string in a
+# snapshot config is data: a vocabulary token or merge such as "/ /" can look
+# like an absolute path and is still not one.
+SNAPSHOT_PATH_KEY = ("_file", "_path", "_dir", "name_or_path")
+# linux/fs.h FICLONE: share the source extents instead of copying its bytes.
+FICLONE = 0x40049409
 
 
 def installed_code_commit():
@@ -369,18 +380,36 @@ def staging_key(profile, helper):
 
 
 def _replace_file(path, payload):
-    """Write our own staged copy, breaking a hardlink to the source file."""
+    """Replace a staged copy with the bytes we wrote ourselves."""
     temporary = path.with_name(f".{path.name}.infernix")
     temporary.write_text(payload)
     os.replace(temporary, path)
 
 
-def _materialise(staging, sources, records):
-    """Link or copy every declared file into the tree, then re-hash it.
+def _copy(source, target):
+    """An independent copy of `source`, reflinked when the filesystem has one.
 
-    A hardlink is the same bytes on the same filesystem; anywhere else the file
-    is copied. Either way the materialised file is hashed again against its
-    declaration, so a source that changed after verification is refused here
+    A hardlink would leave the verified source writable under the staged path,
+    so anything holding the tree could rewrite the checkpoint it loads from: a
+    reflink shares extents, not an inode, and the bytes are copied when the
+    filesystem cannot do that.
+    """
+    try:
+        with open(source, "rb") as handle, open(target, "wb") as staged:
+            fcntl.ioctl(staged.fileno(), FICLONE, handle.fileno())
+        return
+    except OSError:
+        # Not the same filesystem, no reflink support, or a short read: a plain
+        # copy still gives the staged path its own inode.
+        shutil.copyfile(source, target)
+
+
+def _materialise(staging, sources, records):
+    """Copy every declared file into the tree, then re-hash it.
+
+    Each file is an independent copy of the verified source, so a later write to
+    that source cannot change the staged bytes. The copy is hashed again against
+    its declaration, so a source that changed after verification is refused here
     instead of being loaded.
     """
     declared = set()
@@ -394,16 +423,11 @@ def _materialise(staging, sources, records):
             target.parent.mkdir(parents=True, exist_ok=True)
             source = Path(os.path.realpath(Path(source_root) / entry["path"]))
             try:
-                os.link(source, target)
-                linked = True
-            except OSError:
-                try:
-                    shutil.copyfile(source, target)
-                except OSError as error:
-                    raise AdapterError(
-                        14, f"declared file {relative} cannot be staged: {error}"
-                    ) from error
-                linked = False
+                _copy(source, target)
+            except OSError as error:
+                raise AdapterError(
+                    14, f"declared file {relative} cannot be staged: {error}"
+                ) from error
             expected = str(entry["sha256"]).lower()
             actual = sha256_file(target)
             if actual != expected:
@@ -416,7 +440,6 @@ def _materialise(staging, sources, records):
                 "path": relative.as_posix(),
                 "sha256": actual,
                 "size": target.stat().st_size,
-                "linked": linked,
                 "rewritten": False,
             }
 
@@ -475,23 +498,33 @@ def _confine_config(node, tree, staging, key=None):
     return node
 
 
-def _confine_snapshot(node, base, tree, staging):
-    """Confine every string leaf of a staged Hugging Face config.
+def _snapshot_path(key):
+    """Whether a snapshot JSON key names a file or directory a loader opens."""
+    return key is not None and (key == "auto_map" or key.endswith(SNAPSHOT_PATH_KEY))
+
+
+def _confine_snapshot(node, base, tree, staging, key=None):
+    """Confine the path-bearing values of a staged Hugging Face config.
 
     These configs steer loading from inside the snapshot (a `tokenizer_file`, a
     task-specific file), so a value that resolves inside the tree is pinned to
     its published absolute path and one that resolves outside it, or is absolute
-    at all, is refused. Values that resolve to nothing are left as they are:
-    with the cache directories empty and offline mode on, they cannot load bytes.
+    at all, is refused. Only a value whose key names a path is checked, plus the
+    `auto_map` entries: a tokenizer's vocabulary and merges are data, and "/ /"
+    is a merge, not an absolute path. Values that resolve to nothing are left as
+    they are: with the cache directories empty and offline mode on, they cannot
+    load bytes.
     """
     if isinstance(node, dict):
         return {
-            name: _confine_snapshot(value, base, tree, staging)
+            name: _confine_snapshot(
+                value, base, tree, staging, "auto_map" if key == "auto_map" else name
+            )
             for name, value in node.items()
         }
     if isinstance(node, (list, tuple)):
-        return [_confine_snapshot(value, base, tree, staging) for value in node]
-    if isinstance(node, str) and node:
+        return [_confine_snapshot(value, base, tree, staging, key) for value in node]
+    if isinstance(node, str) and node and _snapshot_path(key):
         return _confined(node, base, tree, staging)
     return node
 
@@ -533,20 +566,18 @@ def _staged_configs(tree, staging, adapters):
             yield path
 
 
-def _seal(staging, records):
-    """Close the tree for writing, except where a hardlink is shared.
+def _seal(staging):
+    """Close the tree for writing.
 
     Directories become read-only, so no entry can be added, removed or renamed,
-    and every file we own (a copy or a rewrite) becomes read-only. A hardlinked
-    file keeps the mode of the verified source it shares an inode with: chmod
-    would change the checkpoint or the hub cache as well.
+    and every file — a copy or a rewrite of our own — becomes read-only. The two
+    Hugging Face cache directories keep their mode: an adapter may write inside
+    them, but the tree itself cannot gain a file an adapter could load.
     """
     staging = Path(staging)
     for base, directories, names in os.walk(staging, topdown=False):
         for name in names:
-            relative = (Path(base) / name).relative_to(staging).as_posix()
-            if not records.get(relative, {}).get("linked"):
-                os.chmod(os.path.join(base, name), 0o444)
+            os.chmod(os.path.join(base, name), 0o444)
         for name in directories:
             os.chmod(os.path.join(base, name), 0o555)
     os.chmod(staging, 0o555)
@@ -596,14 +627,22 @@ def _build_staging(staging, key, checkpoint, checkpoint_files, helper, snapshots
     (Path(staging) / MANIFEST).write_text(
         json.dumps(manifest, sort_keys=True, indent=2) + "\n"
     )
-    _seal(staging, records)
+    _seal(staging)
 
 
 def _reusable(staging, key):
-    """The staging manifest when the tree still matches it, else None.
+    """The staging manifest when every staged file still hashes to it, else None.
 
-    Cheap on purpose: sizes and file identity, not a re-hash of every weight.
+    Every declared file is re-hashed on each job, not sampled by size: a rewrite
+    that keeps the size — of a weight, or of a config we wrote ourselves — is
+    the cheap attack, and only the digest sees it. The cost is one pass over the
+    provisioned tree per job.
     """
+    # ponytail: the staging tree is owned by the worker UID that also runs the
+    # adapter, so its mode bits cannot isolate it from a compromised adapter;
+    # the per-job re-hash is the guard (0.8 s for the provisioned 1.4 GiB tree on
+    # atlas, ~11 s once the gated 8B base adds its 16 GiB), and a real barrier
+    # needs a separate UID.
     try:
         manifest = json.loads((Path(staging) / MANIFEST).read_text())
     except (OSError, ValueError):
@@ -622,13 +661,22 @@ def _reusable(staging, key):
         if not isinstance(record, dict):
             return None
         relative, size = record.get("path"), record.get("size")
-        if not isinstance(relative, str) or not relative or not isinstance(size, int):
+        expected = record.get("sha256")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or not isinstance(size, int)
+            or not isinstance(expected, str)
+        ):
             return None
+        staged = Path(staging) / relative
         try:
-            info = os.lstat(Path(staging) / relative)
+            info = os.lstat(staged)
         except OSError:
             return None
         if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            return None
+        if sha256_file(staged) != expected:
             return None
         declared.add(relative)
     seen = 0
@@ -647,8 +695,8 @@ def _reusable(staging, key):
 def _discard(path):
     """Remove a staging tree, including its read-only contents.
 
-    Only directories are opened for writing: a file may be a hardlink into the
-    verified source, whose mode must not change.
+    Only directories are opened for writing: a read-only file can be unlinked
+    from a writable directory, so no file mode ever needs changing.
     """
     path = Path(path)
     if not path.exists():
@@ -828,7 +876,8 @@ def verify_config(profile, staging):
     """The staged checkpoint config, resolved once into what upstream instantiates.
 
     `config.yaml` is declared and hash-verified, and read from its staged copy.
-    It is parsed as plain YAML, so the check runs on values rather than on text:
+    It is parsed with OmegaConf's own YAML loader, so the check runs on the values
+    OmegaConf would see rather than on text:
     every string leaf may only name a staged file, and only upstream's own
     `checkpoint_dir` anchor is substituted. Each `_target_` must be one of the
     classes the shipped config names. The result is a plain mapping with no
@@ -848,6 +897,7 @@ def verify_config(profile, staging):
             "the denoiser and the paths it loads come from it",
         )
     from omegaconf import OmegaConf
+    from omegaconf._utils import get_yaml_loader
 
     path = staging / "config.yaml"
     try:
@@ -856,8 +906,11 @@ def verify_config(profile, staging):
         raise AdapterError(
             14, f"checkpoint config {path} is unreadable: {error}"
         ) from error
+    # Parsed with the loader OmegaConf itself uses, so every value has the type
+    # OmegaConf would give it, and a duplicate key is refused here as it would be
+    # there. The check must run on the same structure Hydra would instantiate.
     try:
-        document = yaml.safe_load(text)
+        document = yaml.load(text, Loader=get_yaml_loader())
     except yaml.YAMLError as error:
         raise AdapterError(
             14, f"checkpoint config {path} is not valid YAML: {error}"

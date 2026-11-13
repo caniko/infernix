@@ -157,7 +157,7 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-111 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+113 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
 again when it drops to the CPU *after* generation); a tensor on the wrong GPU
 index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP or
@@ -171,7 +171,9 @@ versions, an adapter-specific renderer version or source commit, and a null
 identity refused); full-sha, local-directory and local-file checkpoint
 resolution (branch/tag/short sha rejected, undeclared weights, undeclared files
 and a weight index naming an undeclared shard rejected, a nested index escaping
-the checkpoint root rejected, a Hugging Face snapshot whose shards are
+the checkpoint root rejected, an absolute or `..`-bearing shard name rejected
+before normalisation (also through a symlinked directory), a Hugging Face
+snapshot whose shards are
 `../../blobs/<sha>` links accepted while a link out of the repository cache and
 a weight index behind a symlinked directory are refused); output-path
 traversal, realpath escapes and
@@ -645,24 +647,31 @@ checkpoint is `invalid_input` rather than a silent unpinned download.
 `pinned_source` verifies every declared sha256, refuses an undeclared weight,
 and requires every shard named by a weights index — including an index in a
 subdirectory, resolved against its own directory, and including a Hugging Face
-`blobs/<sha>` link that stays inside the repository cache — to be declared.
+`blobs/<sha>` link that stays inside the repository cache — to be declared. A
+shard name must be plain and relative: an absolute entry or one with a `..`
+component is exit 14 before any normalisation, because Transformers joins it
+onto the index's directory and lets the filesystem resolve the rest.
 
 Every declared file of the checkpoint and of the three encoder snapshots is then
 materialised into one staging tree at
-`$INFERNIX_ADAPTER_CACHE_DIR/kimodo-staging/<sha256 of every pin>/` — a hardlink
-on the same filesystem, a copy otherwise — and hashed again against its
-declaration, so the bytes upstream reads are the bytes that were verified and a
-source that changed after verification is refused. Only declared files exist in
-that tree (no symlink, no extra file), the directories are read-only, and the
-tree is published by renaming a fully built temporary directory, so a
-concurrent job reuses it instead of reading a partial one. It is reused while a
-cheap size check holds; a tampered tree is rebuilt. The process changes into the
-staging tree for the whole load, so a relative path cannot resolve anywhere
-else.
+`$INFERNIX_ADAPTER_CACHE_DIR/kimodo-staging/<sha256 of every pin>/` — an
+independent copy (a reflink where the filesystem has one, a byte copy otherwise,
+never a hardlink, so a write to the source cannot reach the staged bytes) — and
+hashed again against its declaration, so the bytes upstream reads are the bytes
+that were verified and a source that changed after verification is refused. Only
+declared files exist in that tree (no symlink, no extra file), every file is
+read-only including the configs the adapter writes itself, and the tree is
+published by renaming a fully built temporary directory, so a concurrent job
+reuses it instead of reading a partial one. It is reused only while every
+declared file still re-hashes to its manifest entry; a tampered tree is rebuilt.
+The process changes into the staging tree for the whole load, so a relative path
+cannot resolve anywhere else.
 
 `config.yaml` must be one of the declared files. It is read once from the staged
-copy, parsed as plain YAML, and turned into the one config Hydra instantiates:
-the adapter's own `checkpoint_dir` anchor becomes the staging directory, every
+copy, parsed with OmegaConf's own YAML loader (so a value has the type OmegaConf
+would give it and a duplicate key is exit 14, as it would be there), and turned
+into the one config Hydra instantiates: the adapter's own `checkpoint_dir` anchor
+becomes the staging directory, every
 other `${...}` interpolation — including an escaped `\${oc.env:…}` and a
 defaulted `${oc.select:checkpoint_dir,…}` — is refused, every `_target_` must be
 one of the four classes the shipped config names (`kimodo.model.Kimodo`,
@@ -686,10 +695,13 @@ the pin byte for byte, with no newline tolerance and no case folding, and the
 cache may hold only the three declared repositories. Everything loads by path
 from the staged snapshots: the base Llama and both LoRAs are attached from their
 staged directories, so no `from_pretrained` call receives a repo id. A staged
-`adapter_config.json` we write ourselves names the staged base, and every string
-leaf of every staged snapshot config is confined to the tree the same way — a
-`tokenizer_file` outside it is exit 14, an internal one is pinned to its staged
-path. `HF_HOME` and `HF_HUB_CACHE` point at empty directories inside the staging
+`adapter_config.json` we write ourselves names the staged base, and every
+path-bearing value of every staged snapshot config (`*_file`, `*_path`, `*_dir`,
+`*name_or_path`, and the `auto_map` entries) is confined to the tree the same
+way — a `tokenizer_file` outside it is exit 14, an internal one is pinned to its
+staged path. Tokenizer vocabulary, merges and added tokens are data, not paths,
+and are never confined: a merge such as `/ /` is accepted. `HF_HOME` and
+`HF_HUB_CACHE` point at empty directories inside the staging
 tree, `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set,
 `TEXT_ENCODERS_DIR` and `CHECKPOINT_DIR` are cleared, and `TEXT_ENCODER_DEVICE`
 is pinned to the selected GPU — upstream's `TEXT_ENCODER_DEVICE=cpu` path is

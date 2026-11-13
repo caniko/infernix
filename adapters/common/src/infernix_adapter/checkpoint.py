@@ -154,6 +154,16 @@ def index_referenced_files(directory):
         for shard in weight_map.values():
             if not isinstance(shard, str) or not shard:
                 raise invalid(f"weight index {index.name} names an invalid shard {shard!r}")
+            # Before any normalisation: Transformers joins the entry onto the
+            # index's directory and lets the filesystem resolve it, so an
+            # absolute shard or one with a `..` component would address a file
+            # this checker never proved is inside the checkpoint. A shard is a
+            # name inside the directory holding its index, nothing else.
+            if Path(shard).is_absolute() or ".." in Path(shard).parts:
+                raise invalid(
+                    f"weight index {index.name} names shard {shard!r}, which is not "
+                    "a relative path inside the checkpoint"
+                )
             named = Path(os.path.normpath(index.parent / shard))
             resolved = Path(os.path.realpath(named))
             if resolved != base and base not in resolved.parents:

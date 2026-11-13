@@ -59,7 +59,13 @@ CHECKPOINT_FILES = {
     "stats/motion/body/std.npy": b"std",
 }
 LLAMA_FILES = {
-    "config.json": b'{"model_type": "llama", "hidden_size": 4096}',
+    "config.json": json.dumps(
+        {
+            "_name_or_path": "meta-llama/Meta-Llama-3-8B-Instruct",
+            "model_type": "llama",
+            "hidden_size": 4096,
+        }
+    ).encode(),
     "generation_config.json": b'{"eos_token_id": 128001}',
     "model.safetensors.index.json": json.dumps(
         {
@@ -714,6 +720,13 @@ class KimodoTests(unittest.TestCase):
         self.assertEqual(os.listdir(staging / adapter.HF_HOME_DIRECTORY), [])
         self.assertEqual(os.listdir(staging / adapter.HF_HUB_DIRECTORY), [])
         self.assertFalse(staging.stat().st_mode & 0o222, "the tree must be read-only")
+        # Every file, including the configs we wrote ourselves, is sealed.
+        for base, _directories, names in os.walk(staging):
+            for name in names:
+                path = Path(base) / name
+                self.assertFalse(
+                    path.stat().st_mode & 0o222, f"{path} is writable"
+                )
         manifest = json.loads((staging / adapter.MANIFEST).read_text())
         self.assertEqual(manifest["key"], adapter.staging_key(self.profile, self.helper()))
         rewritten = {
@@ -777,6 +790,90 @@ class KimodoTests(unittest.TestCase):
         rebuilt = self.staging()
         self.assertEqual(rebuilt, staging)
         self.assertNotEqual((Path(rebuilt) / relative).read_bytes(), b"tampered")
+
+    def test_a_staged_copy_survives_a_write_to_its_source(self):
+        # A copy, not a hardlink: the source stays writable, and rewriting it
+        # must not change the bytes the adapter will load.
+        staging = self.staging()
+        source = Path(self.profile["checkpoint"]["localPath"]) / "model.safetensors"
+        staged = Path(staging) / "model.safetensors"
+        self.assertNotEqual(os.stat(staged).st_ino, os.stat(source).st_ino)
+        source.write_bytes(b"rewritten-after-staging")
+        self.assertEqual(staged.read_bytes(), CHECKPOINT_FILES["model.safetensors"])
+
+    def test_same_size_tampering_invalidates_the_staged_tree(self):
+        # Neither a rewritten weight nor a config we wrote ourselves can hide
+        # behind the size check: reuse re-hashes every declared file.
+        staging = self.staging()
+        key = json.loads((Path(staging) / adapter.MANIFEST).read_text())["key"]
+        for relative in (
+            "model.safetensors",
+            f"{adapter.ENCODER_DIRECTORY}/{adapter._slug(adapter.LLM2VEC)}"
+            "/adapter_config.json",
+        ):
+            with self.subTest(relative=relative):
+                target = Path(staging) / relative
+                original = target.read_bytes()
+                os.chmod(target, 0o644)
+                target.write_bytes(b"x" * len(original))
+                self.assertEqual(os.lstat(target).st_size, len(original))
+                self.assertIsNone(adapter._reusable(staging, key))
+                rebuilt = self.staging()
+                self.assertEqual((Path(rebuilt) / relative).read_bytes(), original)
+
+    def test_tokenizer_data_is_not_confined_as_a_path(self):
+        # Vocabulary tokens, merges and added tokens are data: a merge such as
+        # "/ /" starts with a slash and is still not an absolute path.
+        payload = json.dumps(
+            {
+                "version": "1.0",
+                "model": {"vocab": {"/ /": 0, "../ ../": 1, "/etc/passwd": 2}},
+                "merges": ["/ /", "../ ../", "/etc/passwd"],
+                "added_tokens": [{"content": "/etc/passwd", "id": 3}],
+            }
+        ).encode()
+        self.redeclare(self.helper()["checkpoints"][0], "tokenizer.json", payload)
+        staging = self.staging()
+        staged = (
+            Path(staging)
+            / adapter.ENCODER_DIRECTORY
+            / adapter._slug(adapter.BASE_LLAMA)
+            / "tokenizer.json"
+        )
+        self.assertEqual(json.loads(staged.read_text()), json.loads(payload))
+
+    def test_an_absolute_tokenizer_file_is_refused(self):
+        payload = json.dumps(
+            {"tokenizer_class": "PreTrainedTokenizerFast", "tokenizer_file": "/etc/passwd"}
+        ).encode()
+        self.redeclare(self.helper()["checkpoints"][1], "tokenizer_config.json", payload)
+        with self.assertRaises(AdapterError) as caught:
+            self.staging()
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("/etc/passwd", str(caught.exception))
+
+    def test_an_auto_map_value_is_confined(self):
+        # `auto_map` names code files; a value that leaves the snapshot is
+        # refused even though no other string in config.json is a path.
+        payload = json.dumps({"auto_map": {"AutoConfig": "../../../escape.py"}}).encode()
+        self.redeclare(self.helper()["checkpoints"][0], "config.json", payload)
+        with self.assertRaises(AdapterError) as caught:
+            self.staging()
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("names no declared file", str(caught.exception))
+        self.assertIn("escape.py", str(caught.exception))
+
+    def test_a_duplicate_config_key_is_refused(self):
+        # OmegaConf's own loader refuses a duplicate key, so the config the
+        # adapter throws away is never the config Hydra would merge.
+        self.redeclare_config(
+            b"denoiser:\n  ckpt_path: model.safetensors\n"
+            b"denoiser:\n  ckpt_path: /etc/passwd\n"
+        )
+        with self.assertRaises(AdapterError) as caught:
+            self.resolved_config()
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("duplicate key", str(caught.exception))
 
     def test_a_tokenizer_config_may_not_name_a_file_outside_the_tree(self):
         secret = self.root / "elsewhere" / "tokenizer.json"

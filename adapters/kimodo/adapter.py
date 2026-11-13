@@ -38,6 +38,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -45,9 +46,10 @@ import torch
 import yaml
 
 import infernix_adapter as adapter
-from infernix_adapter import AdapterError, run
+from infernix_adapter import RESOURCE_BUSY, AdapterError, run
 from infernix_adapter.cache import cache_root
 from infernix_adapter.fingerprint import digest
+from infernix_adapter.gpu import DEFAULT_GATE_TIMEOUT, GATE_TIMEOUT_ENV
 from infernix_adapter.hub import sha256_file
 
 MODEL_DIR = "Kimodo-SOMA-RP-v1.2"
@@ -103,7 +105,9 @@ ALLOWED_TARGETS = frozenset(
 CHECKPOINT_TOKEN = "${oc.select:checkpoint_dir}"
 _ANCHOR_BODY = CHECKPOINT_TOKEN[2:]
 # The verified staging tree: one directory per pin digest, holding only declared
-# files, plus our manifest and the two empty Hugging Face cache directories.
+# files and the two empty Hugging Face cache directories. The informational
+# manifest is a sibling of the tree, never inside it: everything inside is a
+# byte a loader may read, so nothing unauthenticated may live there.
 # v2: staged files are independent copies, never hardlinks, and every one of them
 # is sealed read-only — so no tree built by an earlier version may be reused.
 STAGING_DIRECTORY = "kimodo-staging"
@@ -111,7 +115,8 @@ STAGING_VERSION = "2"
 ENCODER_DIRECTORY = "encoders"
 HF_HOME_DIRECTORY = ".hf-home"
 HF_HUB_DIRECTORY = ".hf-hub"
-MANIFEST = "manifest.json"
+MANIFEST_SUFFIX = ".manifest.json"
+LOCK_POLL_SECONDS = 0.5
 # A config key that names a path, and a value that looks like one. They decide
 # only whether a string that names nothing must still be refused; any string
 # that resolves outside the staging tree is refused whatever its key.
@@ -464,16 +469,37 @@ def _materialise(staging, sources, records):
             }
 
 
-def _confined(value, base, tree, staging, path_like=False, exists=os.path.exists):
+def _authenticated(expected):
+    """Whether a tree-relative path is a declared file, or a directory holding one.
+
+    Every deterministic rewrite is a rewrite of a declared file, so the declared
+    set is the whole authenticated file set: a path that exists inside the tree
+    but is not in it was published by something other than these pins.
+    """
+    names = set(expected)
+
+    def allowed(relative):
+        relative = Path(relative).as_posix()
+        prefix = "" if relative == "." else relative.rstrip("/") + "/"
+        return relative in names or any(name.startswith(prefix) for name in names)
+
+    return allowed
+
+
+def _confined(
+    value, base, tree, staging, allowed, path_like=False, exists=os.path.exists
+):
     """One string leaf: its published absolute path, or the value unchanged.
 
     A value that resolves to an existing path must resolve inside the tree and
-    is rewritten to the absolute path it will have once the tree is published,
-    so no loader can resolve it against the working directory or another base.
-    An absolute value, one that resolves outside the tree, or (`path_like`) one
-    that names nothing the tree holds is exit 14: the pin does not contain it.
-    `exists` lets the caller answer against the pinned file set before a tree
-    exists; the default asks the filesystem.
+    be one of the files the pins authenticate, and is rewritten to the absolute
+    path it will have once the tree is published, so no loader can resolve it
+    against the working directory or another base. Merely existing inside the
+    tree is not enough: a planted file is not a declared file. An absolute
+    value, one that resolves outside the tree, or (`path_like`) one that names
+    nothing the tree holds is exit 14: the pin does not contain it.
+    `allowed` and `exists` let the caller answer against the pinned file set
+    before a tree exists; `exists` defaults to the filesystem.
     """
     tree, staging = str(tree), str(staging)
     candidate = value if os.path.isabs(value) else os.path.join(base, value)
@@ -486,6 +512,13 @@ def _confined(value, base, tree, staging, path_like=False, exists=os.path.exists
                 14,
                 f"{value!r} resolves to {real}, outside the verified staging tree "
                 f"{staging}; only a declared file may be loaded",
+            )
+        if not allowed(relative):
+            raise AdapterError(
+                14,
+                f"{value!r} resolves to {real}, which sits in the verified staging "
+                f"tree {staging} but is not a file these pins declared; only a "
+                "declared file may be loaded",
             )
         return os.path.normpath(os.path.join(staging, relative))
     if os.path.isabs(value) or not inside or path_like:
@@ -506,17 +539,19 @@ def _path_like(key, value):
     )
 
 
-def _confine_config(node, tree, staging, key=None):
+def _confine_config(node, tree, staging, allowed, key=None):
     """Confine every string leaf of the parsed checkpoint config."""
     if isinstance(node, dict):
         return {
-            name: _confine_config(value, tree, staging, name)
+            name: _confine_config(value, tree, staging, allowed, name)
             for name, value in node.items()
         }
     if isinstance(node, (list, tuple)):
-        return [_confine_config(value, tree, staging, key) for value in node]
+        return [_confine_config(value, tree, staging, allowed, key) for value in node]
     if isinstance(node, str) and node:
-        return _confined(node, tree, tree, staging, _path_like(key, node))
+        return _confined(
+            node, tree, tree, staging, allowed, path_like=_path_like(key, node)
+        )
     return node
 
 
@@ -525,7 +560,9 @@ def _snapshot_path(key):
     return key is not None and (key == "auto_map" or key.endswith(SNAPSHOT_PATH_KEY))
 
 
-def _confine_snapshot(node, base, tree, staging, key=None, exists=os.path.exists):
+def _confine_snapshot(
+    node, base, tree, staging, allowed, key=None, exists=os.path.exists
+):
     """Confine the path-bearing values of a staged Hugging Face config.
 
     These configs steer loading from inside the snapshot (a `tokenizer_file`, a
@@ -547,6 +584,7 @@ def _confine_snapshot(node, base, tree, staging, key=None, exists=os.path.exists
                 base,
                 tree,
                 staging,
+                allowed,
                 "auto_map" if key == "auto_map" else name,
                 exists,
             )
@@ -554,17 +592,20 @@ def _confine_snapshot(node, base, tree, staging, key=None, exists=os.path.exists
         }
     if isinstance(node, (list, tuple)):
         return [
-            _confine_snapshot(value, base, tree, staging, key, exists) for value in node
+            _confine_snapshot(value, base, tree, staging, allowed, key, exists)
+            for value in node
         ]
     if isinstance(node, str) and node:
         if _snapshot_path(key):
-            return _confined(node, base, tree, staging, exists=exists)
+            return _confined(node, base, tree, staging, allowed, exists=exists)
         if key == SNAPSHOT_PATH_LIST:
-            return _confined(node, base, tree, staging, path_like=True, exists=exists)
+            return _confined(
+                node, base, tree, staging, allowed, path_like=True, exists=exists
+            )
     return node
 
 
-def _staged_configs(tree, staging, adapters):
+def _staged_configs(tree, staging, adapters, allowed):
     """Rewrite every staged snapshot config that needs it; yield each one.
 
     `adapters` maps a published LoRA directory to the published base directory
@@ -587,7 +628,7 @@ def _staged_configs(tree, staging, adapters):
                 raise AdapterError(
                     14, f"staged config {path} is unreadable: {error}"
                 ) from error
-            updated = _confine_snapshot(document, path.parent, tree, staging)
+            updated = _confine_snapshot(document, path.parent, tree, staging, allowed)
             adapter_base = adapters.get(staging / path.parent.relative_to(tree))
             if adapter_base is not None and name == "adapter_config.json":
                 if not isinstance(updated, dict):
@@ -601,14 +642,16 @@ def _staged_configs(tree, staging, adapters):
             yield path
 
 
-def _staged_rewrites(helper, snapshots, staging, staged):
+def _staged_rewrites(helper, snapshots, staging, staged, allowed):
     """The exact digest of every config the pins' own configs turn into.
 
     The rewrite is computed in memory from the verified source snapshot, not
     read back from a candidate tree: a reused tree must be authenticated by the
-    pins, never by bytes it carries itself. `staged` answers whether a value
-    names a file the pins materialise, so the rewrite does not depend on the
-    candidate tree either.
+    pins, never by bytes it carries itself. Each source config is read once and
+    that buffer is hashed against the declared sha256 before it is parsed, so a
+    source that changed after `verify_snapshots` can never contribute a rewrite
+    digest. `staged` and `allowed` answer whether a value names a file the pins
+    materialise, so the rewrite does not depend on the candidate tree either.
     """
     published = Path(staging)
     base = published / ENCODER_DIRECTORY / _slug(BASE_LLAMA)
@@ -627,14 +670,28 @@ def _staged_rewrites(helper, snapshots, staging, staged):
                 continue
             path = Path(snapshots[repo]) / relative
             try:
-                document = json.loads(path.read_text())
-            except (OSError, ValueError) as error:
+                payload = path.read_bytes()
+            except OSError as error:
+                raise AdapterError(
+                    14, f"verified snapshot config {path} is unreadable: {error}"
+                ) from error
+            expected = str(entry["sha256"]).lower()
+            actual = hashlib.sha256(payload).hexdigest()
+            if actual != expected:
+                raise AdapterError(
+                    14,
+                    f"verified snapshot config {path} hashes {actual} != the "
+                    f"declared {expected}: the source changed after it was verified",
+                )
+            try:
+                document = json.loads(payload)
+            except ValueError as error:
                 raise AdapterError(
                     14, f"verified snapshot config {path} is unreadable: {error}"
                 ) from error
             parent = directory / relative.parent
             updated = _confine_snapshot(
-                document, parent, published, published, exists=staged
+                document, parent, published, published, allowed, exists=staged
             )
             adapter_base = adapters.get(parent)
             if adapter_base is not None and name == "adapter_config.json":
@@ -669,6 +726,7 @@ def _expected_tree(staging, profile, helper, snapshots):
             expected[relative] = str(entry["sha256"]).lower()
 
     tree = Path(staging)
+    allowed = _authenticated(expected)
 
     def staged(path):
         real = os.path.realpath(path)
@@ -676,12 +734,9 @@ def _expected_tree(staging, profile, helper, snapshots):
         inside = relative != ".." and not relative.startswith("../")
         if not inside:
             return os.path.exists(real)
-        prefix = "" if relative == "." else relative.rstrip("/") + "/"
-        return relative in expected or any(
-            name.startswith(prefix) for name in expected
-        )
+        return allowed(relative)
 
-    expected.update(_staged_rewrites(helper, snapshots, staging, staged))
+    expected.update(_staged_rewrites(helper, snapshots, staging, staged, allowed))
     return expected
 
 
@@ -702,6 +757,11 @@ def _seal(staging):
     os.chmod(staging, 0o555)
     for name in (HF_HOME_DIRECTORY, HF_HUB_DIRECTORY):
         os.chmod(staging / name, 0o755)
+
+
+def manifest_path(root, key):
+    """The informational manifest, beside the tree: never a byte a loader can read."""
+    return Path(root) / f".{key}{MANIFEST_SUFFIX}"
 
 
 def _build_staging(staging, key, checkpoint, checkpoint_files, helper, snapshots):
@@ -731,6 +791,7 @@ def _build_staging(staging, key, checkpoint, checkpoint_files, helper, snapshots
             published / ENCODER_DIRECTORY / _slug(repo): base
             for repo in (LLM2VEC, LLM2VEC_SUPERVISED)
         },
+        _authenticated(records),
     ):
         relative = path.relative_to(staging).as_posix()
         records[relative]["sha256"] = sha256_file(path)
@@ -743,7 +804,7 @@ def _build_staging(staging, key, checkpoint, checkpoint_files, helper, snapshots
         "key": key,
         "files": sorted(records.values(), key=lambda record: record["path"]),
     }
-    (Path(staging) / MANIFEST).write_text(
+    manifest_path(Path(staging).parent, key).write_text(
         json.dumps(manifest, sort_keys=True, indent=2) + "\n"
     )
     _seal(staging)
@@ -757,8 +818,8 @@ def _reusable(staging, expected):
     Every file is re-hashed on each job, not sampled by size: a rewrite that
     keeps the size — of a weight, or of a config we wrote ourselves — is the
     cheap attack, and only the digest sees it. The tree must hold exactly the
-    expected files (plus the informational manifest), no symlink and no extra
-    file. The cost is one pass over the provisioned tree per job.
+    expected files, no symlink and no extra file. The cost is one pass over the
+    provisioned tree per job.
     """
     # ponytail: the staging tree is owned by the worker UID that also runs the
     # adapter, so its mode bits cannot isolate it from a compromised adapter;
@@ -781,8 +842,6 @@ def _reusable(staging, expected):
             relative = path.relative_to(staging).as_posix()
             if os.path.islink(path):
                 return None
-            if relative == MANIFEST:
-                continue
             digest = expected.get(relative)
             if digest is None:
                 return None
@@ -821,11 +880,27 @@ def _discard(path):
         path.unlink()
         return
     for base, directories, _names in os.walk(path):
+        kept = []
         for name in directories:
+            entry = os.path.join(base, name)
             try:
-                os.chmod(os.path.join(base, name), 0o700)
+                info = os.lstat(entry)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                # A symlink named as a directory: unlink the entry itself,
+                # never chmod what it points at.
+                try:
+                    os.unlink(entry)
+                except OSError:
+                    pass
+                continue
+            kept.append(name)
+            try:
+                os.chmod(entry, 0o700)
             except OSError:
                 pass
+        directories[:] = kept
     try:
         os.chmod(path, 0o700)
     except OSError:
@@ -834,17 +909,37 @@ def _discard(path):
 
 
 @contextlib.contextmanager
-def _staging_lock(path):
-    """Serialise validation and replacement for one staging key."""
+def _staging_lock(path, cancel=None):
+    """Serialise validation and replacement for one staging key.
+
+    The wait is bounded like the device gate, so a job whose builder died cannot
+    pin a worker forever, and a cancel file or SIGTERM ends it at once. `flock`
+    is relied on only because the staging root is worker-local: its semantics
+    across NFS are not.
+    """
     handle = open(path, "a")
+    limit = float(os.environ.get(GATE_TIMEOUT_ENV) or DEFAULT_GATE_TIMEOUT)
+    deadline = time.monotonic() + limit
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if cancel is not None:
+                    cancel()
+                if time.monotonic() >= deadline:
+                    raise AdapterError(
+                        RESOURCE_BUSY,
+                        f"staging lock {path} busy for {limit:.0f}s",
+                    )
+                time.sleep(LOCK_POLL_SECONDS)
         yield
     finally:
         handle.close()
 
 
-def staging_tree(profile, helper, checkpoint, snapshots):
+def staging_tree(profile, helper, checkpoint, snapshots, cancel=None):
     """The verified staging tree for these pins, built once and reused.
 
     Every declared file of the checkpoint and of the three encoder snapshots is
@@ -853,13 +948,14 @@ def staging_tree(profile, helper, checkpoint, snapshots):
     files exist there — no symlink, no extra file — and the tree is read-only
     once published. It is built in a temporary directory and renamed into
     place. Validation and replacement are serialised per key, so a concurrent
-    job reuses a valid tree instead of discarding one another job published.
+    job reuses a valid tree instead of discarding one another job published;
+    `cancel` is the job's cancellation hook, polled while that lock is held.
     """
     root = Path(cache_root()) / STAGING_DIRECTORY
     key = staging_key(profile, helper)
     staging = root / key
     root.mkdir(parents=True, exist_ok=True)
-    with _staging_lock(root / f".{key}.lock"):
+    with _staging_lock(root / f".{key}.lock", cancel):
         expected = _expected_tree(staging, profile, helper, snapshots)
         if _reusable(staging, expected) is None:
             temporary = Path(tempfile.mkdtemp(prefix=f".tmp-{key[:16]}-", dir=root))
@@ -1012,10 +1108,10 @@ def verify_config(profile, staging):
     `config.yaml` is declared and hash-verified, and read from its staged copy.
     It is parsed with OmegaConf's own YAML loader, so the check runs on the values
     OmegaConf would see rather than on text:
-    every string leaf may only name a staged file, and only upstream's own
-    `checkpoint_dir` anchor is substituted. Each `_target_` must be one of the
-    classes the shipped config names. The result is a plain mapping with no
-    OmegaConf resolver left to run.
+    every string leaf may only name a file the checkpoint pin declares, and only
+    upstream's own `checkpoint_dir` anchor is substituted. Each `_target_` must
+    be one of the classes the shipped config names. The result is a plain mapping
+    with no OmegaConf resolver left to run.
     """
     staging = Path(staging)
     files = (profile.get("checkpoint") or {}).get("files") or []
@@ -1052,7 +1148,10 @@ def verify_config(profile, staging):
     if not isinstance(document, dict):
         raise AdapterError(14, f"checkpoint config {path} is not a mapping")
     resolved = _confine_config(
-        _substitute_anchor(document, staging, path), staging, staging
+        _substitute_anchor(document, staging, path),
+        staging,
+        staging,
+        _authenticated(declared),
     )
     for target in _targets(resolved):
         if not isinstance(target, str) or target not in ALLOWED_TARGETS:
@@ -1221,7 +1320,9 @@ def produce(context):
     snapshots = verify_snapshots(helper)
     # Every declared file is now materialised and re-hashed: only those bytes
     # exist in the tree, and only that tree is reachable by a relative path.
-    staging = staging_tree(profile, helper, checkpoint, snapshots)
+    staging = staging_tree(
+        profile, helper, checkpoint, snapshots, context.check_cancel
+    )
     config = verify_config(profile, staging)
     # Frame bounds are checked against the config's own fps before any model
     # loads: an out-of-range job must not spend a GPU load first.

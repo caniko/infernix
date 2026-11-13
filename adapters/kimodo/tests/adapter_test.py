@@ -5,6 +5,7 @@ Hugging Face snapshots in a temporary directory, hash-declares them, and lets
 `verified_checkpoint`/`verify_snapshots`/`configure_environment` run against it.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -293,6 +295,11 @@ class KimodoTests(unittest.TestCase):
         return adapter._expected_tree(
             staging, self.profile, helper, adapter.verify_snapshots(helper)
         )
+
+    def manifest(self, staging):
+        """The informational manifest: beside the tree, never inside it."""
+        key = adapter.staging_key(self.profile, self.helper())
+        return json.loads(adapter.manifest_path(Path(staging).parent, key).read_text())
 
     def resolved_config(self, profile=None):
         profile = profile or self.profile
@@ -758,7 +765,7 @@ class KimodoTests(unittest.TestCase):
                 )
             for name in names:
                 found.add((Path(base) / name).relative_to(staging).as_posix())
-        self.assertEqual(sorted(found - {adapter.MANIFEST}), sorted(declared))
+        self.assertEqual(sorted(found), sorted(declared))
         self.assertNotIn("stats/motion/body/extra.npy", found)
         self.assertEqual(os.listdir(staging / adapter.HF_HOME_DIRECTORY), [])
         self.assertEqual(os.listdir(staging / adapter.HF_HUB_DIRECTORY), [])
@@ -770,7 +777,9 @@ class KimodoTests(unittest.TestCase):
                 self.assertFalse(
                     path.stat().st_mode & 0o222, f"{path} is writable"
                 )
-        manifest = json.loads((staging / adapter.MANIFEST).read_text())
+        # The manifest is a sibling of the tree: no loadable byte is unhashed.
+        self.assertFalse((staging / "manifest.json").exists())
+        manifest = self.manifest(staging)
         self.assertEqual(manifest["key"], adapter.staging_key(self.profile, self.helper()))
         rewritten = {
             record["path"] for record in manifest["files"] if record["rewritten"]
@@ -820,7 +829,7 @@ class KimodoTests(unittest.TestCase):
 
     def test_a_tampered_staging_tree_is_rebuilt(self):
         staging = self.staging()
-        manifest = json.loads((Path(staging) / adapter.MANIFEST).read_text())
+        manifest = self.manifest(staging)
         # A file we wrote ourselves has a private inode; tampering it cannot
         # reach the verified source.
         relative = next(
@@ -916,16 +925,14 @@ class KimodoTests(unittest.TestCase):
         tampered = b"x" * target.stat().st_size
         os.chmod(target, 0o644)
         target.write_bytes(tampered)
-        manifest_path = Path(staging) / adapter.MANIFEST
+        key = adapter.staging_key(self.profile, self.helper())
+        manifest_path = adapter.manifest_path(Path(staging).parent, key)
         manifest = json.loads(manifest_path.read_text())
         for record in manifest["files"]:
             if record["path"] == relative:
                 record["sha256"] = digest(tampered)
                 record["size"] = len(tampered)
-        os.chmod(manifest_path, 0o644)
-        manifest_path.write_text(
-            json.dumps(manifest, sort_keys=True, indent=2) + "\n"
-        )
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
         self.assertIsNone(adapter._reusable(staging, self.expected(staging)))
         rebuilt = self.staging()
         self.assertEqual(rebuilt, staging)
@@ -933,11 +940,96 @@ class KimodoTests(unittest.TestCase):
             (Path(rebuilt) / relative).read_bytes(),
             CHECKPOINT_FILES[relative],
         )
-        manifest = json.loads((Path(rebuilt) / adapter.MANIFEST).read_text())
+        manifest = self.manifest(rebuilt)
         record = next(
             item for item in manifest["files"] if item["path"] == relative
         )
         self.assertEqual(record["sha256"], digest(CHECKPOINT_FILES[relative]))
+
+    def test_a_config_naming_the_manifest_is_refused(self):
+        # The manifest is a sibling of the tree, so it is not a byte a loader
+        # may name: a config that resolves to it is not a declared file.
+        self.redeclare_config(
+            b"denoiser:\n  ckpt_path: ${oc.select:checkpoint_dir}/manifest.json\n"
+        )
+        staging = self.staging()
+        with self.assertRaises(AdapterError) as caught:
+            adapter.verify_config(self.profile, staging)
+        self.assertEqual(caught.exception.code, 14)
+
+    def test_a_config_naming_a_file_planted_in_the_tree_is_refused(self):
+        # Existing inside the tree is not authentication: only the files the
+        # pins declared may be resolved, whatever else sits beside them.
+        self.redeclare_config(b"denoiser:\n  extra: notes.txt\n")
+        staging = Path(self.staging())
+        os.chmod(staging, 0o755)
+        self.addCleanup(os.chmod, staging, 0o555)
+        (staging / "notes.txt").write_bytes(b"planted")
+        with self.assertRaises(AdapterError) as caught:
+            adapter.verify_config(self.profile, staging)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("not a file these pins declared", str(caught.exception))
+
+    def test_a_source_config_changed_after_verification_is_refused(self):
+        # The rewrite digest comes from the bytes that were hashed against the
+        # pin: a config that changed after `verify_snapshots` cannot feed it.
+        helper = adapter.text_encoder_helper(self.profile)
+        snapshots = adapter.verify_snapshots(helper)
+        path = Path(snapshots[adapter.LLM2VEC]) / "adapter_config.json"
+        path.write_bytes(json.dumps({"peft_type": "LORA", "rank": 64}).encode())
+        staging = Path(os.environ["INFERNIX_ADAPTER_CACHE_DIR"]) / adapter.STAGING_DIRECTORY
+        with self.assertRaises(AdapterError) as caught:
+            adapter._expected_tree(staging, self.profile, helper, snapshots)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("changed after it was verified", str(caught.exception))
+
+    def held_staging_lock(self):
+        """Hold the staging lock for this profile, as a second job would."""
+        helper = adapter.text_encoder_helper(self.profile)
+        snapshots = adapter.verify_snapshots(helper)
+        checkpoint = adapter.verified_checkpoint(self.profile)
+        key = adapter.staging_key(self.profile, helper)
+        root = Path(os.environ["INFERNIX_ADAPTER_CACHE_DIR"]) / adapter.STAGING_DIRECTORY
+        root.mkdir(parents=True, exist_ok=True)
+        handle = open(root / f".{key}.lock", "a")
+        self.addCleanup(handle.close)
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return self.profile, helper, checkpoint, snapshots
+
+    def test_a_held_staging_lock_times_out_as_resource_busy(self):
+        profile, helper, checkpoint, snapshots = self.held_staging_lock()
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {gpu.GATE_TIMEOUT_ENV: "1"}):
+            with self.assertRaises(AdapterError) as caught:
+                adapter.staging_tree(profile, helper, checkpoint, snapshots)
+        self.assertEqual(caught.exception.code, 10)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_cancel_during_the_staging_wait_exits_15(self):
+        profile, helper, checkpoint, snapshots = self.held_staging_lock()
+        polls = []
+
+        def cancel():
+            polls.append(1)
+            raise AdapterError(15, "cancelled by cancel file or SIGTERM")
+
+        with mock.patch.dict(os.environ, {gpu.GATE_TIMEOUT_ENV: "600"}):
+            with self.assertRaises(AdapterError) as caught:
+                adapter.staging_tree(profile, helper, checkpoint, snapshots, cancel)
+        self.assertEqual(caught.exception.code, 15)
+        self.assertNotEqual(polls, [], "the wait must poll the cancel hook")
+
+    def test_discarding_a_tree_does_not_chmod_through_a_directory_symlink(self):
+        outside = self.root / "outside-directory"
+        outside.mkdir()
+        os.chmod(outside, 0o751)
+        tree = self.root / "tree-to-discard"
+        (tree / "nested").mkdir(parents=True)
+        (tree / "nested" / "file").write_bytes(b"x")
+        (tree / "nested" / "link").symlink_to(outside)
+        adapter._discard(tree)
+        self.assertFalse(tree.exists() or tree.is_symlink())
+        self.assertEqual(os.lstat(outside).st_mode & 0o777, 0o751)
 
     def test_tokenizer_data_is_not_confined_as_a_path(self):
         # Vocabulary tokens, merges and added tokens are data: a merge such as
@@ -1066,7 +1158,7 @@ class KimodoTests(unittest.TestCase):
             document["tokenizer_file"], str(staged.parent / "tokenizer.json")
         )
         self.assertTrue((staged.parent / "tokenizer.json").is_file())
-        manifest = json.loads((Path(staging) / adapter.MANIFEST).read_text())
+        manifest = self.manifest(staging)
         rewritten = {
             record["path"] for record in manifest["files"] if record["rewritten"]
         }

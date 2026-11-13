@@ -274,6 +274,9 @@
     in
       {
         inherit infernix-lb infernix-workerd;
+        # TODO(animation G2): package the Python adapters while G2 owns
+        # `adapters/**`. Each adapter becomes one package here and one entry in
+        # the workload-fabric `adapters` option; do not guess their layout.
         codex-acp = pkgs.callPackage ./packages/codex-acp.nix {};
         codex-provider = pkgs.callPackage ./packages/codex-provider.nix {};
         ponytail = pkgs.callPackage ./packages/ponytail.nix {};
@@ -712,6 +715,56 @@
         # sandbox's own uid/gid instead of trying to chown files to root.
         rules = map (nixpkgs.lib.replaceStrings [" root root "] [" - - "]) rules;
       }) [llamaSwapFreshLockSample llamaSwapCustomLockSample];
+      gpuGateSample = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          self.nixosModules.default
+          {
+            system.stateVersion = "24.11";
+
+            services.infernix.gpu = {
+              vendor = "cpu";
+              inherit pkgs;
+            };
+
+            services.infernix.gpuGate = {
+              enable = true;
+              device = "atlas-7900xtx";
+            };
+
+            services.infernix.workloadFabric = {
+              enable = true;
+              databaseUrl = "postgres:///canix?host=/run/postgresql";
+              gpuDevice = "atlas-7900xtx";
+              hubTokenFile = "/run/keys/infernix-hub-token";
+              memoryMax = "8G";
+              cpuQuota = "200%";
+              tasksMax = 64;
+              adapters.fixture = {
+                workload = "animation";
+                queues = ["asset"];
+                command = "/bin/true";
+              };
+            };
+
+            services.infernix.comfyui = {
+              enable = true;
+              package = pkgs.hello;
+            };
+
+            services.infernix.llama-swap = {
+              enable = true;
+              modelsDir = "/var/lib/infernix-models";
+              models.test-model = {
+                repo = "example/main-model";
+                file = "main.gguf";
+                ctxSize = 2048;
+              };
+            };
+          }
+        ];
+      };
+
       visualRubricDirectSample = home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
         extraSpecialArgs = {osConfig = null;};
@@ -1603,6 +1656,51 @@
         grep -Fq 'heartbeat_secs = 30' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         grep -Fq 'health_url = "http://127.0.0.1:8014/healthz"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         ! grep -Eiq 'opaque-fixture-reference|prompt|source' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        touch "$out"
+      '';
+
+      gpu-gate = pkgs.runCommand "infernix-gpu-gate-check" {} ''
+        tmpfiles='${builtins.toJSON gpuGateSample.config.systemd.tmpfiles.rules}'
+        printf '%s' "$tmpfiles" | ${pkgs.jq}/bin/jq -e '
+          map(select(. == "f /run/infernix/gpu/atlas-7900xtx.lock 0660 root render -")) | length == 1
+        '
+
+        users='${builtins.toJSON gpuGateSample.config.users.users.infernix-worker}'
+        printf '%s' "$users" | ${pkgs.jq}/bin/jq -e '.extraGroups == ["render", "video"]'
+        printf '%s' "$users" | ${pkgs.jq}/bin/jq -e '.isSystemUser == true'
+
+        model_cmd=${nixpkgs.lib.escapeShellArg gpuGateSample.config.services.llama-swap.settings.models.test-model.cmd}
+        case "$model_cmd" in
+          *flock*--shared*/run/infernix/gpu/atlas-7900xtx.lock*) ;;
+          *) echo "llama-swap model command must take the shared device gate: $model_cmd" >&2; exit 1 ;;
+        esac
+        ungated_cmd=${nixpkgs.lib.escapeShellArg llamaSwapExtraFilesSample.config.services.llama-swap.settings.models.test-model.cmd}
+        case "$ungated_cmd" in
+          *infernix/gpu*) echo "the gate must default off: $ungated_cmd" >&2; exit 1 ;;
+        esac
+
+        comfy=${nixpkgs.lib.escapeShellArg (toString gpuGateSample.config.systemd.services.comfyui.serviceConfig.ExecStart)}
+        case "$comfy" in
+          *flock*--shared*/run/infernix/gpu/atlas-7900xtx.lock*) ;;
+          *) echo "ComfyUI ExecStart must take the shared device gate" >&2; exit 1 ;;
+        esac
+
+        worker='${builtins.toJSON gpuGateSample.config.systemd.services.infernix-workerd.serviceConfig}'
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '.User == "infernix-worker"'
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '.Group == "infernix-worker"'
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '.MemoryMax == "8G"'
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '.CPUQuota == "200%"'
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '.TasksMax == 64'
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '
+          .ReadWritePaths | index("/var/lib/infernix-workload/staging") and index("/var/lib/infernix-workload/cache")
+        '
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '
+          .LoadCredential | index("infernix-hub-token:/run/keys/infernix-hub-token")
+        '
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '
+          .Environment | index("INFERNIX_HUB_TOKEN_FILE=/run/credentials/infernix-workerd.service/infernix-hub-token")
+        '
+        printf '%s' "$worker" | ${pkgs.jq}/bin/jq -e '.Environment | index("INFERNIX_GPU_DEVICE=atlas-7900xtx")'
         touch "$out"
       '';
 

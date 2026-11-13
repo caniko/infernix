@@ -21,6 +21,13 @@
     ;
   cfg = config.services.infernix.llama-swap;
   modelLock = import ../../lib/model-lock.nix {inherit lib pkgs;};
+  gpuGate = import ../../lib/gpu-gate.nix {inherit lib pkgs;};
+  # A host that imports llama-swap without the workload-fabric module has no
+  # gate; the default keeps the rendered command byte-identical.
+  gpuGateCfg = lib.attrByPath ["services" "infernix" "gpuGate"] {
+    enable = false;
+    device = "";
+  } config;
 
   # NB: gpuCfg, llama-cpp, llama-server, mkModelCmd, and downloadFiles all
   # depend on services.infernix.gpu.* (which is null when nothing's enabled)
@@ -349,7 +356,10 @@ in {
 
         models =
           lib.mapAttrs (name: model: {
-            cmd = mkModelCmd name model;
+            cmd = gpuGate.wrap {
+              inherit (gpuGateCfg) enable device;
+              command = mkModelCmd name model;
+            };
             inherit (model) ttl aliases;
           })
           cfg.models;

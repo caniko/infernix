@@ -27,6 +27,11 @@ After `max_busy_releases` releases the job fails with `resource_busy`. A cancel
 flag outranks a retry: a busy release or a normal failure on a cancelled job
 resolves it to `cancelled`, because nothing would ever claim it again.
 
+`COMPLETE` is refused when `cancel_requested_at` is set: the worker then runs
+`CONFIRM_CANCELLED` instead of uploading, atomically. Like `HEARTBEAT`,
+`COMPLETE` also requires `lease_expires_at > now()`, so an expired lease cannot
+land a result even before another worker claims the job.
+
 `MARK_DELIVERED` is fenced on the worker that completed the job. The boot id is
 not part of that fence: a restart must finish delivery, and the upload is
 idempotent.
@@ -112,7 +117,10 @@ result object on exit 0:
 
 `path` is relative to `stagingDirectory`. `source` matches
 `[a-z0-9][a-z0-9_.-]{0,62}` and is unique. Each artifact is at most 256 MiB.
-The worker rejects a result whose artifact is missing, escapes staging, or
+`contentFingerprint` (64 lowercase hex), `cacheHit` (bool), `telemetry` (object)
+and `validation` (`state` one of `ok|warn|fail`, `findings` array) are
+required; extra keys are tolerated. The worker rejects a result that is missing
+a field, has the wrong type, whose artifact is missing, escapes staging, or
 mismatches its declared size or sha256, and fails the job with
 `invalid_result:<code>`.
 
@@ -136,9 +144,11 @@ numbers from the ledger manifest and not from worker logs.
 
 The worker learns about a cancellation from its lease heartbeat. It writes the
 attempt's `CANCEL` file, sends `SIGTERM` to the adapter's process group, waits
-`worker.cancel_grace_secs` (default 30 s), then sends `SIGKILL`, and finally
-runs `CONFIRM_CANCELLED`. A job whose confirmation was fenced is left to the
-worker that won the lease.
+`worker.cancel_grace_secs` (default 30 s), then sends `SIGKILL`. It polls
+`kill(-pgid, 0)` until the whole group is gone — a descendant that ignores
+`SIGTERM` is killed and reaped first — and only then runs
+`CONFIRM_CANCELLED`. A job whose confirmation was fenced is left to the worker
+that won the lease.
 
 ## Delivery
 
@@ -160,10 +170,12 @@ which is what the restart pass needs.
 A workload that declares no artifacts is marked delivered as soon as its
 completion is accepted.
 
-On startup the worker lists its own `succeeded` and undelivered jobs and
-finishes their delivery from retained staging. Missing staging fails the job as
-`staging_lost`. Staging is removed only after delivery (or, for a cancelled
-job, kept for inspection: it will never be delivered).
+On startup, and then periodically while it runs, the worker lists its own
+`succeeded` and undelivered jobs and finishes their delivery from retained
+staging. The retry starts at `worker.delivery_retry_secs` (default 30 s) and
+backs off exponentially to a 10 minute cap after a failed pass. Missing staging
+fails the job as `staging_lost`. Staging is removed only after delivery (or, for
+a cancelled job, kept for inspection: it will never be delivered).
 
 ## CLI
 
@@ -185,9 +197,12 @@ to confirm termination.
 [worker]
 id = "atlas"
 capabilities = ["gpu:atlas-7900xtx"]
+gpu_device = "atlas-7900xtx"    # also advertised as gpu:<device>
 concurrency = 1
 lease_duration_secs = 900
 heartbeat_interval_secs = 30
+poll_interval_secs = 5
+delivery_retry_secs = 30        # base delay for retained-delivery retries
 staging_root = "/var/lib/infernix-workload/staging"
 cancel_grace_secs = 30          # SIGTERM → SIGKILL grace
 max_busy_releases = 30
@@ -197,9 +212,17 @@ busy_retry_delay_secs = 30
 [[adapters]]
 workload = "animation"
 queues = ["asset"]
+profiles = ["sam2-1-hiera-small-rocm"]   # job `profile:<id>` requirements
 command = "/run/current-system/sw/bin/animation-adapter"
 artifacts = true               # validate result.artifacts and deliver them
 ```
+
+The worker's claim capabilities are the configured labels plus `gpu:<gpu_device>`
+plus one `profile:<id>` per adapter profile, so a job is claimed only by a
+worker that has an adapter for it. The job's single `profile:<id>` requirement
+selects the adapter (never adapter order); a claimed job with no matching
+adapter fails as `invalid_input`. Two adapters serving the same
+`(workload, queue, profile)` are a configuration error.
 
 `services.infernix.workloadFabric` renders this file and runs the worker as
 `infernix-worker` with `MemoryMax`, `CPUQuota`, `TasksMax`, read-write access

@@ -22,7 +22,21 @@ the profile.
 | `audio2face/` | `face` | nomad (CUDA) | **blocked, not built** |
 
 `profile.example.json` in each directory is a section-5 profile. The examples
-carry the pinned checkpoint revision and the measured or expected device.
+carry the pinned checkpoint revision and the measured or expected device. A
+resolved profile must also name the provisioned weights:
+
+```json
+"checkpoint": {
+  "repo": "…", "revision": "…",
+  "localPath": "/path/to/weights",
+  "files": [ { "path": "model.safetensors", "sha256": "…" } ]
+}
+```
+
+Adapters load only that checkpoint: a repository is requested at `revision`,
+a local copy is verified against every declared file hash, and a missing
+`localPath`/`revision` is `invalid_input` (14). A payload `modelPath` is
+ignored, so a job cannot redirect an adapter to unapproved weights.
 
 ## `common/` — the shared runtime (`infernix_adapter`)
 
@@ -48,7 +62,7 @@ Environment knobs (all have production defaults):
 | `INFERNIX_GPU_GATE_TIMEOUT` | `600` | gate wait in seconds before exit 10 |
 | `INFERNIX_ADAPTER_CACHE_DIR` | `/var/cache/infernix/animation` | content cache |
 | `INFERNIX_HUB_TOKEN_FILE` | — | file holding the hub bearer token |
-| `INFERNIX_FRAMES_ROOT` | `outputDirectory` | where Blender frame sequences live |
+| `INFERNIX_FRAMES_ROOT` | `$INFERNIX_ADAPTER_CACHE_DIR/frames` | persistent Blender frame root (params/profile `framesRoot` wins) |
 
 `assert_gpu` matches `deviceMatch` against the driver's device name **and** the
 `gcnArchName`. Measured reason: PyTorch on this ROCm 7.2 build reports the RX
@@ -59,8 +73,17 @@ use `gfx1100`. Nomad's 4090 reports its marketing name, so its profiles keep
 `device` is the section-5 id `gpu:<host>-<card>`; the gate file drops the
 prefix, so `gpu:atlas-7900xtx` holds `/run/infernix/gpu/atlas-7900xtx.lock` —
 the same inode canix's `lib/gpu-gate.nix` creates for
-`gpuDevice = "atlas-7900xtx"`. Adapters open it read-write and never create or
-unlink it in production; the tmpfiles rule owns the inode.
+`gpuDevice = "atlas-7900xtx"`. Adapters open the existing inode read-only (the
+worker runs under `ProtectSystem=strict`, so `/run` is read-only) and never
+create or unlink it; the tmpfiles rule owns it.
+
+`assert_gpu` records the device index it selected (`device_index()` /
+`device_string()`), every adapter loads onto that index, and `assert_on_gpu`
+rejects a tensor placed on a different GPU.
+
+`runner.run` reserves fd 1 for the result object: handler and library writes,
+including C-level `printf`, are redirected to stderr for the duration of the
+operation, so a chatty model cannot corrupt the one JSON object workerd reads.
 
 ### Tests
 
@@ -69,13 +92,17 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-40 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+53 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
-again when it drops to the CPU *after* generation); OOM giving 12 (both
-`torch.OutOfMemoryError` and a HIP "out of memory" message); gate timeout giving
-10 while the handler never runs; a cancel file giving 15; fingerprint stability
-and sensitivity (params, seed, inputs, profile, checkpoint revision, runtime);
-and cache corruption/missing file forcing a recompute.
+again when it drops to the CPU *after* generation); a tensor on the wrong GPU
+index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP
+"out of memory" message); gate timeout giving 10 while the handler never runs;
+a read-only gate inode; a cancel file giving 15; handler prints (Python and
+fd-level) staying out of the result; fingerprint stability and sensitivity
+(params, seed, inputs, profile, checkpoint revision, runtime including installed
+package, torch, HIP and CUDA versions); pinned-checkpoint resolution; output
+path traversal; cache corruption/missing file forcing a recompute; and a cache
+hit restoring the stored validation.
 
 ## Hardware evidence
 
@@ -141,8 +168,7 @@ $ANIM_ROOT/.venvs/qwen3-tts/bin/python harness/run_job.py \
   --adapter $ADAPTERS/qwen3-tts --python $ANIM_ROOT/.venvs/qwen3-tts/bin/python \
   --profile $ADAPTERS/qwen3-tts/profile.example.json --memory-max 24G \
   --workdir $ANIM_ROOT/runs/qwen3-tts-1 --cache-root $ANIM_ROOT/cache --lock-root $ANIM_ROOT/locks \
-  --params '{"text":"Maybe Bob brought my mug.","speaker":"Vivian","language":"English",
-             "modelPath":"'$ANIM_ROOT'/weights/qwen3-tts-0.6b-customvoice"}'
+  --params '{"text":"Maybe Bob brought my mug.","speaker":"Vivian","language":"English"}'
 ```
 
 flux2-klein:
@@ -153,8 +179,7 @@ $ANIM_ROOT/.venvs/flux2-klein/bin/python harness/run_job.py \
   --profile $ADAPTERS/flux2-klein/profile.example.json --memory-max 24G \
   --workdir $ANIM_ROOT/runs/flux2-klein-1 --cache-root $ANIM_ROOT/cache --lock-root $ANIM_ROOT/locks \
   --params '{"prompt":"a painterly ceramic mug on a wooden table, soft window light, gouache texture",
-             "steps":4,"width":1024,"height":1024,
-             "modelPath":"'$ANIM_ROOT'/weights/flux2-klein-4b"}'
+             "steps":4,"width":1024,"height":1024}'
 ```
 
 sam2:
@@ -165,8 +190,7 @@ $ANIM_ROOT/.venvs/sam2/bin/python harness/run_job.py \
   --profile $ADAPTERS/sam2/profile.example.json --memory-max 24G \
   --workdir $ANIM_ROOT/runs/sam2-1 --cache-root $ANIM_ROOT/cache --lock-root $ANIM_ROOT/locks \
   --input image=$ANIM_ROOT/fixtures/sam-input.png \
-  --params '{"pointCoords":[[260,270]],"pointLabels":[1],"imageMime":"image/png",
-             "modelPath":"'$ANIM_ROOT'/weights/sam2.1-hiera-small/sam2.1_hiera_small.pt"}'
+  --params '{"pointCoords":[[260,270]],"pointLabels":[1],"imageMime":"image/png"}'
 ```
 
 blender-cycles-hip (atlas; the operation script comes from studio-pipeline, the
@@ -198,8 +222,7 @@ ssh can@lnomad "LD_LIBRARY_PATH=/run/opengl-driver/lib \
   --lock-root $NOMAD_ROOT/locks \
   --input image=$NOMAD_ROOT/fixtures/mug.png --input mask=$NOMAD_ROOT/fixtures/mug-mask.png \
   --params '{\"imageMime\":\"image/png\",\"maskMime\":\"image/png\",\"steps\":40,
-             \"numTokens\":2048,\"decoder\":\"hierarchical\",
-             \"modelPath\":\"$NOMAD_ROOT/weights/triposg\"}'"
+             \"numTokens\":2048,\"decoder\":\"hierarchical\"}'"
 ```
 
 ### Environment build
@@ -245,26 +268,31 @@ python -c "from huggingface_hub import snapshot_download as d; d(repo_id='VAST-A
 ### Per-adapter notes
 
 **qwen3-tts.** `attn_implementation="sdpa"` is hard-coded (FlashAttention-2 is
-CUDA-only). `device_map="cuda:0"`, bf16, mono 16-bit WAV at the model's sample
-rate. `params`: `text`, `speaker` (required), `language`, `instruct`,
-`temperature`, `topK`, `topP`, `maxNewTokens`, `modelPath`, `outputName`.
-Sampling is seeded from `payload.seed` by the shared runner, so an identical
-envelope reproduces identical audio (verified: two runs, same sha256).
+CUDA-only). `device_map` is the index `assert_gpu` selected, bf16, mono 16-bit
+WAV at the model's sample rate. The speech tokenizer (`model.model.
+speech_tokenizer.model`) is asserted on the GPU too. `params`: `text`,
+`speaker` (required), `language`, `instruct`, `temperature`, `topK`, `topP`,
+`maxNewTokens`, `outputName`. Sampling is seeded from `payload.seed` by the
+shared runner, so an identical envelope reproduces identical audio (verified:
+two runs, same sha256).
 
 **flux2-klein.** `Flux2KleinPipeline` from diffusers 0.43, bf16, whole pipeline
 on the GPU. Two hard rules: the checkpoint repo must be exactly
 `black-forest-labs/FLUX.2-klein-4B` (9B and `dev` are FLUX Non-Commercial under
 the same repo family — the adapter refuses them, exit 13), and
-`enable_model_cpu_offload` is never called. The on-GPU assertion runs both after
-load and after generation, so an offload hook cannot hide. `params`: `prompt`
-(required), `steps` (default 4), `guidanceScale` (1.0), `width`/`height` (1024),
-`modelPath`, `outputName`.
+`enable_model_cpu_offload` is never called. Loading is bound to the profile's
+pinned revision (or a local copy whose declared hashes match), and the on-GPU
+assertion runs both after load and after generation, so an offload hook cannot
+hide. `params`: `prompt` (required), `steps` (default 4), `guidanceScale`
+(1.0), `width`/`height` (1024), `outputName`.
 
 **sam2.** SAM 2.1 hiera-small image predictor, `apply_postprocessing=False` so
-no CUDA extension is needed on ROCm. Prompts come from `params.pointCoords` /
-`pointLabels` / `box`; masks come from the prompt, never from a
-background-removal model. Emits `mask.png` (mode `L`) plus `mask.json` with the
-score and the prompt.
+no CUDA extension is needed on ROCm. The pinned `.pt` file comes from the
+profile's `checkpoint.localPath`; a missing file or hash mismatch fails before
+`build_sam2`, so the predictor never runs random weights. Prompts come from
+`params.pointCoords` / `pointLabels` / `box`; masks come from the prompt, never
+from a background-removal model. Emits `mask.png` (mode `L`) plus `mask.json`
+with the score and the prompt.
 
 **blender-cycles-hip.** Runs a studio-pipeline `blender/operations` script headless:
 
@@ -275,17 +303,25 @@ blender --background --factory-startup --python-exit-code 13 \
 
 The guard pins `compute_device_type` to `HIP`/`OPTIX` from the profile backend,
 enables only those devices, sets `scene.cycles.device = "GPU"`, OIDN denoise and
-`denoising_use_gpu`; it prints a marker line or raises. The verify expression
-runs after the operation and re-asserts engine/device/device name on the scene
-that was actually rendered. A blender exit without the guard marker is exit 13
-(`backend_mismatch`); a failure after the marker is an ordinary error. The
+`denoising_use_gpu` (a missing `denoising_use_gpu` property fails); it prints a
+marker line or raises. The same guard is installed as a `render_init` handler,
+so it re-runs on the scene the operation loaded, right before rendering, and
+refuses a scene that is not Cycles. The verify expression runs after the
+operation and re-asserts engine/device/denoise/device name on the scene that was
+actually rendered. A blender exit without the guard marker is exit 13
+(`backend_mismatch`); a python exit 13 stays 13, an OOM message or exit 12 is
+`oom` (12), and any other failure is an ordinary error. The
 operation receives its inputs through the environment (`INFERNIX_BLENDER_ARGS`
 JSON, `INFERNIX_STAGING_DIR`, `INFERNIX_FRAMES_DIR`, `INFERNIX_FRAME_START`,
 `INFERNIX_FRAME_END`, `INFERNIX_FPS`) and writes `####.png` frames. The adapter
 then encodes the master with `ffmpeg -c:v hevc_vaapi` (atlas, render node from
 `INFERNIX_VAAPI_DEVICE`) or `hevc_nvenc` (nomad), and emits the master plus a
-`frames.json` locator with per-frame sha256. Frames stay under
-`INFERNIX_FRAMES_ROOT`; only the master and the locator are artifacts.
+`frames.json` locator with per-frame sha256. Frames stay under a persistent root
+(`params.framesRoot`, profile `framesRoot`, `INFERNIX_FRAMES_ROOT`, else
+`$INFERNIX_ADAPTER_CACHE_DIR/frames`), content-addressed by the job fingerprint;
+a retained sequence is reused only when every frame still matches the recorded
+sha256, and a frames root inside staging is `invalid_input`. Only the master and
+the locator are artifacts.
 `profile.id == "authoring"` (`cpuPolicy: authoring`) is the only case that skips
 the GPU guard, per the plan.
 

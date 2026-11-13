@@ -14,9 +14,9 @@ the profile.
 | Directory | Operation | Worker | State |
 | --- | --- | --- | --- |
 | `common/` | — (shared runtime) | both | tested |
-| `qwen3-tts/` | `tts` | atlas (ROCm) | hardware-tested |
+| `qwen3-tts/` | `tts` | atlas (ROCm), murph (XPU) | hardware-tested (ROCm) |
 | `flux2-klein/` | `image` | atlas (ROCm) | hardware-tested |
-| `sam2/` | `mask` | atlas (ROCm) | hardware-tested |
+| `sam2/` | `mask` | atlas (ROCm), murph (XPU) | hardware-tested (ROCm) |
 | `blender-cycles-hip/` | `render_preview` / `render_final` | atlas (HIP), nomad (OPTIX) | hardware-tested (preview fixture) |
 | `triposg/` | `geometry` | nomad (CUDA) | see evidence table |
 | `audio2face/` | `face` | nomad (CUDA) | **blocked, not built** |
@@ -84,6 +84,36 @@ Environment knobs (all have production defaults):
 use `gfx1100`. Nomad's 4090 reports its marketing name, so its profiles keep
 `4090`.
 
+The third backend is `xpu` for murph (Intel Arc A770 16 GiB, i915, PCI
+`8086:56a0`). PyTorch's XPU API is the only interface used: `torch.xpu` must be
+present and available, device names come from `torch.xpu.get_device_name()`
+(murph reports `Intel(R) Arc(TM) A770 Graphics`, so `deviceMatch` is `A770`),
+free memory for admission from `torch.xpu.mem_get_info()` only — a build without
+it fails closed as `gpu_unavailable` (11), because the allocator's own reserved
+bytes cannot see a desktop or another job holding the card — and the peak from
+`torch.xpu.max_memory_reserved()`. XPU has no arch alias, so the marketing name
+is the whole identity. CPU fallback is refused exactly like the other backends.
+murph is a shared family desktop; the production admission gate lives outside
+the adapter, and jobs only run when its GPU is free.
+
+XPU telemetry is unprivileged and per process: 1 s samples parse
+`/proc/self/fdinfo/*` entries whose `drm-driver` is `i915`, keyed by
+`(drm-pdev, drm-client-id)` so two descriptors of one client count once and an
+fd number reused by another client starts a fresh baseline. GPU-busy seconds
+are the per-sample maximum over engines of `Δns / capacity` (capacity from
+`drm-engine-capacity-<engine>`, default 1), so concurrent or multi-instance
+engines contribute their wall time rather than the sum of their time; each
+client's counter is tracked by a high-water mark, so a temporarily regressing
+counter is never counted twice. A baseline snapshot at start and a final one in
+`stop()` charge engine time spent between ticks, so a sub-second inference on a
+client that existed at the previous snapshot still reports GPU seconds; clients
+sharing an engine add up before the per-engine maximum. Blind spot: work a
+client does before its first observation (a DRM client created and used within
+one interval) is not counted, because there is no earlier counter to diff. `drm-resident-local0` is the resident device memory.
+Temperature and power stay 0 on this backend (they need root on i915). Level
+Zero's `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` and the XPU "out of memory" text
+both map to exit 12.
+
 `device` is the section-5 id `gpu:<host>-<card>`; the gate file drops the
 prefix, so `gpu:atlas-7900xtx` holds `/run/infernix/gpu/atlas-7900xtx.lock` —
 the same inode canix's `lib/gpu-gate.nix` creates for
@@ -120,21 +150,27 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-71 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+101 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
 again when it drops to the CPU *after* generation); a tensor on the wrong GPU
-index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP
-"out of memory" message); gate timeout giving 10 while the handler never runs;
-a read-only gate inode; a cancel file giving 15; handler prints (Python,
-fd-level and buffered libc `printf`) staying out of the result; fingerprint
-stability and sensitivity (params, seed, inputs, profile, checkpoint revision,
-runtime including installed package, torch, HIP and CUDA versions, an
-adapter-specific renderer version or source commit, and a null identity
-refused); full-sha, local-directory and local-file checkpoint resolution
-(branch/tag/short sha rejected, undeclared weights rejected); output-path
-traversal, realpath escapes and symlinks (also through `O_NOFOLLOW`); cache
-corruption/missing file forcing a recompute; and a cache hit restoring the
-stored validation.
+index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP or
+XPU "out of memory" message, and Level Zero's
+`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`); gate timeout giving 10 while the
+handler never runs; a read-only gate inode; a cancel file giving 15; handler
+prints (Python, fd-level and buffered libc `printf`) staying out of the result;
+fingerprint stability and sensitivity (params, seed, inputs, profile, checkpoint
+revision, runtime including installed package, torch, HIP, CUDA and XPU
+versions, an adapter-specific renderer version or source commit, and a null
+identity refused); full-sha, local-directory and local-file checkpoint
+resolution (branch/tag/short sha rejected, undeclared weights rejected);
+output-path traversal, realpath escapes and symlinks (also through
+`O_NOFOLLOW`); cache corruption/missing file forcing a recompute; and a cache
+hit restoring the stored validation. The XPU branches are covered without an
+Intel card: device selection and mismatch, `mem_get_info` and the fail-closed
+refusal when it is absent, i915 fdinfo parsing keyed by DRM client,
+duplicated-descriptor dedupe, fd reuse by another client, regressing counters,
+engine capacity and overlapping engines, the final snapshot in `stop()`, and
+the allocator peak merge.
 
 Per-adapter suites (each needs that worker's venv: `numpy`, `torch`, `pillow`,
 and for TripoSG `trimesh`/`pymeshlab`):
@@ -150,10 +186,17 @@ proves the `render_init` handler is still registered and still applies.
 
 ## Hardware evidence
 
-Measured on 2026-11-13 on the two GPU workers, each run under
+Measured on 2026-11-13 on the GPU workers, each run under
 `systemd-run --user -p MemoryMax=24G -p MemorySwapMax=0 --wait --pipe` with the
 stub hub below. "Peak VRAM" is the sampler's `mem_info_vram_used` peak, which
-includes whatever the desktop already holds (~4 GiB on atlas).
+includes whatever the desktop already holds (~4 GiB on atlas). On murph (XPU)
+the peak is the process's own resident memory (`drm-resident-local0`) merged
+with `torch.xpu.max_memory_reserved()`, so it excludes the desktop.
+
+murph is a shared family desktop: a job may only run while `loginctl
+list-sessions` shows no `can`/`dejana` session on `seat0` except the login
+greeter. The production admission gate lives in the worker; the hardware runs
+below re-checked that condition before starting.
 
 Before each run the game guard was checked: `gamemoded -s` reported
 `gamemode is inactive` and no Steam game process existed. A headless
@@ -169,6 +212,8 @@ with the desktop's 4 GiB). No run was skipped.
 | `sam2` | atlas `gfx1100` | 512², 1 point | 11.15 s | 1.59 GiB | 0.42 | 10.31 | 37 | 45 | `hardware-tested` |
 | `blender-cycles-hip` | atlas HIP + VCN | 3 frames 160×120 + HEVC VAAPI | 4.09 s | 1.43 GiB | 0.10 | 0.06 | 39 | 38 | `hardware-tested` (fixture operation) |
 | `triposg` | nomad 4090 Laptop | 1024² image + SAM mask → GLB | 188.32 s | 12.0 GiB | 179.26 | 188.22 | 88 | 81 | `hardware-tested` (hierarchical decoder, fp32) |
+| `qwen3-tts` | murph `A770` | 1 line → 24 kHz wav | — | — | — | — | — | — | not run: admission gate closed |
+| `sam2` | murph `A770` | 512², 1 point | — | — | — | — | — | — | not run: admission gate closed |
 
 Notes that matter for a profile's `peakVramGib`:
 
@@ -189,6 +234,16 @@ Notes that matter for a profile's `peakVramGib`:
   Mesh *quality* is Phase C certification and is not claimed here.
 - Nomad hit 88 °C on the laptop 4090 at 81 W during the 3-minute run. Thermal
   headroom, not VRAM, is the constraint for long TripoSG jobs on that worker.
+- **murph (XPU) has no hardware evidence yet.** The environment is provisioned
+  (`torch==2.14.1+xpu`, `torchvision==0.29.1+xpu`, `torchaudio==2.11.0+xpu`, both
+  weights downloaded) and both packages import, but every run window found
+  `dejana` `Active=yes` on `seat0` in `loginctl`, so the shared-desktop gate was
+  closed and no job was started. A bare `torch.xpu.is_available()` probe without
+  the driver path reported zero devices; the run command sets
+  `LD_LIBRARY_PATH=/run/opengl-driver/lib`, where NixOS wires `libze_loader` and
+  `libze_intel_gpu`. `can` is not in `render`/`video`, but
+  `/dev/dri/renderD128` is mode 0666, so the render node is accessible. The XPU
+  backend stays `documented` in its profiles until a real run lands here.
 
 ### Reproduce
 
@@ -269,6 +324,30 @@ ssh can@lnomad "LD_LIBRARY_PATH=/run/opengl-driver/lib \
              \"numTokens\":2048,\"decoder\":\"hierarchical\"}'"
 ```
 
+murph (Intel XPU, over ssh; the wheel's Level Zero stack finds the NixOS driver
+through `LD_LIBRARY_PATH`). The sam2 example has no `localPath`: resolve it to
+the downloaded `.pt` and add its sha256 to `files` before a run.
+
+```sh
+export XPU_ROOT=/data/scratch/infernix-xpu       # murph model root
+export XPU_ADAPTERS=$XPU_ROOT/adapters
+export LD_LIBRARY_PATH=/run/opengl-driver/lib
+
+sudo -u can $XPU_ROOT/.venvs/qwen3-tts/bin/python $XPU_ROOT/harness/run_job.py \
+  --adapter $XPU_ADAPTERS/qwen3-tts --python $XPU_ROOT/.venvs/qwen3-tts/bin/python \
+  --profile $XPU_ADAPTERS/qwen3-tts/profile.xpu.example.json --memory-max 12G \
+  --workdir $XPU_ROOT/runs/qwen3-tts-xpu-1 --cache-root $XPU_ROOT/cache \
+  --lock-root $XPU_ROOT/locks \
+  --params '{"text":"Maybe Bob brought my mug.","speaker":"Vivian","language":"English"}'
+
+sudo -u can $XPU_ROOT/.venvs/sam2/bin/python $XPU_ROOT/harness/run_job.py \
+  --adapter $XPU_ADAPTERS/sam2 --python $XPU_ROOT/.venvs/sam2/bin/python \
+  --profile $XPU_ROOT/runs/sam2-xpu-1/profile.json --memory-max 12G \
+  --workdir $XPU_ROOT/runs/sam2-xpu-1 --cache-root $XPU_ROOT/cache \
+  --lock-root $XPU_ROOT/locks --input image=$XPU_ROOT/fixtures/sam-input.png \
+  --params '{"pointCoords":[[260,270]],"pointLabels":[1],"imageMime":"image/png"}'
+```
+
 ### Environment build
 
 atlas (ROCm, PyTorch 2.14.1+rocm7.2, python 3.12):
@@ -300,6 +379,27 @@ uv pip install --python $V --index-strategy unsafe-best-match \
   "torch==2.14.1+cu126" "torchvision==0.29.1+cu126" "torchaudio==2.11.0+cu126"
 ```
 
+murph (Intel XPU, python 3.12) does not reuse the adapter's ROCm lock. Each of
+the two XPU adapters has its own frozen project under `<adapter>/xpu/`; the
+default lock keeps resolving ROCm and stays untouched:
+
+```sh
+export XPU_ROOT=/data/scratch/infernix-xpu
+UV_PROJECT_ENVIRONMENT=$XPU_ROOT/.venvs/<adapter> \
+  uv sync --frozen --project $ADAPTERS/<adapter>/xpu --python 3.12
+```
+
+The sam2 project has a `git+https` dependency, so `git` must be on `PATH` for
+that sync (on murph: `nix shell nixpkgs#uv nixpkgs#git -c uv sync …`).
+
+The XPU lock pins `torch==2.14.1+xpu`, `torchvision==0.29.1+xpu` and
+`torchaudio==2.11.0+xpu` from `https://download.pytorch.org/whl/xpu`. On NixOS
+the wheels still need the system Level Zero loader and Intel GPU driver:
+
+```sh
+LD_LIBRARY_PATH=/run/opengl-driver/lib
+```
+
 Weights (ungated Apache-2.0 / MIT only; nothing here accepts a licence gate):
 
 ```sh
@@ -312,8 +412,9 @@ python -c "from huggingface_hub import snapshot_download as d; d(repo_id='VAST-A
 ### Per-adapter notes
 
 **qwen3-tts.** `attn_implementation="sdpa"` is hard-coded (FlashAttention-2 is
-CUDA-only). `device_map` is the index `assert_gpu` selected, bf16, mono 16-bit
-WAV at the model's sample rate. The speech tokenizer (`model.model.
+CUDA-only). `device_map` is the index `assert_gpu` selected (`cuda:<n>` on
+ROCm/CUDA, `xpu:<n>` on murph), bf16, mono 16-bit WAV at the model's sample
+rate. The speech tokenizer (`model.model.
 speech_tokenizer.model`) is asserted on the GPU too. `params`: `text`,
 `speaker` (required), `language`, `instruct`, `temperature`, `topK`, `topP`,
 `maxNewTokens`, `outputName`. Sampling is seeded from `payload.seed` by the
@@ -331,7 +432,8 @@ hide. `params`: `prompt` (required), `steps` (default 4), `guidanceScale`
 (1.0), `width`/`height` (1024), `outputName`.
 
 **sam2.** SAM 2.1 hiera-small image predictor, `apply_postprocessing=False` so
-no CUDA extension is needed on ROCm. The pinned `.pt` file comes from the
+no CUDA extension is needed on ROCm or XPU; the autocast device type follows the
+selected backend (`cuda`/`xpu`). The pinned `.pt` file comes from the
 profile's `checkpoint.localPath`; a missing file or hash mismatch fails before
 `build_sam2`, so the predictor never runs random weights. Prompts come from
 `params.pointCoords` / `pointLabels` / `box`; masks come from the prompt, never

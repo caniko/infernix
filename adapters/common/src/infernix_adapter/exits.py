@@ -38,11 +38,18 @@ def invalid(message):
 
 
 def is_oom(exc):
-    """Recognise PyTorch, HIP and CUDA out-of-memory failures without importing torch."""
+    """Recognise PyTorch, HIP, CUDA and XPU out-of-memory failures without importing torch."""
     if type(exc).__name__ in ("OutOfMemoryError", "CudaError", "HipError"):
         text = str(exc).lower()
         if type(exc).__name__ == "OutOfMemoryError":
             return True
         return "out of memory" in text
     text = str(exc).lower()
-    return "out of memory" in text or "cuda error: out of memory" in text
+    return (
+        "out of memory" in text
+        or "cuda error: out of memory" in text
+        # Level Zero's out-of-device-memory status, reported verbatim by the
+        # PyTorch XPU runtime when a kernel allocation is refused.
+        or "ur_result_error_out_of_device_memory" in text
+        or "out of device memory" in text
+    )

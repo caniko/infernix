@@ -24,6 +24,7 @@ from .gpu import (
     device_gate,
     device_index,
     device_string,
+    device_type,
     ensure_device,
     unload_tenants,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "device_gate",
     "device_index",
     "device_string",
+    "device_type",
     "download_inputs",
     "emit",
     "ensure_device",

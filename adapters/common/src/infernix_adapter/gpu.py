@@ -58,13 +58,12 @@ def xpu_free_bytes(torch_module=None):
         return None
     try:
         mem_get_info = getattr(xpu, "mem_get_info", None)
-        if mem_get_info is not None:
-            free, _total = mem_get_info()
-            return int(free)
-        # Older XPU builds lack mem_get_info; the allocator's reserved bytes are
-        # the part of the card already spoken for.
-        total = int(xpu.get_device_properties().total_memory)
-        return total - int(xpu.memory_reserved())
+        if mem_get_info is None:
+            # The allocator counters are this process's own: they cannot see a
+            # desktop or another job holding the card, so they must not admit.
+            return None
+        free, _total = mem_get_info()
+        return int(free)
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         return None
 
@@ -108,7 +107,15 @@ def ensure_device(peak_gib, backend, margin_gib=1.5):
     """Fail as resource_busy when the card cannot hold this job."""
     free = vram_free_bytes(backend)
     if free is None:
-        raise AdapterError(GPU_UNAVAILABLE, f"cannot read free VRAM for backend {backend!r}")
+        detail = (
+            "; torch.xpu.mem_get_info is required, because the allocator cannot"
+            " see another process's usage"
+            if backend == "xpu"
+            else ""
+        )
+        raise AdapterError(
+            GPU_UNAVAILABLE, f"cannot read free VRAM for backend {backend!r}{detail}"
+        )
     need = int(float(peak_gib or 0.0) * GIB) + int(float(margin_gib) * GIB)
     if free < need:
         raise AdapterError(

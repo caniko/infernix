@@ -398,9 +398,16 @@ class XpuMemoryTests(unittest.TestCase):
         torch = fake_xpu_torch(mem_get_info=(10 << 30, 16 << 30))
         self.assertEqual(gpu.xpu_free_bytes(torch), 10 << 30)
 
-    def test_xpu_free_bytes_falls_back_to_total_minus_reserved(self):
-        torch = fake_xpu_torch(mem_get_info=None, total_memory=16 << 30, reserved=6 << 30)
-        self.assertEqual(gpu.xpu_free_bytes(torch), 10 << 30)
+    def test_xpu_free_bytes_without_mem_get_info_fails_closed(self):
+        torch = fake_xpu_torch(mem_get_info=None, total_memory=16 << 30, reserved=0)
+        self.assertIsNone(gpu.xpu_free_bytes(torch))
+
+    def test_ensure_device_without_mem_get_info_exits_11(self):
+        with mock.patch.object(gpu, "vram_free_bytes", return_value=None):
+            with self.assertRaises(AdapterError) as caught:
+                gpu.ensure_device(1.0, "xpu")
+        self.assertEqual(caught.exception.code, 11)
+        self.assertIn("mem_get_info", str(caught.exception))
 
     def test_xpu_free_bytes_without_xpu_is_none(self):
         self.assertIsNone(gpu.xpu_free_bytes(fake_torch(hip=None, cuda=None)))
@@ -513,12 +520,30 @@ class XpuTelemetryTests(unittest.TestCase):
             resident_kib=1024,
         )
 
-    def write_client(self, path, *, driver, render_ns, compute_ns, resident_kib):
-        lines = ["pos:\t0", f"drm-driver:\t{driver}", "drm-client-id:\t9"]
+    def write_client(
+        self,
+        path,
+        *,
+        driver,
+        render_ns,
+        compute_ns,
+        resident_kib,
+        client_id=9,
+        pdev="0000:03:00.0",
+        capacity=None,
+    ):
+        lines = [
+            "pos:\t0",
+            f"drm-driver:\t{driver}",
+            f"drm-pdev:\t{pdev}",
+            f"drm-client-id:\t{client_id}",
+        ]
         if render_ns is not None:
             lines.append(f"drm-engine-render:\t{render_ns} ns")
         if compute_ns is not None:
             lines.append(f"drm-engine-compute:\t{compute_ns} ns")
+        for engine, value in (capacity or {}).items():
+            lines.append(f"drm-engine-capacity-{engine}:\t{value}")
         lines.append(f"drm-resident-local0:\t{resident_kib} KiB")
         path.write_text("\n".join(lines) + "\n")
 
@@ -526,13 +551,93 @@ class XpuTelemetryTests(unittest.TestCase):
         (self.root / "8").write_text("drm-driver:\tamdgpu\ndrm-engine-render:\t99 ns\n")
         (self.root / "9").write_text("pos:\t0\n")
         found = telemetry.i915_fdinfo(self.root)
-        self.assertEqual(list(found), [str(self.client)])
-        self.assertEqual(found[str(self.client)]["engines"]["drm-engine-render"], 1_000)
-        self.assertEqual(found[str(self.client)]["engines"]["drm-engine-compute"], 2_000)
-        self.assertEqual(found[str(self.client)]["resident"], 1 << 20)
+        self.assertEqual(list(found), [("0000:03:00.0", "9")], "keyed by client, not fd")
+        self.assertEqual(found[("0000:03:00.0", "9")]["engines"]["drm-engine-render"], 1_000)
+        self.assertEqual(found[("0000:03:00.0", "9")]["engines"]["drm-engine-compute"], 2_000)
+        self.assertEqual(found[("0000:03:00.0", "9")]["capacity"]["drm-engine-render"], 1)
+        self.assertEqual(found[("0000:03:00.0", "9")]["resident"], 1 << 20)
 
     def test_missing_fdinfo_root_is_empty(self):
         self.assertEqual(telemetry.i915_fdinfo(self.root / "absent"), {})
+
+    def test_two_descriptors_of_one_client_count_once(self):
+        duplicate = self.root / "8"
+        self.write_client(
+            duplicate, driver="i915", render_ns=1_000, compute_ns=2_000, resident_kib=1024
+        )
+        self.assertEqual(len(telemetry.i915_fdinfo(self.root)), 1)
+
+        sampler = telemetry.Sampler("xpu")
+        self.assertEqual(sampler._sample_xpu(root=self.root)["busy_ns"], 0)
+        for path in (self.client, duplicate):
+            self.write_client(
+                path, driver="i915", render_ns=1_400, compute_ns=2_000, resident_kib=1024
+            )
+        second = sampler._sample_xpu(root=self.root)
+        self.assertEqual(second["busy_ns"], 400, "the duplicated descriptor adds nothing")
+        self.assertEqual(second["vram"], 1 << 20, "resident memory is counted once")
+
+    def test_an_fd_number_reused_for_another_client_is_not_a_delta(self):
+        sampler = telemetry.Sampler("xpu")
+        sampler._sample_xpu(root=self.root)
+        # The kernel reuses fd 7 for a different DRM client with higher counters.
+        self.write_client(
+            self.client,
+            driver="i915",
+            render_ns=9_000,
+            compute_ns=2_000,
+            resident_kib=1024,
+            client_id=10,
+        )
+        self.assertEqual(sampler._sample_xpu(root=self.root)["busy_ns"], 0)
+        self.write_client(
+            self.client,
+            driver="i915",
+            render_ns=9_500,
+            compute_ns=2_000,
+            resident_kib=1024,
+            client_id=10,
+        )
+        self.assertEqual(sampler._sample_xpu(root=self.root)["busy_ns"], 500)
+
+    def test_a_regressing_counter_counts_only_the_high_water_mark(self):
+        sampler = telemetry.Sampler("xpu")
+        for render_ns in (1_000, 900, 1_100):
+            self.write_client(
+                self.client,
+                driver="i915",
+                render_ns=render_ns,
+                compute_ns=2_000,
+                resident_kib=1024,
+            )
+            sample = sampler._sample_xpu(root=self.root)
+        self.assertEqual(sample["busy_ns"], 100, "1.0 -> 0.9 -> 1.1 is 0.1, not 0.2")
+
+    def test_engine_capacity_divides_engine_time(self):
+        sampler = telemetry.Sampler("xpu")
+        sampler._sample_xpu(root=self.root)
+        self.write_client(
+            self.client,
+            driver="i915",
+            render_ns=2_000_000_000 + 1_000,
+            compute_ns=2_000,
+            resident_kib=1024,
+            capacity={"render": 2},
+        )
+        self.assertEqual(sampler._sample_xpu(root=self.root)["busy_ns"], 1_000_000_000)
+
+    def test_overlapping_engines_do_not_add_their_time(self):
+        sampler = telemetry.Sampler("xpu")
+        sampler._sample_xpu(root=self.root)
+        self.write_client(
+            self.client,
+            driver="i915",
+            render_ns=1_000_000_000 + 1_000,
+            compute_ns=1_000_000_000 + 2_000,
+            resident_kib=1024,
+        )
+        sample = sampler._sample_xpu(root=self.root)
+        self.assertEqual(sample["busy_ns"], 1_000_000_000, "render and compute overlap")
 
     def test_engine_deltas_become_gpu_seconds_and_resident_becomes_peak(self):
         sampler = telemetry.Sampler("xpu")
@@ -548,10 +653,20 @@ class XpuTelemetryTests(unittest.TestCase):
             resident_kib=2048,
         )
         second = sampler._sample_xpu(root=self.root)
-        self.assertEqual(second["busy_ns"], 750, "500 + 250 engine nanoseconds")
+        self.assertEqual(second["busy_ns"], 500, "max(500 render, 250 compute)")
         self.assertEqual(second["vram"], 2 << 20)
         self.assertIsNone(second["busy"])
         self.assertIsNone(second["temp"])
+
+    def test_activity_after_the_last_sample_still_counts(self):
+        sampler = telemetry.Sampler("xpu", interval=60, fdinfo_root=self.root)
+        self.addCleanup(sampler.stop)
+        sampler.start()
+        self.write_client(
+            self.client, driver="i915", render_ns=2_000_000_000, compute_ns=2_000, resident_kib=1024
+        )
+        summary = sampler.stop()
+        self.assertGreater(summary["gpuSeconds"], 0, "time between the last tick and stop")
 
     def test_summary_merges_the_allocator_peak(self):
         sampler = telemetry.Sampler("xpu")

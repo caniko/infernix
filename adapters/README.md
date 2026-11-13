@@ -88,20 +88,28 @@ The third backend is `xpu` for murph (Intel Arc A770 16 GiB, i915, PCI
 `8086:56a0`). PyTorch's XPU API is the only interface used: `torch.xpu` must be
 present and available, device names come from `torch.xpu.get_device_name()`
 (murph reports `Intel(R) Arc(TM) A770 Graphics`, so `deviceMatch` is `A770`),
-free memory for admission from `torch.xpu.mem_get_info()` with a
-`total_memory - memory_reserved()` fallback for builds without it, and the peak
-from `torch.xpu.max_memory_reserved()`. XPU has no arch alias, so the marketing
-name is the whole identity. CPU fallback is refused exactly like the other
-backends. murph is a shared family desktop; the production admission gate lives
-outside the adapter, and jobs only run when its GPU is free.
+free memory for admission from `torch.xpu.mem_get_info()` only — a build without
+it fails closed as `gpu_unavailable` (11), because the allocator's own reserved
+bytes cannot see a desktop or another job holding the card — and the peak from
+`torch.xpu.max_memory_reserved()`. XPU has no arch alias, so the marketing name
+is the whole identity. CPU fallback is refused exactly like the other backends.
+murph is a shared family desktop; the production admission gate lives outside
+the adapter, and jobs only run when its GPU is free.
 
 XPU telemetry is unprivileged and per process: 1 s samples parse
-`/proc/self/fdinfo/*` entries whose `drm-driver` is `i915`, sum the
-`drm-engine-render` / `drm-engine-compute` nanosecond deltas for GPU-busy
-seconds, and read `drm-resident-local0` for resident device memory. Temperature
-and power stay 0 on this backend (they need root on i915). Level Zero's
-`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` and the XPU "out of memory" text both
-map to exit 12.
+`/proc/self/fdinfo/*` entries whose `drm-driver` is `i915`, keyed by
+`(drm-pdev, drm-client-id)` so two descriptors of one client count once and an
+fd number reused by another client starts a fresh baseline. GPU-busy seconds
+are the per-sample maximum over engines of `Δns / capacity` (capacity from
+`drm-engine-capacity-<engine>`, default 1), so concurrent or multi-instance
+engines contribute their wall time rather than the sum of their time; each
+client's counter is tracked by a high-water mark, so a temporarily regressing
+counter is never counted twice. A baseline snapshot at start and a final one in
+`stop()` charge engine time spent between ticks, so a sub-second inference still
+reports GPU seconds. `drm-resident-local0` is the resident device memory.
+Temperature and power stay 0 on this backend (they need root on i915). Level
+Zero's `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` and the XPU "out of memory" text
+both map to exit 12.
 
 `device` is the section-5 id `gpu:<host>-<card>`; the gate file drops the
 prefix, so `gpu:atlas-7900xtx` holds `/run/infernix/gpu/atlas-7900xtx.lock` —
@@ -139,7 +147,7 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-94 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+101 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
 again when it drops to the CPU *after* generation); a tensor on the wrong GPU
 index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP or
@@ -155,8 +163,11 @@ resolution (branch/tag/short sha rejected, undeclared weights rejected);
 output-path traversal, realpath escapes and symlinks (also through
 `O_NOFOLLOW`); cache corruption/missing file forcing a recompute; and a cache
 hit restoring the stored validation. The XPU branches are covered without an
-Intel card: device selection and mismatch, `mem_get_info` and its fallback,
-i915 fdinfo parsing and engine deltas, and the allocator peak merge.
+Intel card: device selection and mismatch, `mem_get_info` and the fail-closed
+refusal when it is absent, i915 fdinfo parsing keyed by DRM client,
+duplicated-descriptor dedupe, fd reuse by another client, regressing counters,
+engine capacity and overlapping engines, the final snapshot in `stop()`, and
+the allocator peak merge.
 
 Per-adapter suites (each needs that worker's venv: `numpy`, `torch`, `pillow`,
 and for TripoSG `trimesh`/`pymeshlab`):

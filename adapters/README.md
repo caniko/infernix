@@ -46,6 +46,9 @@ Adapters load only that checkpoint, and `checkpoint.py` enforces the pin:
   the walk follows symlinked directories (a Hugging Face cache is a
   `snapshots/<sha>/model.safetensors` → `blobs/<sha>` link farm) and hashes the
   file each declared path resolves to;
+- every `*.index.json` is found recursively, and each shard it names resolves
+  against that index's own directory, must stay inside the checkpoint root, and
+  must be a declared file — a nested index cannot name `../../outside.safetensors`;
 - a local file (`checkpoint.localPath` for an adapter that loads one file) needs
   a matching `files` entry, or it is refused.
 
@@ -151,7 +154,7 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-101 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+107 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
 again when it drops to the CPU *after* generation); a tensor on the wrong GPU
 index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP or
@@ -446,15 +449,16 @@ python - <<'PY'
 from pathlib import Path
 from huggingface_hub import snapshot_download
 
-# Kimodo's own weights are a plain directory: upstream resolves a checkpoint by
-# display name under CHECKPOINT_DIR, so the directory name is load-bearing.
+# Kimodo's own weights are a plain directory: upstream names a checkpoint folder
+# after the model, so the directory name is load-bearing.
 snapshot_download(
     "nvidia/Kimodo-SOMA-RP-v1.2",
     revision="0e3c89024d896064b6851201373f7834784a386b",
     local_dir="/data/nvme0/models/animation-dev/kimodo/weights/Kimodo-SOMA-RP-v1.2",
 )
-# The encoder is resolved by repo id with HF_HUB_OFFLINE=1, so the cache ref
-# for `main` must name the pinned commit: that is what offline resolution reads.
+# The adapter loads the encoder by snapshot path, never by repo id, so the cache
+# only has to hold the pinned snapshots; refs/main must match the pin byte for
+# byte.
 for repo, revision in [
     ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp", "31474e395ada192e8ed1586db6be79fb3b70c9c0"),
     ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised", "baa8ebf04a1c2500e61288e7dad65e8ae42601a7"),
@@ -497,8 +501,8 @@ PY
 
 The adapter refuses to load a snapshot that declares no files, misses one of
 its loader files, or carries any file the profile does not declare; it also
-refuses a checkpoint whose `config.yaml` is not declared, because Hydra
-instantiates classes and picks weight paths from it. The initial profile keeps
+refuses a checkpoint whose `config.yaml` is not declared, because the config
+instantiates classes and picks weight paths. The initial profile keeps
 `helpers[0].checkpoints[0].files` empty, so a job fails closed with exit 14 and
 names the checkpoint rather than loading unverified weights.
 
@@ -629,15 +633,24 @@ standard T-pose as rest pose (`standard_tpose=True`), which is what Blender's
 BVH importer wants for retargeting. Clips run up to 10 s (300 frames at 30 fps).
 
 The checkpoint must be a local directory from the profile: `checkpoint.localPath`
-is required and must be named `Kimodo-SOMA-RP-v1.2`, because upstream resolves a
-model as `CHECKPOINT_DIR/<display name>`, so the name is load-bearing. A
-remote-only or misnamed checkpoint is `invalid_input` rather than a silent
-unpinned download. `pinned_source` verifies every declared sha256, refuses an
-undeclared weight, and requires every shard named by a weights index to be
-declared. `config.yaml` must be one of the declared files, because Hydra
-instantiates the classes (`_target_`) and the denoiser weights (`ckpt_path`)
-from it; every path the config resolves to must be a declared file inside the
-verified directory.
+is required and must be named `Kimodo-SOMA-RP-v1.2`, because upstream names a
+model folder `CHECKPOINT_DIR/<display name>`. A remote-only or misnamed
+checkpoint is `invalid_input` rather than a silent unpinned download.
+`pinned_source` verifies every declared sha256, refuses an undeclared weight,
+and requires every shard named by a weights index — including an index in a
+subdirectory, resolved against its own directory and kept inside the root — to
+be declared. `config.yaml` must be one of the declared files. It is read once,
+after its hash check, and turned into the one config Hydra instantiates: the
+adapter's own `checkpoint_dir` anchor becomes the verified directory, any other
+`${...}` resolver (`oc.env` included) is refused, every `_target_` must be one
+of the four classes the shipped config names (`kimodo.model.Kimodo`,
+`kimodo.model.twostage_denoiser.TwostageDenoiser`,
+`kimodo.motion_rep.KimodoMotionRep`, `kimodo.skeleton.SOMASkeleton30`), and
+every path it names (`ckpt_path`, `*_path`, `*_dir`, `*_file`, `stats`, and any
+value ending in `.safetensors`, `.npy`, `.pt`, `.bin`, `.json` or `.yaml`) is
+rewritten to its canonical absolute path inside the checkpoint. Upstream never
+re-reads the file, so the bytes that were verified are the bytes that are
+instantiated.
 
 The text encoder is LLM2Vec over the gated Meta-Llama-3-8B-Instruct: the base
 8B weights plus two stacked LoRA adapters (mntp, then mntp-supervised). All
@@ -645,17 +658,21 @@ three snapshots are pinned in `helpers[0].checkpoints` with full 40-hex
 revisions, resolved from the Hugging Face cache in `helpers[0].localPath`, and
 verified file by file: the loader's files (weights, shard index, config.json,
 adapter_config.json, tokenizer files, generation_config) must be declared, and
-every other file in the snapshot must be declared too. Each loader call is
-bound to the verified snapshot's absolute path; the one repo id that remains
-(the LoRA's `base_model_name_or_path`) resolves offline from the same cache, and
-`adapter_config.json` may only name the declared base. The process clears
-`TEXT_ENCODERS_DIR` and pins `HF_HOME`, `HF_HUB_CACHE`,
-`HUGGINGFACE_CACHE_DIR`, `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` to the
-verified cache, so no resolution can reach the Hub, and `TEXT_ENCODER_DEVICE` is
-pinned to the selected GPU — upstream's `TEXT_ENCODER_DEVICE=cpu` path is never
-taken. The fingerprint covers the installed `kimodo` distribution's PEP 610
-commit and the three encoder pins, so a cache entry cannot be reused across a
-source or encoder change.
+every other file in the snapshot must be declared too. `refs/main` must match
+the pin byte for byte, with no newline tolerance and no case folding, and the
+cache may hold only the three declared repositories. Everything loads by path:
+the base Llama and both LoRAs are attached from their verified absolute snapshot
+directories, so no `from_pretrained` call receives a repo id, a working-directory
+directory named like one cannot shadow it, and `adapter_config.json`'s
+`base_model_name_or_path` is only checked (it may name the declared base), never
+resolved. The process clears `TEXT_ENCODERS_DIR` and `CHECKPOINT_DIR` and pins
+`HF_HOME`, `HF_HUB_CACHE`, `HUGGINGFACE_CACHE_DIR`, `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1` to the verified cache, so no resolution can reach the
+Hub, and `TEXT_ENCODER_DEVICE` is pinned to the selected GPU — upstream's
+`TEXT_ENCODER_DEVICE=cpu` path is never taken. Frame bounds are checked against
+the config's own `fps` before any model loads. The fingerprint covers the
+installed `kimodo` distribution's PEP 610 commit and the three encoder pins, so
+a cache entry cannot be reused across a source or encoder change.
 
 ROCm: Kimodo is pure PyTorch plus that one CPU-only C++ extension, so nothing
 in it is CUDA-only. `torch.backends.cuda` TF32 and `torch.backends.cudnn` flags

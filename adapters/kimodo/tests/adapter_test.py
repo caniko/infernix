@@ -14,6 +14,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common" / "src"))
@@ -45,6 +46,7 @@ denoiser:
   _target_: kimodo.model.twostage_denoiser.TwostageDenoiser
   motion_rep:
     _target_: kimodo.motion_rep.KimodoMotionRep
+    fps: 30
     stats_path: ${oc.select:checkpoint_dir}/stats/motion/
   ckpt_path: ${oc.select:checkpoint_dir}/model.safetensors
 """
@@ -56,7 +58,7 @@ CHECKPOINT_FILES = {
     "stats/motion/body/std.npy": b"std",
 }
 LLAMA_FILES = {
-    "config.json": b'{"_name_or_path": "meta-llama/Meta-Llama-3-8B-Instruct"}',
+    "config.json": b'{"model_type": "llama", "hidden_size": 4096}',
     "generation_config.json": b'{"eos_token_id": 128001}',
     "model.safetensors.index.json": json.dumps(
         {
@@ -184,6 +186,9 @@ class FakeModel(FakeModule):
         self.output_skeleton = SOMASkeleton77()
         self.calls = []
 
+    def eval(self):
+        return self
+
     def __call__(self, prompts, num_frames, **kwargs):
         self.calls.append({"prompts": prompts, "num_frames": num_frames, **kwargs})
         frames = int(num_frames[0])
@@ -226,11 +231,12 @@ class KimodoTests(unittest.TestCase):
             self.loads.append(("encoder", snapshots))
             return FakeEncoder()
 
-        def load(checkpoint, device, encoder):
-            self.loads.append(("model", checkpoint))
+        def load(config, device, encoder):
+            self.loads.append(("model", config))
             return FakeModel()
 
         self.addCleanup(self.restore, saved)
+        self.real = {"build_text_encoder": saved[0], "load_model": saved[1]}
         adapter.build_text_encoder = encode
         adapter.load_model = load
         adapter.installed_code_commit = lambda: COMMIT
@@ -280,6 +286,25 @@ class KimodoTests(unittest.TestCase):
                 return
         self.fail(f"{relative} is not declared")
 
+    def redeclare_config(self, payload):
+        """Rewrite the checkpoint's config.yaml and update its declared hash."""
+        weights = Path(self.profile["checkpoint"]["localPath"])
+        (weights / "config.yaml").write_bytes(payload)
+        for entry in self.profile["checkpoint"]["files"]:
+            if entry["path"] == "config.yaml":
+                entry["sha256"] = digest(payload)
+                return
+        self.fail("config.yaml is not declared")
+
+    def working_directory(self):
+        """A fresh working directory, so a CWD shadow of a verified name can exist."""
+        directory = Path(tempfile.mkdtemp(prefix="kimodo-cwd-"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(directory)
+        return directory
+
     def test_writes_bvh_with_the_declared_frame_count(self):
         specs = adapter.produce(self.context())
         self.assertEqual(specs, [("motion", "motion.bvh", "application/x-bvh")])
@@ -290,7 +315,7 @@ class KimodoTests(unittest.TestCase):
 
     def test_generation_receives_the_prompt_and_frames(self):
         model = FakeModel()
-        adapter.load_model = lambda checkpoint, device, encoder: model
+        adapter.load_model = lambda config, device, encoder: model
         adapter.produce(self.context(durationSeconds=3.0))
         self.assertEqual(model.calls[0]["prompts"], ["a person walks forward and waves"])
         self.assertEqual(model.calls[0]["num_frames"], [90])
@@ -352,13 +377,17 @@ class KimodoTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.rejected(self.context(durationSeconds=value))
 
-    def test_frames_over_the_profile_limit_is_invalid(self):
-        profile = dict(self.profile, limits={"maxOutputSeconds": 10, "maxFrames": 60})
+    def test_frames_over_the_profile_limit_are_rejected_before_any_load(self):
+        profile = dict(
+            self.profile, limits={"maxOutputSeconds": 10, "maxFrames": 90}
+        )
         context = FakeContext(self.root, profile, {"prompt": "walk", "durationSeconds": 4.0})
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(context)
         self.assertEqual(caught.exception.code, 14)
-        self.assertIn("60", str(caught.exception))
+        self.assertIn("120", str(caught.exception))
+        self.assertIn("90", str(caught.exception))
+        self.assertEqual(self.loads, [], "an over-long job must not load a model")
 
     def test_non_positive_duration_is_invalid(self):
         self.rejected(self.context(durationSeconds=0))
@@ -425,6 +454,134 @@ class KimodoTests(unittest.TestCase):
             adapter.verified_checkpoint(self.profile)
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("extra.npy", str(caught.exception))
+
+    def test_config_paths_resolve_to_the_verified_checkpoint(self):
+        checkpoint, config = adapter.verified_checkpoint(self.profile)
+        root = os.path.realpath(checkpoint)
+        self.assertEqual(
+            config["denoiser"]["ckpt_path"], os.path.join(root, "model.safetensors")
+        )
+        self.assertEqual(
+            config["denoiser"]["motion_rep"]["stats_path"],
+            os.path.join(root, "stats", "motion"),
+        )
+        self.assertNotIn("${", json.dumps(config))
+        self.assertNotIn("checkpoint_dir", config)
+        # A bare filename is a path too: it is rewritten to the verified file,
+        # not to a same-named file in the working directory.
+        shadow = self.working_directory() / "model.safetensors"
+        shadow.write_bytes(b"shadow")
+        self.redeclare_config(b"denoiser:\n  ckpt_path: model.safetensors\n")
+        _, bare = adapter.verified_checkpoint(self.profile)
+        self.assertEqual(
+            bare["denoiser"]["ckpt_path"], os.path.join(root, "model.safetensors")
+        )
+        self.assertNotEqual(bare["denoiser"]["ckpt_path"], str(shadow))
+
+    def test_config_bare_undeclared_checkpoint_path_is_refused(self):
+        # A bare filename resolves inside the verified checkpoint, never the CWD,
+        # so a file with that name in the working directory cannot satisfy it.
+        self.working_directory().joinpath("other.safetensors").write_bytes(b"shadow")
+        self.redeclare_config(b"denoiser:\n  ckpt_path: other.safetensors\n")
+        with self.assertRaises(AdapterError) as caught:
+            adapter.verified_checkpoint(self.profile)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("does not declare", str(caught.exception))
+        self.assertIn("other.safetensors", str(caught.exception))
+
+    def test_config_interpolation_is_refused(self):
+        self.redeclare_config(b"denoiser:\n  ckpt_path: ${oc.env:KIMODO_CKPT}\n")
+        with self.assertRaises(AdapterError) as caught:
+            adapter.verified_checkpoint(self.profile)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("interpolation", str(caught.exception))
+
+    def test_config_may_only_instantiate_the_shipped_classes(self):
+        self.redeclare_config(
+            b"denoiser:\n  ckpt_path: model.safetensors\n"
+            b"  reader:\n    _target_: pathlib.Path.read_text\n"
+        )
+        with self.assertRaises(AdapterError) as caught:
+            adapter.verified_checkpoint(self.profile)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("pathlib.Path.read_text", str(caught.exception))
+
+    def test_model_is_instantiated_from_the_resolved_config_without_a_reread(self):
+        import kimodo.model.loading as loading
+
+        checkpoint, config = adapter.verified_checkpoint(self.profile)
+        # The file is gone; a load that re-read it would fail.
+        (Path(checkpoint) / "config.yaml").unlink()
+        captured = {}
+
+        def instantiate(cfg, overrides=None):
+            captured["config"] = cfg
+            captured["overrides"] = overrides
+            return FakeModel()
+
+        encoder = FakeEncoder()
+        with mock.patch.object(loading, "instantiate_from_dict", instantiate):
+            model = self.real["load_model"](config, "cuda:0", encoder)
+        self.assertEqual(captured["overrides"], {"device": "cuda:0"})
+        self.assertIsNone(captured["config"]["text_encoder"])
+        self.assertEqual(
+            captured["config"]["denoiser"]["ckpt_path"],
+            os.path.join(os.path.realpath(checkpoint), "model.safetensors"),
+        )
+        self.assertIs(model.text_encoder, encoder)
+
+    def test_snapshot_ref_with_a_trailing_newline_is_refused(self):
+        pin = self.helper()["checkpoints"][0]
+        ref = (
+            Path(self.helper()["localPath"])
+            / "hub"
+            / f"models--{pin['repo'].replace('/', '--')}"
+            / "refs"
+            / "main"
+        )
+        ref.write_bytes(pin["revision"].encode() + b"\n")
+        with self.assertRaises(AdapterError) as caught:
+            adapter.verify_snapshots(self.helper())
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("byte for byte", str(caught.exception))
+
+    def test_text_encoder_loads_the_base_and_both_loras_by_path(self):
+        import kimodo.model.llm2vec as llm2vec_module
+        import peft
+
+        shadow = self.working_directory() / adapter.LLM2VEC
+        shadow.mkdir(parents=True)
+        (shadow / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "attacker/model"})
+        )
+        snapshots = adapter.verify_snapshots(self.helper())
+        loaded = {"kwargs": None, "stacks": []}
+
+        class Recorder:
+            def __init__(self, **kwargs):
+                loaded["kwargs"] = kwargs
+                self.model = types.SimpleNamespace(model="llama")
+
+        def stack(model, path):
+            loaded["stacks"].append((model, path))
+            return f"stacked:{path}"
+
+        with (
+            mock.patch.object(llm2vec_module, "LLM2VecEncoder", Recorder),
+            mock.patch.object(peft.PeftModel, "from_pretrained", stack),
+        ):
+            self.real["build_text_encoder"]("cuda:0", snapshots)
+        self.assertEqual(loaded["kwargs"]["base_model_name_or_path"], snapshots[adapter.BASE_LLAMA])
+        self.assertEqual(
+            loaded["kwargs"]["peft_model_name_or_path"], snapshots[adapter.LLM2VEC]
+        )
+        self.assertEqual(
+            loaded["stacks"],
+            [("llama", snapshots[adapter.LLM2VEC_SUPERVISED])],
+        )
+        for path in snapshots.values():
+            self.assertTrue(Path(path).is_absolute())
+            self.assertNotEqual(Path(path), shadow)
 
     def test_undeclared_shard_under_a_symlinked_directory_is_refused(self):
         elsewhere = self.root / "elsewhere"

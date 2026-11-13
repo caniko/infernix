@@ -1194,6 +1194,32 @@ class CheckpointTests(Harness):
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("model-00002-of-00002.safetensors", str(caught.exception))
 
+    def test_a_nested_weight_index_cannot_escape_the_checkpoint(self):
+        root = self.directory / "nested"
+        (root / "layers").mkdir(parents=True)
+        (self.directory / "outside.safetensors").write_bytes(b"outside")
+        index = root / "layers" / "model.safetensors.index.json"
+        index.write_text(
+            json.dumps({"weight_map": {"layer.0": "../../outside.safetensors"}})
+        )
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.index_referenced_files(root)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("escapes", str(caught.exception))
+        self.assertIn("outside.safetensors", str(caught.exception))
+
+    def test_a_nested_weight_index_resolves_against_its_own_directory(self):
+        root = self.directory / "relative"
+        (root / "layers").mkdir(parents=True)
+        (root / "layers" / "shard.safetensors").write_bytes(b"shard")
+        (root / "layers" / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"layer.0": "shard.safetensors"}})
+        )
+        self.assertEqual(
+            checkpoint.index_referenced_files(root),
+            {"layers/shard.safetensors"},
+        )
+
     def test_a_directory_can_require_every_file_to_be_declared(self):
         root = self.directory / "snapshot"
         root.mkdir()

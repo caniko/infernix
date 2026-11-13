@@ -66,6 +66,12 @@ def _verify_entries(root, entries):
 
     A Hugging Face cache stores every snapshot file as a symlink into `blobs/`,
     so the hash is taken from the realpath target the adapter will load.
+
+    ponytail: verification and loading reopen paths, so a writer that can reach
+    the verified tree could swap bytes in between (TOCTOU). Accepted: the
+    production model root is owned by infernix-worker, the job's own user, so no
+    other user can write it. Upgrade path: load from an immutable verified
+    staging copy instead of reopening the source tree.
     """
     for entry in entries:
         relative = entry.get("path")
@@ -86,10 +92,17 @@ def verify_files(profile, directory):
 
 
 def index_referenced_files(directory):
-    """Every shard a weight index names, relative to `directory`."""
+    """Every shard a weight index names, relative to `directory`.
+
+    Indexes are discovered recursively, and each shard resolves against the
+    directory holding its own index. The result must stay inside the checkpoint
+    root, so a nested index cannot point `../../outside.safetensors` at a file
+    the profile never declared.
+    """
     root = Path(directory)
+    root_real = Path(os.path.realpath(root))
     referenced = set()
-    for index in sorted(root.glob(f"*{INDEX_SUFFIX}")):
+    for index in sorted(root.rglob(f"*{INDEX_SUFFIX}")):
         try:
             document = json.loads(index.read_text())
         except (OSError, ValueError) as error:
@@ -98,14 +111,20 @@ def index_referenced_files(directory):
         if not isinstance(weight_map, dict) or not weight_map:
             raise invalid(f"weight index {index.name} declares no weight_map")
         for shard in weight_map.values():
-            if (
-                not isinstance(shard, str)
-                or not shard
-                or shard in (".", "..")
-                or "/" in shard
-            ):
+            if not isinstance(shard, str) or not shard:
                 raise invalid(f"weight index {index.name} names an invalid shard {shard!r}")
-            referenced.add(shard)
+            resolved = Path(os.path.realpath(index.parent / shard))
+            if resolved != root_real and root_real not in resolved.parents:
+                raise invalid(
+                    f"weight index {index.name} names shard {shard!r}, which escapes "
+                    f"the checkpoint root {root}"
+                )
+            if not resolved.is_file():
+                raise invalid(
+                    f"weight index {index.name} names shard {shard!r}, which is not "
+                    "a file in the checkpoint"
+                )
+            referenced.add(resolved.relative_to(root_real).as_posix())
     return referenced
 
 

@@ -778,10 +778,13 @@ dependencies = [
  "chrono",
  "clap",
  "infernix-workload",
+ "infernix-workload-testing",
+ "libc",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
- "tokio-postgres",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -793,9 +796,21 @@ name = "infernix-workload"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "infernix-workload-testing",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "infernix-workload-testing"
+version = "0.1.0"
+dependencies = [
+ "infernix-workload",
  "uuid",
 ]
 

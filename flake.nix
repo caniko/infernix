@@ -113,6 +113,9 @@
         version = "0.1.0";
         strictDeps = true;
         cargoExtraArgs = "-p ${packageName}";
+        # The ledger integration tests start a throwaway cluster with
+        # initdb/pg_ctl, so the check phase needs the server binaries.
+        nativeCheckInputs = [pkgs.postgresql];
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
     in
@@ -368,7 +371,9 @@
       cross = harbor-rs.lib.mkCross {inherit pkgs system;};
     in {
       default = toolchain.craneLib.devShell {
-        packages = [pkgs.pkg-config pkgs.openssl];
+        # postgresql is not a build input: the ledger integration tests start a
+        # throwaway cluster with initdb/pg_ctl.
+        packages = [pkgs.pkg-config pkgs.postgresql pkgs.openssl];
       };
       docs = harbor-rs.lib.mkDocsShell {
         inherit pkgs cross;

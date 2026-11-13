@@ -15,6 +15,9 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
 /// Errors returned at the workload-coordination boundary.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -37,6 +40,10 @@ pub enum WorkloadError {
     StaleLease { job: String },
     #[error("job `{0}` is already terminal")]
     TerminalJob(String),
+    #[error("cancellation for job `{job}` was not requested")]
+    CancelNotRequested { job: String },
+    #[error("job `{job}` was not completed by worker `{worker}`")]
+    NotCompletedBy { job: String, worker: String },
     #[error("invalid workload profile field `{field}`")]
     InvalidProfile { field: &'static str },
 }
@@ -345,6 +352,37 @@ pub enum JobState {
     Cancelled,
 }
 
+/// Error text recorded when a job exhausts its busy-release budget.
+pub const RESOURCE_BUSY: &str = "resource_busy";
+
+impl JobState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Leased => "leased",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "leased" => Some(Self::Leased),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// Terminal states are never claimed, cancelled twice, or completed again.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct JobRecord {
     pub spec: JobSpec,
@@ -353,6 +391,89 @@ pub struct JobRecord {
     pub lease: Option<Lease>,
     pub result: Option<Value>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub delivered_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub not_before: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub busy_releases: u32,
+}
+
+impl JobRecord {
+    pub fn status(&self) -> JobStatus {
+        JobStatus {
+            job_id: self.spec.id.clone(),
+            workload: self.spec.workload.clone(),
+            queue: self.spec.queue.clone(),
+            input_fingerprint: self.spec.input_fingerprint.as_str().to_owned(),
+            state: self.state,
+            attempts: self.attempts,
+            result: self.result.clone(),
+            error: self.error.clone(),
+            cancel_requested_at: self.cancel_requested_at,
+            delivered_at: self.delivered_at,
+        }
+    }
+}
+
+/// Public, serializable view of one ledger row (spec section 1 `STATUS`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStatus {
+    pub job_id: JobId,
+    pub workload: String,
+    pub queue: String,
+    pub input_fingerprint: String,
+    pub state: JobState,
+    pub attempts: u32,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// Result of the `CANCEL` contract. The caller maps `previous_state` onto the
+/// hub cancel outcome: `pending` is a dequeue, a terminal state is already
+/// finished, and anything else is an in-flight interruption.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelOutcome {
+    pub previous_state: JobState,
+    pub state: JobState,
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+}
+
+/// Result of the `RELEASE_BUSY` contract.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BusyReleaseOutcome {
+    Released {
+        attempts: u32,
+        busy_releases: u32,
+        not_before: DateTime<Utc>,
+    },
+    Exhausted {
+        busy_releases: u32,
+    },
+    /// The job was cancelled while the adapter was busy; the cancel wins over
+    /// the retry so the job cannot sit unclaimable in `pending`.
+    Cancelled {
+        busy_releases: u32,
+    },
+}
+
+/// Result of a heartbeated lease renewal.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HeartbeatOutcome {
+    Renewed {
+        cancel_requested_at: Option<DateTime<Utc>>,
+    },
+    /// The lease generation is gone: another worker owns the job, the job is
+    /// terminal, or the lease expired.
+    Fenced,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -363,6 +484,17 @@ pub struct Lease {
     pub token: LeaseToken,
     pub attempt: u32,
     pub expires_at: DateTime<Utc>,
+}
+
+/// One claimed job: the lease plus the immutable spec fields the worker needs
+/// to build an adapter envelope.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClaimedJob {
+    pub lease: Lease,
+    pub workload: String,
+    pub queue: String,
+    pub input_fingerprint: String,
+    pub payload: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -442,6 +574,10 @@ impl InMemoryQueue {
                 lease: None,
                 result: None,
                 error: None,
+                cancel_requested_at: None,
+                delivered_at: None,
+                not_before: None,
+                busy_releases: 0,
             },
         );
         Ok(EnqueueOutcome::Created(id))
@@ -483,6 +619,8 @@ impl InMemoryQueue {
             .jobs
             .values_mut()
             .filter(|record| record.state == JobState::Pending)
+            .filter(|record| record.cancel_requested_at.is_none())
+            .filter(|record| record.not_before.is_none_or(|not_before| not_before <= now))
             .filter(|record| record.spec.requirements.is_subset(&worker.capabilities))
             .filter(|record| record.attempts < record.spec.max_attempts)
             .min_by(|left, right| {
@@ -515,7 +653,7 @@ impl InMemoryQueue {
         lease: &Lease,
         now: DateTime<Utc>,
         lease_duration: Duration,
-    ) -> Result<(), WorkloadError> {
+    ) -> Result<HeartbeatOutcome, WorkloadError> {
         let mut state = self.lock_state();
         let record = state
             .jobs
@@ -525,7 +663,9 @@ impl InMemoryQueue {
         if let Some(current) = record.lease.as_mut() {
             current.expires_at = now + lease_duration;
         }
-        Ok(())
+        Ok(HeartbeatOutcome::Renewed {
+            cancel_requested_at: record.cancel_requested_at,
+        })
     }
 
     pub fn complete(
@@ -542,7 +682,14 @@ impl InMemoryQueue {
         record.state = JobState::Succeeded;
         record.result = Some(completion.artifact);
         record.error = None;
-        record.lease = None;
+        // The completing worker stays recorded so `MARK_DELIVERED` can be
+        // fenced on it. The token itself is retired with the lease.
+        record.lease = Some(Lease {
+            token: LeaseToken::random(),
+            ..lease.clone()
+        });
+        record.not_before = None;
+        record.attempts = record.attempts.max(1);
         Ok(CompletionOutcome::Accepted)
     }
 
@@ -555,7 +702,11 @@ impl InMemoryQueue {
         ensure_current_lease(record, lease)?;
         record.error = Some(error.into());
         record.lease = None;
-        record.state = if record.attempts < record.spec.max_attempts {
+        record.not_before = None;
+        record.state = if record.cancel_requested_at.is_some() {
+            // A cancellation outranks a retry: nothing will ever claim it.
+            JobState::Cancelled
+        } else if record.attempts < record.spec.max_attempts {
             JobState::Pending
         } else {
             JobState::Failed
@@ -563,8 +714,189 @@ impl InMemoryQueue {
         Ok(())
     }
 
+    /// `CANCEL`: a pending job is cancelled immediately, a leased job keeps
+    /// its state until the worker confirms, and a terminal job is a no-op.
+    pub fn cancel(
+        &self,
+        job_id: &JobId,
+        now: DateTime<Utc>,
+    ) -> Result<CancelOutcome, WorkloadError> {
+        let mut state = self.lock_state();
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| WorkloadError::UnknownJob(job_id.as_str().to_owned()))?;
+        let previous_state = record.state;
+        if previous_state.is_terminal() {
+            return Ok(CancelOutcome {
+                previous_state,
+                state: previous_state,
+                cancel_requested_at: record.cancel_requested_at,
+            });
+        }
+        if record.cancel_requested_at.is_none() {
+            record.cancel_requested_at = Some(now);
+        }
+        if record.state == JobState::Pending {
+            record.state = JobState::Cancelled;
+            record.not_before = None;
+        }
+        Ok(CancelOutcome {
+            previous_state,
+            state: record.state,
+            cancel_requested_at: record.cancel_requested_at,
+        })
+    }
+
+    /// `CONFIRM_CANCELLED`: fenced on the live lease generation.
+    pub fn confirm_cancelled(
+        &self,
+        lease: &Lease,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkloadError> {
+        let mut state = self.lock_state();
+        let record = state
+            .jobs
+            .get_mut(&lease.job_id)
+            .ok_or_else(|| WorkloadError::UnknownJob(lease.job_id.as_str().to_owned()))?;
+        if record.cancel_requested_at.is_none() {
+            return Err(WorkloadError::CancelNotRequested {
+                job: lease.job_id.as_str().to_owned(),
+            });
+        }
+        if record.state == JobState::Leased {
+            ensure_current_lease(record, lease)?;
+        } else if record.state.is_terminal() {
+            return Ok(());
+        }
+        record.state = JobState::Cancelled;
+        record.lease = None;
+        record.not_before = None;
+        record.cancel_requested_at = record.cancel_requested_at.or(Some(now));
+        Ok(())
+    }
+
+    /// `RELEASE_BUSY`: return a leased job to `pending` without consuming the
+    /// attempt. After `max_busy_releases`, the job fails as `resource_busy`.
+    pub fn release_busy(
+        &self,
+        lease: &Lease,
+        now: DateTime<Utc>,
+        retry_delay: Duration,
+        max_busy_releases: u32,
+    ) -> Result<BusyReleaseOutcome, WorkloadError> {
+        let mut state = self.lock_state();
+        let record = state
+            .jobs
+            .get_mut(&lease.job_id)
+            .ok_or_else(|| WorkloadError::UnknownJob(lease.job_id.as_str().to_owned()))?;
+        ensure_current_lease(record, lease)?;
+        record.busy_releases += 1;
+        record.attempts = record.attempts.saturating_sub(1);
+        record.lease = None;
+        record.not_before = None;
+        if record.cancel_requested_at.is_some() {
+            record.state = JobState::Cancelled;
+            return Ok(BusyReleaseOutcome::Cancelled {
+                busy_releases: record.busy_releases,
+            });
+        }
+        if record.busy_releases > max_busy_releases {
+            record.state = JobState::Failed;
+            record.error = Some(RESOURCE_BUSY.to_owned());
+            return Ok(BusyReleaseOutcome::Exhausted {
+                busy_releases: record.busy_releases,
+            });
+        }
+        let not_before = now + retry_delay;
+        record.state = JobState::Pending;
+        record.not_before = Some(not_before);
+        Ok(BusyReleaseOutcome::Released {
+            attempts: record.attempts,
+            busy_releases: record.busy_releases,
+            not_before,
+        })
+    }
+
+    /// `MARK_DELIVERED`: fenced on the worker that completed the job.
+    pub fn mark_delivered(
+        &self,
+        job_id: &JobId,
+        worker_id: &WorkerId,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkloadError> {
+        let mut state = self.lock_state();
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| WorkloadError::UnknownJob(job_id.as_str().to_owned()))?;
+        ensure_completing_worker(record, worker_id)?;
+        if record.delivered_at.is_none() {
+            record.delivered_at = Some(now);
+        }
+        Ok(())
+    }
+
+    /// Fail a `succeeded` job whose retained staging is gone, so the hub never
+    /// reports it as delivered.
+    pub fn mark_delivery_failed(
+        &self,
+        job_id: &JobId,
+        worker_id: &WorkerId,
+        reason: impl Into<String>,
+    ) -> Result<(), WorkloadError> {
+        let mut state = self.lock_state();
+        let record = state
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| WorkloadError::UnknownJob(job_id.as_str().to_owned()))?;
+        ensure_completing_worker(record, worker_id)?;
+        if record.delivered_at.is_some() {
+            return Ok(());
+        }
+        record.state = JobState::Failed;
+        record.error = Some(reason.into());
+        record.lease = None;
+        Ok(())
+    }
+
+    /// `STATUS` by `(workload, queue, input_fingerprint)`, used for adoption.
+    pub fn find(
+        &self,
+        workload: &str,
+        queue: &str,
+        fingerprint: &InputFingerprint,
+    ) -> Option<JobRecord> {
+        self.lock_state()
+            .jobs
+            .values()
+            .find(|record| {
+                record.spec.workload == workload
+                    && record.spec.queue == queue
+                    && record.spec.input_fingerprint == *fingerprint
+            })
+            .cloned()
+    }
+
     pub fn get(&self, job_id: &JobId) -> Option<JobRecord> {
         self.lock_state().jobs.get(job_id).cloned()
+    }
+
+    /// `succeeded` jobs whose artifacts are not yet delivered by this worker.
+    pub fn undelivered_succeeded(&self, worker_id: &WorkerId) -> Vec<JobRecord> {
+        self.lock_state()
+            .jobs
+            .values()
+            .filter(|record| {
+                record.state == JobState::Succeeded
+                    && record.delivered_at.is_none()
+                    && record
+                        .lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.worker_id == *worker_id)
+            })
+            .cloned()
+            .collect()
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -592,8 +924,26 @@ fn ensure_current_lease(record: &JobRecord, lease: &Lease) -> Result<(), Workloa
     Ok(())
 }
 
+fn ensure_completing_worker(record: &JobRecord, worker_id: &WorkerId) -> Result<(), WorkloadError> {
+    let owned = record.state == JobState::Succeeded
+        && record
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.worker_id == *worker_id);
+    if !owned {
+        return Err(WorkloadError::NotCompletedBy {
+            job: record.spec.id.as_str().to_owned(),
+            worker: worker_id.as_str().to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn expire_leases(state: &mut QueueState, now: DateTime<Utc>) {
     for record in state.jobs.values_mut() {
+        if record.state != JobState::Leased {
+            continue;
+        }
         let expired = record
             .lease
             .as_ref()
@@ -602,16 +952,26 @@ fn expire_leases(state: &mut QueueState, now: DateTime<Utc>) {
             continue;
         }
         record.lease = None;
-        record.state = if record.attempts < record.spec.max_attempts {
-            JobState::Pending
+        record.not_before = None;
+        if record.cancel_requested_at.is_some() {
+            // An expired lease on a cancelled job has no adapter left to
+            // confirm; the ledger owns the cancellation.
+            record.state = JobState::Cancelled;
         } else {
-            JobState::Failed
-        };
+            record.state = if record.attempts < record.spec.max_attempts {
+                JobState::Pending
+            } else {
+                JobState::Failed
+            };
+        }
     }
 }
 
 /// SQL contracts consumed by the eventual PostgreSQL-backed worker.
 pub mod sql {
+    /// Name recorded when the busy-release budget is exhausted.
+    pub const RESOURCE_BUSY: &str = super::RESOURCE_BUSY;
+
     /// PostgreSQL schema for durable workload coordination.
     pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS infernix_workload_jobs (
@@ -631,6 +991,10 @@ CREATE TABLE IF NOT EXISTS infernix_workload_jobs (
     lease_expires_at TIMESTAMPTZ,
     result JSONB,
     error TEXT,
+    cancel_requested_at TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ,
+    not_before TIMESTAMPTZ,
+    busy_releases INTEGER NOT NULL DEFAULT 0 CHECK (busy_releases >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (workload, queue, input_fingerprint)
@@ -650,13 +1014,50 @@ CREATE TABLE IF NOT EXISTS infernix_workload_workers (
 );
 "#;
 
+    /// Additive, idempotent upgrades for ledgers created before the lease and
+    /// delivery contracts existed. Run after [`SCHEMA`].
+    pub const MIGRATIONS: &str = r#"
+ALTER TABLE infernix_workload_jobs
+    ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ;
+ALTER TABLE infernix_workload_jobs
+    ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+ALTER TABLE infernix_workload_jobs
+    ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;
+ALTER TABLE infernix_workload_jobs
+    ADD COLUMN IF NOT EXISTS busy_releases INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS infernix_workload_jobs_delivery_idx
+    ON infernix_workload_jobs (lease_owner)
+    WHERE state = 'succeeded' AND delivered_at IS NULL;
+"#;
+
+    /// Register or refresh a worker row for this boot.
+    pub const WORKER_UPSERT: &str = r#"
+INSERT INTO infernix_workload_workers
+    (id, boot_id, capabilities, concurrency, drained)
+VALUES ($1, $2, $3, $4, FALSE)
+ON CONFLICT (id, boot_id) DO UPDATE SET
+    capabilities = EXCLUDED.capabilities,
+    concurrency = EXCLUDED.concurrency,
+    drained = FALSE,
+    last_heartbeat = now();
+"#;
+
+    /// Stop a worker from receiving new leases without abandoning its current job.
+    pub const WORKER_DRAIN: &str = r#"
+UPDATE infernix_workload_workers
+   SET drained = TRUE, last_heartbeat = now()
+ WHERE id = $1 AND boot_id = $2;
+"#;
+
     /// The claim is one atomic statement. The lease token is generated by the
     /// caller so it can be carried through the adapter envelope.
     ///
     /// `$6`/`$7` are parallel arrays of the worker's `(workload, queue)`
     /// adapter pairs, so a job is claimable only by a worker that can run it.
     /// Like the in-memory queue, an expired lease is claimable again while
-    /// attempts remain and is marked failed once they are exhausted.
+    /// attempts remain and is marked failed once they are exhausted. A job
+    /// whose cancellation was requested is never claimed; its expired lease is
+    /// resolved to `cancelled` because no adapter remains to confirm it.
     pub const CLAIM: &str = r#"
 WITH exhausted AS (
     UPDATE infernix_workload_jobs
@@ -669,13 +1070,29 @@ WITH exhausted AS (
            updated_at = now()
      WHERE state = 'leased'
        AND lease_expires_at <= now()
+       AND cancel_requested_at IS NULL
        AND attempts >= max_attempts
+),
+cancel_expired AS (
+    UPDATE infernix_workload_jobs
+       SET state = 'cancelled',
+           not_before = NULL,
+           lease_owner = NULL,
+           lease_boot_id = NULL,
+           lease_token = NULL,
+           lease_expires_at = NULL,
+           updated_at = now()
+     WHERE state = 'leased'
+       AND lease_expires_at <= now()
+       AND cancel_requested_at IS NOT NULL
 ),
 candidate AS (
     SELECT id
       FROM infernix_workload_jobs
      WHERE (state = 'pending'
             OR (state = 'leased' AND lease_expires_at <= now()))
+       AND cancel_requested_at IS NULL
+       AND (not_before IS NULL OR not_before <= now())
        AND requirements <@ $3::text[]
        AND attempts < max_attempts
        AND (workload, queue) IN (
@@ -705,7 +1122,8 @@ UPDATE infernix_workload_jobs AS job
 RETURNING job.*;
 "#;
 
-    /// Heartbeats are fenced by worker, boot, and lease token.
+    /// Heartbeats are fenced by worker, boot, and lease token. The cancel flag
+    /// travels back with the renewal so the worker needs no second query.
     pub const HEARTBEAT: &str = r#"
 UPDATE infernix_workload_jobs
    SET lease_expires_at = $5, updated_at = now()
@@ -714,7 +1132,8 @@ UPDATE infernix_workload_jobs
    AND lease_owner = $2
    AND lease_boot_id = $3
    AND lease_token = $4
-   AND lease_expires_at > now();
+   AND lease_expires_at > now()
+RETURNING cancel_requested_at;
 "#;
 
     /// Worker liveness is separate from job lease renewal so a drained worker
@@ -727,15 +1146,16 @@ UPDATE infernix_workload_workers
    AND drained = FALSE;
 "#;
 
-    /// Completion is accepted only for the current lease generation.
+    /// Completion is accepted only for the current lease generation. The
+    /// completing worker and boot stay recorded so `MARK_DELIVERED` can be
+    /// fenced on them; the lease token is retired.
     pub const COMPLETE: &str = r#"
 UPDATE infernix_workload_jobs
    SET state = 'succeeded',
        result = $5,
-       lease_owner = NULL,
-       lease_boot_id = NULL,
        lease_token = NULL,
        lease_expires_at = NULL,
+       not_before = NULL,
        error = NULL,
        updated_at = now()
  WHERE id = $1
@@ -743,6 +1163,178 @@ UPDATE infernix_workload_jobs
    AND lease_owner = $2
    AND lease_boot_id = $3
    AND lease_token = $4;
+"#;
+
+    /// `CANCEL`. A pending job is cancelled immediately, a leased job keeps its
+    /// state until the worker confirms, and a terminal job is a no-op. One
+    /// statement returns the previous and the resulting state.
+    pub const CANCEL: &str = r#"
+WITH target AS (
+    SELECT id, state, cancel_requested_at
+      FROM infernix_workload_jobs
+     WHERE id = $1
+       FOR UPDATE
+), changed AS (
+    UPDATE infernix_workload_jobs AS job
+       SET cancel_requested_at = COALESCE(job.cancel_requested_at, now()),
+           state = CASE WHEN job.state = 'pending' THEN 'cancelled' ELSE job.state END,
+           not_before = CASE WHEN job.state = 'pending' THEN NULL ELSE job.not_before END,
+           updated_at = now()
+      FROM target
+     WHERE job.id = target.id
+       AND job.state IN ('pending', 'leased')
+    RETURNING job.state AS state, job.cancel_requested_at AS cancel_requested_at
+)
+SELECT target.state AS previous_state,
+       COALESCE(changed.state, target.state) AS state,
+       COALESCE(changed.cancel_requested_at, target.cancel_requested_at) AS cancel_requested_at
+  FROM target
+  LEFT JOIN changed ON TRUE;
+"#;
+
+    /// `CONFIRM_CANCELLED`: fenced on worker + boot + token, applied once the
+    /// adapter process group has exited.
+    pub const CONFIRM_CANCELLED: &str = r#"
+UPDATE infernix_workload_jobs
+   SET state = 'cancelled',
+       cancel_requested_at = COALESCE(cancel_requested_at, now()),
+       not_before = NULL,
+       lease_owner = NULL,
+       lease_boot_id = NULL,
+       lease_token = NULL,
+       lease_expires_at = NULL,
+       updated_at = now()
+ WHERE id = $1
+   AND state IN ('pending', 'leased')
+   AND cancel_requested_at IS NOT NULL
+   AND (lease_token IS NULL
+        OR (lease_owner = $2 AND lease_boot_id = $3 AND lease_token = $4));
+"#;
+
+    /// `RELEASE_BUSY`: fenced. Returns a leased job to `pending` without
+    /// consuming the attempt, after a short `not_before` delay. The release
+    /// budget (`$6`) is the worker's `max_busy_releases`.
+    pub const RELEASE_BUSY: &str = r#"
+UPDATE infernix_workload_jobs
+   SET busy_releases = busy_releases + 1,
+       attempts = GREATEST(attempts - 1, 0),
+       state = CASE
+                   WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
+                   WHEN busy_releases + 1 > $6 THEN 'failed'
+                   ELSE 'pending'
+               END,
+       error = CASE WHEN busy_releases + 1 > $6 THEN 'resource_busy' ELSE error END,
+       not_before = CASE
+                        WHEN cancel_requested_at IS NOT NULL THEN NULL
+                        WHEN busy_releases + 1 > $6 THEN NULL
+                        ELSE $5::timestamptz
+                    END,
+       lease_owner = NULL,
+       lease_boot_id = NULL,
+       lease_token = NULL,
+       lease_expires_at = NULL,
+       updated_at = now()
+ WHERE id = $1
+   AND state = 'leased'
+   AND lease_owner = $2
+   AND lease_boot_id = $3
+   AND lease_token = $4
+RETURNING state, attempts, busy_releases, not_before;
+"#;
+
+    /// `MARK_DELIVERED`: fenced on the worker that completed the job.
+    ///
+    /// The boot id is deliberately not part of the fence: restart recovery must
+    /// finish delivery after a reboot, and the upload itself is idempotent
+    /// (an identical replay is accepted by the hub).
+    pub const MARK_DELIVERED: &str = r#"
+UPDATE infernix_workload_jobs
+   SET delivered_at = COALESCE(delivered_at, now()), updated_at = now()
+ WHERE id = $1
+   AND state = 'succeeded'
+   AND lease_owner = $2
+   AND delivered_at IS NULL;
+"#;
+
+    /// A `succeeded` job whose retained staging disappeared fails instead of
+    /// being reported as delivered forever.
+    pub const FAIL_AFTER_COMPLETION: &str = r#"
+UPDATE infernix_workload_jobs
+   SET state = 'failed',
+       error = $3,
+       delivered_at = NULL,
+       updated_at = now()
+ WHERE id = $1
+   AND state = 'succeeded'
+   AND delivered_at IS NULL
+   AND lease_owner = $2;
+"#;
+
+    /// `STATUS` by job id.
+    pub const STATUS: &str = r#"
+SELECT id, workload, queue, input_fingerprint, state, attempts, result, error,
+       cancel_requested_at, delivered_at
+  FROM infernix_workload_jobs
+ WHERE id = $1;
+"#;
+
+    /// `STATUS` by generation identity, used for adoption.
+    pub const STATUS_BY_FINGERPRINT: &str = r#"
+SELECT id, workload, queue, input_fingerprint, state, attempts, result, error,
+       cancel_requested_at, delivered_at
+  FROM infernix_workload_jobs
+ WHERE workload = $1 AND queue = $2 AND input_fingerprint = $3;
+"#;
+
+    /// `succeeded` jobs this worker must still deliver, oldest first.
+    pub const UNDELIVERED_SUCCEEDED: &str = r#"
+SELECT id, workload, queue, input_fingerprint, state, attempts, result, error,
+       cancel_requested_at, delivered_at
+  FROM infernix_workload_jobs
+ WHERE state = 'succeeded'
+   AND delivered_at IS NULL
+   AND lease_owner = $1
+ ORDER BY updated_at ASC, id ASC;
+"#;
+
+    /// A normal adapter failure: retry while attempts remain.
+    pub const FAIL: &str = r#"
+UPDATE infernix_workload_jobs
+   SET state = CASE
+                   WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
+                   WHEN attempts < max_attempts THEN 'pending'
+                   ELSE 'failed'
+               END,
+       error = $5,
+       not_before = NULL,
+       lease_owner = NULL,
+       lease_boot_id = NULL,
+       lease_token = NULL,
+       lease_expires_at = NULL,
+       updated_at = now()
+ WHERE id = $1
+   AND state = 'leased'
+   AND lease_owner = $2
+   AND lease_boot_id = $3
+   AND lease_token = $4
+RETURNING state;
+"#;
+
+    /// Idempotent enqueue by generation identity.
+    pub const ENQUEUE: &str = r#"
+INSERT INTO infernix_workload_jobs
+    (id, workload, queue, input_fingerprint, payload, priority,
+     requirements, max_attempts, state)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+ON CONFLICT (workload, queue, input_fingerprint) DO NOTHING
+RETURNING id;
+"#;
+
+    /// The idempotency fallback when [`ENQUEUE`] inserted nothing.
+    pub const ENQUEUE_EXISTING: &str = r#"
+SELECT id
+  FROM infernix_workload_jobs
+ WHERE workload = $1 AND queue = $2 AND input_fingerprint = $3;
 "#;
 }
 
@@ -896,6 +1488,324 @@ mod tests {
         assert!(sql::CLAIM.contains("worker.drained = FALSE"));
         assert!(sql::COMPLETE.contains("lease_boot_id = $3"));
         assert!(sql::SCHEMA.contains("UNIQUE (workload, queue, input_fingerprint)"));
+    }
+
+    #[test]
+    fn sql_migrations_are_additive_and_idempotent() {
+        for column in [
+            "cancel_requested_at",
+            "delivered_at",
+            "not_before",
+            "busy_releases",
+        ] {
+            assert!(
+                sql::MIGRATIONS.contains(&format!("ADD COLUMN IF NOT EXISTS {column}")),
+                "migration must add {column} idempotently"
+            );
+            assert!(sql::SCHEMA.contains(column));
+        }
+        assert!(sql::CLAIM.contains("not_before IS NULL OR not_before <= now()"));
+        assert!(sql::CLAIM.contains("cancel_requested_at IS NULL"));
+        assert!(sql::HEARTBEAT.contains("RETURNING cancel_requested_at"));
+        assert!(sql::RELEASE_BUSY.contains("GREATEST(attempts - 1, 0)"));
+        assert!(sql::MARK_DELIVERED.contains("state = 'succeeded'"));
+    }
+
+    fn claim_one(queue: &InMemoryQueue) -> Lease {
+        queue.register_worker(worker("atlas", &[])).ok();
+        queue
+            .claim(
+                &WorkerId::new("atlas").unwrap(),
+                Utc::now(),
+                Duration::minutes(5),
+            )
+            .unwrap()
+            .expect("a queued job is claimable")
+    }
+
+    #[test]
+    fn cancel_pending_job_cancels_immediately() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let outcome = queue
+            .cancel(&JobId::new("job").unwrap(), Utc::now())
+            .unwrap();
+
+        assert_eq!(outcome.previous_state, JobState::Pending);
+        assert_eq!(outcome.state, JobState::Cancelled);
+        assert!(outcome.cancel_requested_at.is_some());
+        assert_eq!(
+            queue.get(&JobId::new("job").unwrap()).unwrap().state,
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancel_leased_job_waits_for_confirmation() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let lease = claim_one(&queue);
+        let outcome = queue
+            .cancel(&JobId::new("job").unwrap(), Utc::now())
+            .unwrap();
+
+        assert_eq!(outcome.previous_state, JobState::Leased);
+        assert_eq!(outcome.state, JobState::Leased);
+        // The worker learns about the flag on its next heartbeat.
+        match queue
+            .heartbeat(&lease, Utc::now(), Duration::minutes(5))
+            .unwrap()
+        {
+            HeartbeatOutcome::Renewed {
+                cancel_requested_at,
+            } => assert!(cancel_requested_at.is_some()),
+            HeartbeatOutcome::Fenced => panic!("lease should still be current"),
+        }
+        queue.confirm_cancelled(&lease, Utc::now()).unwrap();
+        let record = queue.get(&JobId::new("job").unwrap()).unwrap();
+        assert_eq!(record.state, JobState::Cancelled);
+        assert_eq!(record.attempts, 1);
+    }
+
+    #[test]
+    fn cancel_terminal_job_is_a_noop() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let lease = claim_one(&queue);
+        queue
+            .complete(
+                &lease,
+                Completion {
+                    artifact: serde_json::json!({"status": "ok"}),
+                    completed_at: Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let outcome = queue
+            .cancel(&JobId::new("job").unwrap(), Utc::now())
+            .unwrap();
+        assert_eq!(outcome.previous_state, JobState::Succeeded);
+        assert_eq!(outcome.state, JobState::Succeeded);
+        assert!(outcome.cancel_requested_at.is_none());
+    }
+
+    #[test]
+    fn busy_release_returns_the_job_without_consuming_the_attempt() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let lease = claim_one(&queue);
+        let now = Utc::now();
+
+        let outcome = queue
+            .release_busy(&lease, now, Duration::seconds(30), 30)
+            .unwrap();
+        let BusyReleaseOutcome::Released {
+            attempts,
+            busy_releases,
+            not_before,
+        } = outcome
+        else {
+            panic!("the first busy release must not exhaust the budget");
+        };
+        assert_eq!(attempts, 0);
+        assert_eq!(busy_releases, 1);
+        assert_eq!(not_before, now + Duration::seconds(30));
+
+        let record = queue.get(&JobId::new("job").unwrap()).unwrap();
+        assert_eq!(record.state, JobState::Pending);
+        assert!(record.lease.is_none());
+        // The short delay is honoured by the next claim.
+        assert!(
+            queue
+                .claim(&WorkerId::new("atlas").unwrap(), now, Duration::minutes(5))
+                .unwrap()
+                .is_none()
+        );
+        let again = queue
+            .claim(
+                &WorkerId::new("atlas").unwrap(),
+                not_before + Duration::seconds(1),
+                Duration::minutes(5),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.attempt, 1, "the busy release must not spend attempts");
+    }
+
+    #[test]
+    fn busy_release_budget_fails_the_job_with_resource_busy() {
+        let queue = InMemoryQueue::default();
+        queue.register_worker(worker("atlas", &[])).unwrap();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let now = Utc::now();
+        for expected in 1..=2 {
+            let lease = queue
+                .claim(
+                    &WorkerId::new("atlas").unwrap(),
+                    now + Duration::seconds(i64::from(expected) * 60),
+                    Duration::minutes(5),
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("claim {expected}"));
+            let outcome = queue
+                .release_busy(&lease, now, Duration::seconds(1), 2)
+                .unwrap();
+            assert_eq!(
+                outcome,
+                BusyReleaseOutcome::Released {
+                    attempts: 0,
+                    busy_releases: expected,
+                    not_before: now + Duration::seconds(1),
+                }
+            );
+        }
+        let lease = queue
+            .claim(
+                &WorkerId::new("atlas").unwrap(),
+                now + Duration::seconds(600),
+                Duration::minutes(5),
+            )
+            .unwrap()
+            .unwrap();
+        let outcome = queue
+            .release_busy(&lease, now, Duration::seconds(1), 2)
+            .unwrap();
+        assert_eq!(outcome, BusyReleaseOutcome::Exhausted { busy_releases: 3 });
+        let record = queue.get(&JobId::new("job").unwrap()).unwrap();
+        assert_eq!(record.state, JobState::Failed);
+        assert_eq!(record.error.as_deref(), Some(RESOURCE_BUSY));
+    }
+
+    #[test]
+    fn cancel_wins_over_a_busy_retry() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let lease = claim_one(&queue);
+        queue
+            .cancel(&JobId::new("job").unwrap(), Utc::now())
+            .unwrap();
+
+        assert_eq!(
+            queue
+                .release_busy(&lease, Utc::now(), Duration::seconds(1), 30)
+                .unwrap(),
+            BusyReleaseOutcome::Cancelled { busy_releases: 1 }
+        );
+        let record = queue.get(&JobId::new("job").unwrap()).unwrap();
+        assert_eq!(record.state, JobState::Cancelled);
+        assert!(
+            record.not_before.is_none(),
+            "a cancelled job is never claimable again, so it keeps no retry delay"
+        );
+    }
+
+    #[test]
+    fn stale_complete_after_release_is_rejected() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let first = claim_one(&queue);
+        queue
+            .release_busy(&first, Utc::now(), Duration::seconds(1), 30)
+            .unwrap();
+
+        assert_eq!(
+            queue.complete(
+                &first,
+                Completion {
+                    artifact: serde_json::json!({"stale": true}),
+                    completed_at: Utc::now(),
+                },
+            ),
+            Err(WorkloadError::StaleLease { job: "job".into() })
+        );
+        let record = queue.get(&JobId::new("job").unwrap()).unwrap();
+        assert_eq!(record.state, JobState::Pending);
+        assert!(record.result.is_none());
+        assert!(record.delivered_at.is_none());
+    }
+
+    #[test]
+    fn delivery_needs_an_accepted_complete_from_the_completing_worker() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let lease = claim_one(&queue);
+        let job_id = JobId::new("job").unwrap();
+
+        assert_eq!(
+            queue.mark_delivered(&job_id, &lease.worker_id, Utc::now()),
+            Err(WorkloadError::NotCompletedBy {
+                job: "job".into(),
+                worker: "atlas".into()
+            })
+        );
+        queue
+            .complete(
+                &lease,
+                Completion {
+                    artifact: serde_json::json!({"ok": true}),
+                    completed_at: Utc::now(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            queue.mark_delivered(&job_id, &WorkerId::new("nomad").unwrap(), Utc::now()),
+            Err(WorkloadError::NotCompletedBy {
+                job: "job".into(),
+                worker: "nomad".into()
+            })
+        );
+        queue
+            .mark_delivered(&job_id, &lease.worker_id, Utc::now())
+            .unwrap();
+        assert!(queue.get(&job_id).unwrap().delivered_at.is_some());
+        assert_eq!(queue.undelivered_succeeded(&lease.worker_id).len(), 0);
+    }
+
+    #[test]
+    fn adoption_finds_the_job_by_generation_fingerprint() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let fingerprint = InputFingerprint::new("sha256:job").unwrap();
+
+        let found = queue.find("fixture", "code", &fingerprint).unwrap();
+        assert_eq!(found.status().job_id.as_str(), "job");
+        assert!(
+            queue.find("fixture", "other", &fingerprint).is_none(),
+            "queue is part of the adoption identity"
+        );
+    }
+
+    #[test]
+    fn expired_lease_of_a_cancelled_job_resolves_to_cancelled() {
+        let queue = InMemoryQueue::default();
+        queue.register_worker(worker("atlas", &[])).unwrap();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let lease = queue
+            .claim(
+                &WorkerId::new("atlas").unwrap(),
+                Utc::now(),
+                Duration::seconds(1),
+            )
+            .unwrap()
+            .unwrap();
+        queue
+            .cancel(&JobId::new("job").unwrap(), Utc::now())
+            .unwrap();
+        assert!(
+            queue
+                .claim(
+                    &WorkerId::new("atlas").unwrap(),
+                    lease.expires_at + Duration::seconds(1),
+                    Duration::minutes(5),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            queue.get(&JobId::new("job").unwrap()).unwrap().state,
+            JobState::Cancelled
+        );
     }
 
     #[test]

@@ -252,7 +252,7 @@ database_url_env = "INFERNIX_WORKLOAD_DATABASE_URL"
 [worker]
 id = "atlas"
 boot_id = "boot-test"
-capabilities = ["gpu:test"]
+# No explicit capabilities: gpu_device alone must advertise gpu:test.
 gpu_device = "test"
 concurrency = 1
 lease_duration_secs = 10

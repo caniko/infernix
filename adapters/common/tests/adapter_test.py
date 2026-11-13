@@ -639,6 +639,19 @@ class XpuTelemetryTests(unittest.TestCase):
         sample = sampler._sample_xpu(root=self.root)
         self.assertEqual(sample["busy_ns"], 1_000_000_000, "render and compute overlap")
 
+    def test_clients_sharing_an_engine_add_up(self):
+        sampler = telemetry.Sampler("xpu")
+        other = self.root / "11"
+        self.write_client(other, driver="i915", render_ns=0, compute_ns=0, resident_kib=0, client_id=10)
+        sampler._sample_xpu(root=self.root)
+        self.write_client(
+            self.client, driver="i915", render_ns=500_000_000 + 1_000, compute_ns=2_000, resident_kib=1024
+        )
+        self.write_client(other, driver="i915", render_ns=500_000_000, compute_ns=0, resident_kib=0, client_id=10)
+        self.assertEqual(
+            sampler._sample_xpu(root=self.root)["busy_ns"], 1_000_000_000, "two 0.5 s clients on render are 1 s"
+        )
+
     def test_engine_deltas_become_gpu_seconds_and_resident_becomes_peak(self):
         sampler = telemetry.Sampler("xpu")
         first = sampler._sample_xpu(root=self.root)

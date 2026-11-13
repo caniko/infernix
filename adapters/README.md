@@ -105,8 +105,11 @@ are the per-sample maximum over engines of `Δns / capacity` (capacity from
 engines contribute their wall time rather than the sum of their time; each
 client's counter is tracked by a high-water mark, so a temporarily regressing
 counter is never counted twice. A baseline snapshot at start and a final one in
-`stop()` charge engine time spent between ticks, so a sub-second inference still
-reports GPU seconds. `drm-resident-local0` is the resident device memory.
+`stop()` charge engine time spent between ticks, so a sub-second inference on a
+client that existed at the previous snapshot still reports GPU seconds; clients
+sharing an engine add up before the per-engine maximum. Blind spot: work a
+client does before its first observation (a DRM client created and used within
+one interval) is not counted, because there is no earlier counter to diff. `drm-resident-local0` is the resident device memory.
 Temperature and power stay 0 on this backend (they need root on i915). Level
 Zero's `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` and the XPU "out of memory" text
 both map to exit 12.

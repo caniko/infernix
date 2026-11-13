@@ -105,6 +105,9 @@ class Sampler:
         self.gpu_seconds = 0.0
         self._samples = 0
         self._stop = threading.Event()
+        # Serialises the periodic thread and stop()'s final snapshot over the
+        # high-water marks and totals.
+        self._lock = threading.Lock()
         self._thread = None
         self._card = None
         self._hwmon = None
@@ -175,17 +178,19 @@ class Sampler:
     def _sample_xpu(self, root=None):
         """Own-process i915 usage: engine nanoseconds and resident local bytes.
 
-        GPU-busy nanoseconds are the per-sample maximum over engines of
-        delta-ns / capacity: concurrent engines and multi-instance engines add
-        their wall time, not the sum of their time.
+        GPU-busy nanoseconds are the per-sample maximum over (device, engine)
+        of the clients' summed delta-ns / capacity: clients sharing an engine
+        add up, concurrent or multi-instance engines add their wall time.
         """
-        busy_ns = 0
+        engine_ns = {}
         resident = 0
         for client, info in i915_fdinfo(root or self.fdinfo_root).items():
             high_water = self._client_ns.setdefault(client, {})
             for engine, value in info["engines"].items():
                 previous = high_water.get(engine)
                 # A client first seen mid-run is baselined at its first counter.
+                # ponytail: work a client does before its first observation is
+                # not counted (no earlier counter to diff against).
                 if previous is None:
                     high_water[engine] = value
                     continue
@@ -193,14 +198,15 @@ class Sampler:
                 # mark is real GPU time.
                 if value > previous:
                     capacity = info["capacity"].get(engine) or 1
-                    busy_ns = max(busy_ns, (value - previous) / capacity)
+                    key = (client[0], engine)
+                    engine_ns[key] = engine_ns.get(key, 0) + (value - previous) / capacity
                     high_water[engine] = value
             resident += info["resident"]
         return {
             "vram": resident,
             "total": None,
             "busy": None,
-            "busy_ns": busy_ns,
+            "busy_ns": max(engine_ns.values(), default=0),
             "power": None,
             "temp": None,
         }
@@ -227,14 +233,18 @@ class Sampler:
     def _run(self):
         last = time.monotonic()
         while not self._stop.is_set():
-            sample = self._sample()
-            now = time.monotonic()
-            elapsed = now - last
-            last = now
-            if sample:
-                self._record(sample, elapsed)
-            else:
-                self.gpu_seconds += elapsed
+            with self._lock:
+                # stop() may have taken the final snapshot while we waited.
+                if self._stop.is_set():
+                    break
+                sample = self._sample()
+                now = time.monotonic()
+                elapsed = now - last
+                last = now
+                if sample:
+                    self._record(sample, elapsed)
+                else:
+                    self.gpu_seconds += elapsed
             self._stop.wait(self.interval)
 
     def start(self):
@@ -253,7 +263,10 @@ class Sampler:
             self._thread = None
             if self.backend == "xpu":
                 # Final snapshot: a sub-second inference can finish between ticks.
-                self._record(self._sample_xpu(), 0.0)
+                # The lock waits out a sample in flight; the thread then exits
+                # without sampling again, so the summary is final.
+                with self._lock:
+                    self._record(self._sample_xpu(), 0.0)
         return self.summary()
 
     def summary(self):

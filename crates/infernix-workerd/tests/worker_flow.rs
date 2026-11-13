@@ -217,6 +217,15 @@ impl Fixture {
 
     fn write_adapter(&self, name: &str, script: &str) -> PathBuf {
         let path = self.directory.join(name);
+        // The Nix build sandbox has no /usr/bin/env: point Python fixtures at
+        // the interpreter on PATH by absolute path.
+        let script = match script.strip_prefix("#!/usr/bin/env python3") {
+            Some(rest) => {
+                let python = which("python3").expect("python3 fixtures need python3 on PATH");
+                format!("#!{}{rest}", python.display())
+            }
+            None => script.to_owned(),
+        };
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
@@ -944,6 +953,27 @@ while True:
     time.sleep(0.1)
 "#;
 
+/// Absolute path of `program` on PATH.
+fn which(program: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The zombie-group fixtures are Python: the Nix build sandbox has none, so
+/// these tests run in the cargo test job (dev shell) and skip in the sandbox.
+fn python_or_skip(test: &str) -> bool {
+    if which("python3").is_some() {
+        return true;
+    }
+    eprintln!(
+        "skipping {test}: python3 is not on PATH (Nix build sandbox); the cargo test job runs it"
+    );
+    false
+}
+
 async fn wait_for_file(path: &Path) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !path.exists() {
@@ -1019,6 +1049,9 @@ async fn late_cancellation_kills_the_group_before_confirming() {
 
 #[tokio::test]
 async fn a_group_that_survives_sigkill_keeps_its_lease_and_is_never_confirmed() {
+    if !python_or_skip("a_group_that_survives_sigkill_keeps_its_lease_and_is_never_confirmed") {
+        return;
+    }
     let cluster = TestCluster::start();
     let (database, client) = fresh_ledger(&cluster).await.unwrap();
     let fixture = Fixture::new("survivor", cluster.connection_string(&database));
@@ -1087,6 +1120,9 @@ async fn lease_row(
 
 #[tokio::test]
 async fn a_short_lease_is_renewed_through_the_group_termination_wait() {
+    if !python_or_skip("a_short_lease_is_renewed_through_the_group_termination_wait") {
+        return;
+    }
     let cluster = TestCluster::start();
     let (database, client) = fresh_ledger(&cluster).await.unwrap();
     let fixture = Fixture::new("short-lease", cluster.connection_string(&database));
@@ -1150,6 +1186,9 @@ async fn a_short_lease_is_renewed_through_the_group_termination_wait() {
 
 #[tokio::test]
 async fn the_termination_handoff_renews_before_any_wait() {
+    if !python_or_skip("the_termination_handoff_renews_before_any_wait") {
+        return;
+    }
     let cluster = TestCluster::start();
     let (database, client) = fresh_ledger(&cluster).await.unwrap();
     let fixture = Fixture::new("handoff", cluster.connection_string(&database));

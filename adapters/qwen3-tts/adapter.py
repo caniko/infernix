@@ -2,14 +2,13 @@
 """Qwen3-TTS 12 Hz 0.6B CustomVoice on ROCm (atlas).
 
 `attn_implementation="sdpa"` is fixed: FlashAttention-2 is CUDA-only, and the
-plan's Voice profile is the ROCm card. The model is asserted on the GPU after
-load, so nothing can silently fall back to the CPU.
+plan's Voice profile is the ROCm card. The model and its speech tokenizer are
+asserted on the GPU after load, so nothing can silently fall back to the CPU.
+Loading is bound to the profile's pinned checkpoint revision.
 """
 
 import sys
 import wave
-from pathlib import Path
-
 import numpy as np
 import torch
 
@@ -20,19 +19,27 @@ MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 DEFAULT_SAMPLE_RATE = 24000
 
 
-def model_path(params, profile):
-    return params.get("modelPath") or (profile.get("checkpoint") or {}).get("localPath") or MODEL
-
-
-def load_model(path):
+def load_model(source, revision, device):
     from qwen_tts import Qwen3TTSModel
 
     return Qwen3TTSModel.from_pretrained(
-        path,
-        device_map="cuda:0",
+        source,
+        revision=revision,
+        device_map=device,
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
+
+
+def assert_speech_tokenizer(model):
+    """The speech tokenizer runs inside the model; it must be on the GPU too."""
+    tokenizer = getattr(getattr(model, "model", None), "speech_tokenizer", None)
+    module = getattr(tokenizer, "model", None)
+    if module is None:
+        raise AdapterError(
+            13, "qwen3-tts model exposes no speech_tokenizer.model to verify"
+        )
+    adapter.assert_on_gpu(module, label="qwen3-tts speech_tokenizer")
 
 
 def write_wav(path, samples, sample_rate):
@@ -57,9 +64,10 @@ def produce(context):
     if not speaker or not isinstance(speaker, str):
         raise AdapterError(14, "params.speaker is required for a CustomVoice checkpoint")
 
-    path = model_path(params, context.profile)
-    model = load_model(path)
+    source, revision = adapter.pinned_source(context.profile)
+    model = load_model(source, revision, adapter.device_string())
     adapter.assert_on_gpu(model.model, label="qwen3-tts")
+    assert_speech_tokenizer(model)
     context.check_cancel()
 
     wavs, sample_rate = model.generate_custom_voice(
@@ -84,7 +92,7 @@ def produce(context):
         findings.append(f"audio {duration:.2f}s exceeds profile limit {limit}s")
 
     name = params.get("outputName") or "line.wav"
-    target = context.output_directory / name
+    target = adapter.output_path(context.output_directory, name)
     target.parent.mkdir(parents=True, exist_ok=True)
     write_wav(target, wavs[0], sample_rate or DEFAULT_SAMPLE_RATE)
 
@@ -94,7 +102,7 @@ def produce(context):
 
 
 def main():
-    return run(produce, package_version="qwen-tts-0.1.1")
+    return run(produce, package="qwen-tts")
 
 
 if __name__ == "__main__":

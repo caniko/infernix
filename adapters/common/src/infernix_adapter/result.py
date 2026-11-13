@@ -36,7 +36,7 @@ def collect(staging_directory, output_directory, specs):
         if source in seen:
             raise invalid(f"artifact source {source!r} is duplicated")
         seen.add(source)
-        target = (output / relative).resolve()
+        target = output_path(output_directory, relative)
         if output not in target.parents:
             raise invalid(f"artifact {source} escapes the output directory: {relative}")
         if not target.is_file():
@@ -58,6 +58,20 @@ def collect(staging_directory, output_directory, specs):
     if not artifacts:
         raise invalid("adapter produced no artifacts")
     return artifacts
+
+
+def output_path(output_directory, relative):
+    """Resolve one output name under `output_directory`, refusing escapes.
+
+    Adapters call this before writing anything, so an absolute path or `..`
+    traversal is rejected (exit 14) instead of landing outside the attempt.
+    """
+    name = Path(relative)
+    if name.is_absolute():
+        raise invalid(f"output path {relative!r} is absolute")
+    if not name.parts or any(part in ("", ".", "..") for part in name.parts):
+        raise invalid(f"output path {relative!r} escapes the output directory")
+    return Path(output_directory) / name
 
 
 def from_manifest(manifest, output_name):

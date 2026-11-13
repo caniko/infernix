@@ -20,7 +20,7 @@ import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 import adapter  # noqa: E402
-from infernix_adapter import AdapterError  # noqa: E402
+from infernix_adapter import AdapterError, gpu  # noqa: E402
 
 PROFILE = {
     "id": "triposg-cuda",
@@ -102,6 +102,8 @@ class FakeContext:
 class TripoTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="triposg-adapter-"))
+        gpu._SELECTED_DEVICE = 0
+        self.addCleanup(setattr, gpu, "_SELECTED_DEVICE", None)
         image = Image.new("RGB", (20, 20), (10, 10, 10))
         for x in range(5, 15):
             for y in range(5, 15):
@@ -129,9 +131,37 @@ class TripoTests(unittest.TestCase):
         values.update(params or {})
         return FakeContext(self.root, values, files)
 
+    def test_pipeline_loads_at_the_pinned_revision(self):
+        recorded = {}
+
+        def load(source, revision, dtype):
+            recorded["source"] = source
+            recorded["revision"] = revision
+            return FakePipeline()
+
+        adapter.load_pipeline = load
+        adapter.produce(self.context(params={"modelPath": "/elsewhere"}))
+        self.assertEqual(recorded["source"], PROFILE["checkpoint"]["repo"])
+        self.assertEqual(recorded["revision"], PROFILE["checkpoint"]["revision"])
+
+    def test_unpinned_profile_is_invalid(self):
+        profile = {**PROFILE, "checkpoint": {"repo": "VAST-AI/TripoSG", "files": []}}
+        context = self.context()
+        context.profile = profile
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(context)
+        self.assertEqual(caught.exception.code, 14)
+
+    def test_output_name_traversal_is_invalid(self):
+        adapter.load_pipeline = lambda source, revision, dtype: FakePipeline()
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(self.context(params={"outputName": "../escape.glb"}))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertFalse((self.root / "staging" / "escape.glb").exists())
+
     def test_writes_a_glb(self):
         pipeline = FakePipeline()
-        adapter.load_pipeline = lambda path, dtype: pipeline
+        adapter.load_pipeline = lambda source, revision, dtype: pipeline
         specs = adapter.produce(self.context())
         self.assertEqual([spec[0] for spec in specs], ["geometry", "geometrymeta"])
         target = self.root / "staging" / "out" / "geometry.glb"
@@ -139,14 +169,14 @@ class TripoTests(unittest.TestCase):
         self.assertEqual(pipeline.calls[0]["num_inference_steps"], 50)
 
     def test_cpu_component_exits_13(self):
-        adapter.load_pipeline = lambda path, dtype: FakePipeline(device="cpu")
+        adapter.load_pipeline = lambda source, revision, dtype: FakePipeline(device="cpu")
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(self.context())
         self.assertEqual(caught.exception.code, 13)
 
     def test_hierarchical_decoder_is_selectable_and_recorded(self):
         pipeline = FakePipeline()
-        adapter.load_pipeline = lambda path, dtype: pipeline
+        adapter.load_pipeline = lambda source, revision, dtype: pipeline
         context = self.context(params={"decoder": "hierarchical"})
         adapter.produce(context)
         self.assertIs(pipeline.calls[0]["use_flash_decoder"], False)
@@ -157,7 +187,7 @@ class TripoTests(unittest.TestCase):
     def test_profile_precision_selects_the_dtype(self):
         seen = {}
 
-        def loader(path, dtype):
+        def loader(source, revision, dtype):
             seen["dtype"] = dtype
             return FakePipeline()
 
@@ -166,7 +196,7 @@ class TripoTests(unittest.TestCase):
         self.assertEqual(seen["dtype"], __import__("torch").float32)
 
     def test_unknown_precision_is_invalid(self):
-        adapter.load_pipeline = lambda path, dtype: FakePipeline()
+        adapter.load_pipeline = lambda source, revision, dtype: FakePipeline()
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(self.context(params={"precision": "int8"}))
         self.assertEqual(caught.exception.code, 14)
@@ -174,7 +204,7 @@ class TripoTests(unittest.TestCase):
     def test_flash_decoder_without_diso_is_invalid(self):
         from unittest import mock
 
-        adapter.load_pipeline = lambda path, dtype: FakePipeline()
+        adapter.load_pipeline = lambda source, revision, dtype: FakePipeline()
         with mock.patch.dict(sys.modules, {"diso": None}):
             with self.assertRaises(AdapterError) as caught:
                 adapter.produce(self.context(params={"decoder": "flash"}))
@@ -182,7 +212,7 @@ class TripoTests(unittest.TestCase):
         self.assertIn("diso", str(caught.exception))
 
     def test_unknown_decoder_is_invalid(self):
-        adapter.load_pipeline = lambda path, dtype: FakePipeline()
+        adapter.load_pipeline = lambda source, revision, dtype: FakePipeline()
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(self.context(params={"decoder": "marching"}))
         self.assertEqual(caught.exception.code, 14)
@@ -243,7 +273,7 @@ class TripoTests(unittest.TestCase):
         os.environ["INFERNIX_TRIPOSG_CODE"] = str(code)
         self.addCleanup(os.environ.pop, "INFERNIX_TRIPOSG_CODE", None)
         with self.assertRaises(ImportError):
-            adapter.load_pipeline("unused")
+            adapter.load_pipeline("unused", "abc", __import__("torch").float16)
         self.assertIn(str(code), sys.path)
 
     def test_bria_rmbg_import_is_refused(self):

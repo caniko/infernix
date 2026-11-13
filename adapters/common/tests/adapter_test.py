@@ -4,11 +4,11 @@ No GPU and no model: torch is faked, the model is a stub, and the only
 external processes are a local HTTP stub for the hub.
 """
 
-import contextlib
 import hashlib
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from infernix_adapter import cache, fingerprint, gpu, hub, parse, result, run
+from infernix_adapter import cache, checkpoint, fingerprint, gpu, hub, parse, result, run, runner
 from infernix_adapter.cancel import CancelWatcher
 from infernix_adapter.exits import AdapterError
 
@@ -43,19 +43,30 @@ PROFILE = {
 }
 
 
-def fake_torch(hip="7.2", cuda="12.8", available=True, name="AMD Radeon RX 7900 XTX", arch="gfx1100"):
+def fake_torch(
+    hip="7.2",
+    cuda="12.8",
+    available=True,
+    name="AMD Radeon RX 7900 XTX",
+    arch="gfx1100",
+    devices=None,
+):
     chosen = []
+    devices = devices or [(name, arch)]
 
     def get_device_properties(index=0):
-        return types.SimpleNamespace(name=name, gcnArchName=arch, total_memory=24 << 30)
+        device_name, device_arch = devices[index]
+        return types.SimpleNamespace(
+            name=device_name, gcnArchName=device_arch, total_memory=24 << 30
+        )
 
     return types.SimpleNamespace(
         __version__="2.14.1",
         version=types.SimpleNamespace(hip=hip, cuda=cuda),
         cuda=types.SimpleNamespace(
             is_available=lambda: available,
-            device_count=lambda: 1 if available else 0,
-            get_device_name=lambda index=0: name,
+            device_count=lambda: len(devices) if available else 0,
+            get_device_name=lambda index=0: devices[index][0],
             get_device_properties=get_device_properties,
             set_device=lambda index: chosen.append(index),
             current_device=lambda: chosen[-1] if chosen else 0,
@@ -118,24 +129,48 @@ class Harness(unittest.TestCase):
         )
         self.env.start()
         self.addCleanup(self.env.stop)
+        gpu._SELECTED_DEVICE = None
+        self.addCleanup(setattr, gpu, "_SELECTED_DEVICE", None)
+        # The tmpfiles rule creates the gate inode; the adapter never does.
+        self.locks.mkdir(parents=True, exist_ok=True)
+        (self.locks / "atlas-7900xtx.lock").touch()
         free = mock.patch.object(gpu, "vram_free_bytes", return_value=64 << 30)
         free.start()
         self.addCleanup(free.stop)
 
     def execute(self, handler, document=None, *, torch_module=None, use_cache=True):
+        """Run one adapter at the file-descriptor level, as workerd does.
+
+        Capturing fd 1 and fd 2 (not just `sys.stdout`) is what proves the
+        handler's Python and C-level writes cannot corrupt the result object.
+        """
         raw = json.dumps(document or envelope(self.staging)).encode()
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        out = tempfile.TemporaryFile()
+        err = tempfile.TemporaryFile()
+        self.addCleanup(out.close)
+        self.addCleanup(err.close)
+        saved = (os.dup(1), os.dup(2))
+        try:
+            os.dup2(out.fileno(), 1)
+            os.dup2(err.fileno(), 2)
             code = run(
                 handler,
-                package_version="1.0",
+                package="infernix-adapter",
                 torch_module=torch_module if torch_module is not None else fake_torch(),
                 use_cache=use_cache,
                 stdin=io.BytesIO(raw),
             )
-        self.stderr = stderr.getvalue()
-        self.stdout = stdout.getvalue()
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.dup2(saved[0], 1)
+            os.dup2(saved[1], 2)
+            os.close(saved[0])
+            os.close(saved[1])
+        out.seek(0)
+        err.seek(0)
+        self.stdout = out.read().decode(errors="replace")
+        self.stderr = err.read().decode(errors="replace")
         return code
 
     def payload(self):
@@ -201,6 +236,26 @@ class GpuGuardTests(Harness):
             gpu.assert_on_gpu(FakePipeline({}), label="empty")
         self.assertEqual(caught.exception.code, 13)
 
+    def test_assert_gpu_records_and_verifies_the_selected_index(self):
+        torch = fake_torch(
+            devices=[
+                ("AMD Radeon RX 7800 XT", "gfx1102"),
+                ("AMD Radeon RX 7900 XTX", "gfx1100"),
+            ]
+        )
+        gpu.assert_gpu(PROFILE, torch)
+        self.assertEqual(gpu.device_index(), 1)
+        self.assertEqual(gpu.device_string(), "cuda:1")
+
+        on_selected = FakePipeline({"m": FakeModule("gpu", {"w": FakeTensor("cuda", 1)})})
+        self.assertTrue(gpu.assert_on_gpu(on_selected))
+
+        on_other = FakePipeline({"m": FakeModule("gpu", {"w": FakeTensor("cuda", 0)})})
+        with self.assertRaises(AdapterError) as caught:
+            gpu.assert_on_gpu(on_other)
+        self.assertEqual(caught.exception.code, 13)
+        self.assertIn("cuda:0", str(caught.exception))
+
     def test_ensure_device_short_of_vram_exits_10(self):
         with mock.patch.object(gpu, "vram_free_bytes", return_value=2 << 30):
             with self.assertRaises(AdapterError) as caught:
@@ -230,10 +285,29 @@ class GateTests(Harness):
         self.assertFalse(called, "handler must not run while the gate is held")
 
     def test_gate_is_exclusive_and_released(self):
+        path = self.locks / "atlas-7900xtx.lock"
         with gpu.device_gate(PROFILE, timeout=1):
-            self.assertTrue((self.locks / "atlas-7900xtx.lock").exists())
+            self.assertTrue(path.exists())
         with gpu.device_gate(PROFILE, timeout=1):
             pass
+
+    def test_gate_opens_the_existing_lock_read_only(self):
+        """ProtectSystem=strict makes /run read-only to the worker."""
+        path = self.locks / "atlas-7900xtx.lock"
+        path.chmod(0o444)
+        with gpu.device_gate(PROFILE, timeout=1):
+            pass
+
+    def test_missing_gate_file_is_gpu_unavailable_and_not_created(self):
+        missing = self.directory / "absent-locks"
+        with self.assertRaises(AdapterError) as caught:
+            with gpu.device_gate(PROFILE, lock_dir=missing, timeout=1):
+                pass
+        self.assertEqual(caught.exception.code, 11)
+        self.assertFalse(
+            (missing / "atlas-7900xtx.lock").exists(),
+            "the tmpfiles rule owns the lock inode; the adapter must not create it",
+        )
 
 
 class OomTests(Harness):
@@ -332,6 +406,46 @@ class FingerprintTests(unittest.TestCase):
         )
 
 
+class RuntimeFingerprintTests(Harness):
+    def test_runtime_records_installed_versions_and_backend_versions(self):
+        torch = fake_torch(hip="7.2", cuda="12.8")
+        with mock.patch.object(
+            runner.importlib.metadata, "version", return_value="9.9.9"
+        ) as version:
+            runtime = runner._runtime_versions("demo-package", torch)
+        version.assert_called_once_with("demo-package")
+        self.assertEqual(runtime["package"], "9.9.9")
+        self.assertEqual(runtime["torch"], "2.14.1")
+        self.assertEqual(runtime["hip"], "7.2")
+        self.assertEqual(runtime["cuda"], "12.8")
+
+    def test_missing_distribution_fingerprints_as_null(self):
+        with mock.patch.object(
+            runner.importlib.metadata,
+            "version",
+            side_effect=runner.importlib.metadata.PackageNotFoundError("demo-package"),
+        ):
+            runtime = runner._runtime_versions("demo-package", fake_torch())
+        self.assertIsNone(runtime["package"])
+
+    def test_a_changed_installed_version_misses_the_fingerprint(self):
+        values = {
+            "profile": PROFILE,
+            "operation": "tts",
+            "inputs": [],
+            "params": {},
+            "seed": 0,
+        }
+        with mock.patch.object(runner.importlib.metadata, "version", return_value="1.0"):
+            first = runner._runtime_versions("demo-package", fake_torch())
+        with mock.patch.object(runner.importlib.metadata, "version", return_value="1.1"):
+            second = runner._runtime_versions("demo-package", fake_torch())
+        self.assertNotEqual(
+            fingerprint.content_fingerprint(runtime=first, **values),
+            fingerprint.content_fingerprint(runtime=second, **values),
+        )
+
+
 class CacheTests(Harness):
     def _producer(self, counter):
         def handler(ctx):
@@ -377,6 +491,21 @@ class CacheTests(Harness):
         self.assertFalse(self.payload()["cacheHit"])
         self.assertEqual(len(counter), 2)
 
+    def test_a_cache_hit_restores_the_stored_validation(self):
+        def handler(ctx):
+            (ctx.output_directory / "line.wav").write_bytes(b"audio")
+            ctx.validation = {"state": "warn", "findings": ["clipped"]}
+            return [("audio", "line.wav", "audio/wav")]
+
+        self.assertEqual(self.execute(handler), 0)
+        first = self.payload()
+        self.assertEqual(first["validation"]["state"], "warn")
+
+        self.assertEqual(self.execute(handler), 0)
+        second = self.payload()
+        self.assertTrue(second["cacheHit"])
+        self.assertEqual(second["validation"], {"state": "warn", "findings": ["clipped"]})
+
     def test_changed_params_miss_the_cache(self):
         counter = []
         handler = self._producer(counter)
@@ -393,6 +522,16 @@ class ResultTests(Harness):
         with self.assertRaises(AdapterError) as caught:
             result.collect(self.staging, self.staging / "out", [("leak", "../secret.txt", "text/plain")])
         self.assertEqual(caught.exception.code, 14)
+
+    def test_output_path_rejects_absolute_paths_and_traversal(self):
+        for relative in ("/etc/passwd", "../escape.wav", "nested/../../escape.wav", "."):
+            with self.assertRaises(AdapterError) as caught:
+                result.output_path(self.staging / "out", relative)
+            self.assertEqual(caught.exception.code, 14, relative)
+        self.assertEqual(
+            result.output_path(self.staging / "out", "line.wav"),
+            self.staging / "out" / "line.wav",
+        )
 
     def test_rejects_duplicate_sources(self):
         out = self.staging / "out"
@@ -433,6 +572,66 @@ class ResultTests(Harness):
             "backend",
         ):
             self.assertIn(key, document["telemetry"])
+
+
+class CheckpointTests(Harness):
+    def test_unpinned_repository_is_invalid(self):
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source({"checkpoint": {"repo": "example/weights"}})
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("revision", str(caught.exception))
+
+    def test_repository_loads_at_the_pinned_revision(self):
+        source, revision = checkpoint.pinned_source(
+            {"checkpoint": {"repo": "example/weights", "revision": "abc123"}}
+        )
+        self.assertEqual((source, revision), ("example/weights", "abc123"))
+
+    def test_local_copy_is_verified_against_the_declared_hashes(self):
+        root = self.directory / "weights"
+        root.mkdir()
+        (root / "model.safetensors").write_bytes(b"weights")
+        profile = {
+            "checkpoint": {
+                "repo": "example/weights",
+                "revision": "abc123",
+                "localPath": str(root),
+                "files": [
+                    {
+                        "path": "model.safetensors",
+                        "sha256": hashlib.sha256(b"weights").hexdigest(),
+                    }
+                ],
+            }
+        }
+        source, revision = checkpoint.pinned_source(profile)
+        self.assertEqual((source, revision), (str(root), "abc123"))
+
+        profile["checkpoint"]["files"][0]["sha256"] = "0" * 64
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source(profile)
+        self.assertEqual(caught.exception.code, 14)
+
+    def test_missing_local_file_is_invalid(self):
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.local_file({"checkpoint": {"revision": "abc123"}})
+        self.assertEqual(caught.exception.code, 14)
+
+
+class StdoutTests(Harness):
+    def test_handler_prints_go_to_stderr_and_the_result_stays_clean(self):
+        def handler(ctx):
+            print("python noise on stdout")
+            os.write(1, b"fd noise on stdout\n")
+            (ctx.output_directory / "line.wav").write_bytes(b"audio")
+            return [("audio", "line.wav", "audio/wav")]
+
+        self.assertEqual(self.execute(handler), 0)
+        document = self.payload()
+        self.assertEqual(document["cacheHit"], False)
+        self.assertIn("python noise", self.stderr)
+        self.assertIn("fd noise", self.stderr)
+        self.assertNotIn("noise", self.stdout)
 
 
 class ThreadTests(Harness):
@@ -521,8 +720,8 @@ class HubTests(Harness):
 
 
 class FakeTensor:
-    def __init__(self, device):
-        self.device = types.SimpleNamespace(type=device)
+    def __init__(self, device, index=None):
+        self.device = types.SimpleNamespace(type=device, index=index)
 
 
 class FakeModule:

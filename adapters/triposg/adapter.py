@@ -41,8 +41,9 @@ for _finder in list(sys.meta_path):
 sys.meta_path.insert(0, _BlockBackgroundRemoval())
 
 
-def weights_path(params, profile):
-    return params.get("modelPath") or (profile.get("checkpoint") or {}).get("localPath") or REPO
+def weights_path(profile):
+    """`(local directory or repo, pinned revision)` for the TripoSG weights."""
+    return adapter.pinned_source(profile)
 
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
@@ -55,7 +56,7 @@ def pipeline_dtype(profile, params):
     return DTYPES[name]
 
 
-def load_pipeline(path, dtype=torch.float16):
+def load_pipeline(source, revision, dtype=torch.float16):
     # Upstream ships no pyproject.toml: the checkout goes on sys.path.
     code = os.environ.get("INFERNIX_TRIPOSG_CODE")
     if code and code not in sys.path:
@@ -65,8 +66,12 @@ def load_pipeline(path, dtype=torch.float16):
     import triposg.schedulers.scheduling_rectified_flow  # noqa: F401
     from triposg.pipelines.pipeline_triposg import TripoSGPipeline
 
-    pipeline = TripoSGPipeline.from_pretrained(path, torch_dtype=dtype)
-    return pipeline.to("cuda")
+    pipeline = TripoSGPipeline.from_pretrained(
+        source,
+        revision=revision,
+        torch_dtype=dtype,
+    )
+    return pipeline.to(adapter.device_string())
 
 
 def compose_on_white(image, mask, padding=PADDING):
@@ -107,7 +112,8 @@ def produce(context):
     composed = compose_on_white(image, mask)
 
     dtype = pipeline_dtype(context.profile, params)
-    pipeline = load_pipeline(weights_path(params, context.profile), dtype)
+    source, revision = weights_path(context.profile)
+    pipeline = load_pipeline(source, revision, dtype)
     adapter.assert_on_gpu(pipeline, label="triposg")
     context.check_cancel()
 
@@ -124,7 +130,7 @@ def produce(context):
             raise AdapterError(
                 14, "the flash decoder needs diso, which is not installed on this worker"
             ) from error
-    generator = torch.Generator(device="cuda").manual_seed(int(context.seed))
+    generator = torch.Generator(device=adapter.device_string()).manual_seed(int(context.seed))
     samples = pipeline(
         image=composed,
         num_inference_steps=int(params.get("steps", 50)),
@@ -150,7 +156,7 @@ def produce(context):
         mesh = _simplify(mesh, faces_target)
 
     name = params.get("outputName") or "geometry.glb"
-    target = context.output_directory / name
+    target = adapter.output_path(context.output_directory, name)
     target.parent.mkdir(parents=True, exist_ok=True)
     mesh.export(str(target), file_type="glb")
 
@@ -166,7 +172,7 @@ def produce(context):
             "guidanceScale": params.get("guidanceScale", 7.0),
         },
     }
-    report_path = context.output_directory / "geometry.json"
+    report_path = adapter.output_path(context.output_directory, "geometry.json")
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
     return [
@@ -192,7 +198,7 @@ def _simplify(mesh, faces_target):
 
 
 def main():
-    return run(produce, package_version="triposg")
+    return run(produce, package="triposg")
 
 
 if __name__ == "__main__":

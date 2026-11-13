@@ -96,7 +96,7 @@ class Flux2Tests(unittest.TestCase):
         self.assertNotIn(".enable_sequential_cpu_offload(", source)
 
     def test_writes_a_png(self):
-        adapter.load_pipeline = lambda path: FakePipeline()
+        adapter.load_pipeline = lambda source, revision: FakePipeline()
         adapter.generate = lambda pipe, params, seed: Image.new("RGB", (8, 8), (10, 20, 30))
         specs = adapter.produce(self.context())
         self.assertEqual(specs, [("image", "frame.png", "image/png")])
@@ -104,7 +104,7 @@ class Flux2Tests(unittest.TestCase):
         self.assertEqual(written.size, (8, 8))
 
     def test_cpu_component_exits_13(self):
-        adapter.load_pipeline = lambda path: FakePipeline(device="cpu")
+        adapter.load_pipeline = lambda source, revision: FakePipeline(device="cpu")
         adapter.generate = lambda pipe, params, seed: Image.new("RGB", (8, 8))
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(self.context())
@@ -118,12 +118,63 @@ class Flux2Tests(unittest.TestCase):
             pipe.components["vae"] = FakeModule("cpu")
             return Image.new("RGB", (8, 8))
 
-        adapter.load_pipeline = lambda path: pipeline
+        adapter.load_pipeline = lambda source, revision: pipeline
         adapter.generate = move_to_cpu
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(self.context())
         self.assertEqual(caught.exception.code, 13)
         self.assertIn("vae", str(caught.exception))
+
+    def test_pipeline_loads_at_the_pinned_revision(self):
+        recorded = {}
+
+        def load(source, revision):
+            recorded["source"] = source
+            recorded["revision"] = revision
+            return FakePipeline()
+
+        adapter.load_pipeline = load
+        adapter.generate = lambda pipe, params, seed: Image.new("RGB", (8, 8))
+        adapter.produce(self.context(modelPath="/elsewhere/9B"))
+        self.assertEqual(recorded["source"], REPO)
+        self.assertEqual(recorded["revision"], "abc")
+        self.assertNotIn(
+            "elsewhere",
+            recorded["source"],
+            "a payload modelPath must not override the approved checkpoint",
+        )
+
+    def test_unpinned_profile_is_invalid(self):
+        profile = {**PROFILE, "checkpoint": {"repo": REPO, "files": []}}
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(FakeContext(self.root, {"prompt": "x"}, profile))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("revision", str(caught.exception))
+
+    def test_local_checkpoint_is_verified_against_declared_hashes(self):
+        weights = self.root / "weights"
+        weights.mkdir()
+        (weights / "model.safetensors").write_bytes(b"weights")
+        profile = {
+            **PROFILE,
+            "checkpoint": {
+                "repo": REPO,
+                "revision": "abc",
+                "localPath": str(weights),
+                "files": [{"path": "model.safetensors", "sha256": "0" * 64}],
+            },
+        }
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(FakeContext(self.root, {"prompt": "x"}, profile))
+        self.assertEqual(caught.exception.code, 14)
+
+    def test_output_name_traversal_is_invalid(self):
+        adapter.load_pipeline = lambda source, revision: FakePipeline()
+        adapter.generate = lambda pipe, params, seed: Image.new("RGB", (8, 8))
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(self.context(outputName="../escape.png"))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertFalse((self.root / "staging" / "escape.png").exists())
 
     def test_missing_prompt_is_invalid(self):
         with self.assertRaises(AdapterError) as caught:

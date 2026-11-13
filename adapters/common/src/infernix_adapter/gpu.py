@@ -27,6 +27,9 @@ DEFAULT_GATE_TIMEOUT = 600.0
 POLL_SECONDS = 0.2
 VRAM_ROOT = Path("/sys/class/drm")
 
+# The device index `assert_gpu` selected for this process, if any.
+_SELECTED_DEVICE = None
+
 
 def amdgpu_device_dir(root=VRAM_ROOT):
     """The amdgpu card with the most VRAM, or None."""
@@ -131,8 +134,10 @@ def device_gate(profile, lock_dir=None, timeout=None):
         limit = float(os.environ.get(GATE_TIMEOUT_ENV) or DEFAULT_GATE_TIMEOUT)
     unload_tenants(profile)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+        # The tmpfiles rule owns the inode and `ProtectSystem=strict` makes
+        # /run read-only for the worker, so the existing lock file is opened
+        # read-only; flock does not need write access.
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
     except OSError as error:
         raise AdapterError(
             GPU_UNAVAILABLE, f"device gate unusable at {path}: {error}"
@@ -214,7 +219,21 @@ def assert_gpu(profile, torch_module=None):
             findings=seen,
         )
     torch.cuda.set_device(chosen)
+    global _SELECTED_DEVICE
+    _SELECTED_DEVICE = chosen
     return torch
+
+
+def device_index():
+    """The device index `assert_gpu` selected for this process."""
+    if _SELECTED_DEVICE is None:
+        raise AdapterError(GPU_UNAVAILABLE, "assert_gpu has not selected a device")
+    return _SELECTED_DEVICE
+
+
+def device_string():
+    """The torch device string for the selected index; never a hardcoded cuda:0."""
+    return f"cuda:{device_index()}"
 
 
 def _walk(obj, prefix=""):
@@ -226,8 +245,13 @@ def _walk(obj, prefix=""):
     yield prefix, obj
 
 
-def assert_on_gpu(obj, label="model"):
-    """Every parameter and buffer of every component must live on the GPU."""
+def assert_on_gpu(obj, label="model", device=None):
+    """Every parameter and buffer of every component must live on the GPU.
+
+    `device` is the selected device index; by default it is the index
+    `assert_gpu` chose. A tensor on a different GPU is a backend mismatch.
+    """
+    expected = _SELECTED_DEVICE if device is None else device
     offenders = []
     seen = 0
     for prefix, module in _walk(obj):
@@ -236,12 +260,19 @@ def assert_on_gpu(obj, label="model"):
             if walker is None:
                 continue
             for name, tensor in walker():
-                device = getattr(getattr(tensor, "device", None), "type", None)
-                if device is None:
+                location = getattr(tensor, "device", None)
+                kind_name = getattr(location, "type", None)
+                if kind_name is None:
                     continue
                 seen += 1
-                if device != "cuda":
-                    offenders.append(f"{prefix}{name}{suffix} on {device}")
+                if kind_name != "cuda":
+                    offenders.append(f"{prefix}{name}{suffix} on {kind_name}")
+                    continue
+                index = getattr(location, "index", None)
+                if expected is not None and index is not None and index != expected:
+                    offenders.append(
+                        f"{prefix}{name}{suffix} on cuda:{index}, not cuda:{expected}"
+                    )
     if offenders:
         shown = ", ".join(offenders[:8])
         raise AdapterError(

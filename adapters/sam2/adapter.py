@@ -21,15 +21,26 @@ CONFIG = "configs/sam2.1/sam2.1_hiera_s.yaml"
 REPO = "facebook/sam2.1-hiera-small"
 
 
-def checkpoint_path(params, profile):
-    return params.get("modelPath") or (profile.get("checkpoint") or {}).get("localPath")
+def checkpoint_path(profile):
+    """The pinned SAM 2.1 weights, never random initialisation.
+
+    The worker provisions the file (downloaded at the profile's revision) and
+    names it in `checkpoint.localPath`; a missing file or hash mismatch fails
+    before `build_sam2` runs.
+    """
+    return adapter.local_file(profile, "SAM 2.1 checkpoint")
 
 
 def load_predictor(path):
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-    model = build_sam2(CONFIG, path, device="cuda", apply_postprocessing=False)
+    model = build_sam2(
+        CONFIG,
+        path,
+        device=adapter.device_string(),
+        apply_postprocessing=False,
+    )
     return SAM2ImagePredictor(model)
 
 
@@ -61,7 +72,7 @@ def produce(context):
         image = np.asarray(handle.convert("RGB"))
 
     coordinates, labels, box = prompt_from(params)
-    predictor = load_predictor(checkpoint_path(params, context.profile))
+    predictor = load_predictor(checkpoint_path(context.profile))
     adapter.assert_on_gpu(predictor.model, label="sam2")
 
     context.check_cancel()
@@ -78,7 +89,7 @@ def produce(context):
     index = int(np.argmax(scores))
     mask = (masks[index] > 0.5).astype(np.uint8) * 255
     name = params.get("outputName") or "mask.png"
-    target = context.output_directory / name
+    target = adapter.output_path(context.output_directory, name)
     target.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(mask, mode="L").save(target)
 
@@ -92,7 +103,7 @@ def produce(context):
             "box": None if box is None else box.tolist(),
         },
     }
-    report_path = context.output_directory / "mask.json"
+    report_path = adapter.output_path(context.output_directory, "mask.json")
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 
     return [
@@ -102,7 +113,7 @@ def produce(context):
 
 
 def main():
-    return run(produce, package_version="sam2")
+    return run(produce, package="sam-2")
 
 
 if __name__ == "__main__":

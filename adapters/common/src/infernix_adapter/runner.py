@@ -1,5 +1,7 @@
 """Adapter entrypoint: envelope in on stdin, one result object out on stdout."""
 
+import importlib.metadata
+import os
 import platform
 import random
 import sys
@@ -69,9 +71,6 @@ class Context:
         """Declare one output file, relative to the output directory."""
         return (source, relative, mime)
 
-    def output(self, relative):
-        return self.output_directory / relative
-
 
 def seed_everything(seed, torch_module=None):
     """The fingerprint covers the seed, so every source of randomness must honour it."""
@@ -92,21 +91,63 @@ def seed_everything(seed, torch_module=None):
     return value
 
 
-def _runtime_versions(package_version, torch_module):
-    version = None
-    if torch_module is not None:
-        version = getattr(torch_module, "__version__", None)
+def _installed_version(distribution):
+    """The installed version of a distribution, or None when it is absent."""
+    if not distribution:
+        return None
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _runtime_versions(distribution, torch_module):
+    """Fingerprint actual versions, never a label."""
+    version = getattr(torch_module, "version", None) if torch_module is not None else None
     return {
         "python": platform.python_version(),
-        "torch": version,
-        "package": package_version,
+        "torch": getattr(torch_module, "__version__", None) if torch_module is not None else None,
+        "hip": getattr(version, "hip", None),
+        "cuda": getattr(version, "cuda", None),
+        "package": _installed_version(distribution),
     }
+
+
+class _ReservedStdout:
+    """Keep fd 1 for the result object only.
+
+    Handler and library writes, including C-level `printf`, go to stderr while
+    the operation runs; the result is printed on the original stdout.
+    """
+
+    def __init__(self):
+        self._stream = sys.stdout
+        self._fd = os.dup(1)
+        self._flush()
+        os.dup2(2, 1)
+
+    def _flush(self):
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+
+    def restore(self):
+        """Restore fd 1 and return the stream the result belongs on."""
+        if self._fd is None:
+            return self._stream
+        self._flush()
+        os.dup2(self._fd, 1)
+        os.close(self._fd)
+        self._fd = None
+        return self._stream
 
 
 def run(
     handler,
     *,
-    package_version,
+    package,
     torch_module=None,
     use_cache=True,
     torch_guard=True,
@@ -117,7 +158,9 @@ def run(
     staging = None
     watcher = None
     sampler = None
+    reserved = None
     try:
+        reserved = _ReservedStdout()
         envelope = parse(stdin.read())
         staging = Path(envelope.staging_directory)
         output = Path(envelope.output_directory)
@@ -132,7 +175,7 @@ def run(
             torch = gpu.assert_gpu(envelope.profile, torch_module)
         elif requires_gpu:
             torch = torch_module
-        runtime = _runtime_versions(package_version, torch or torch_module)
+        runtime = _runtime_versions(package, torch or torch_module)
 
         fingerprint = content_fingerprint(
             profile=envelope.profile,
@@ -156,9 +199,9 @@ def run(
                     fingerprint,
                     True,
                     _telemetry(envelope, sampler=None),
-                    {"state": "ok", "findings": []},
+                    cache.stored_validation(manifest),
                 )
-                result.emit(document)
+                result.emit(document, stream=reserved.restore())
                 return 0
 
         seed_everything(envelope.seed, torch)
@@ -180,7 +223,7 @@ def run(
 
         artifacts = collect(staging, output, specs)
         if use_cache:
-            cache.store(cache.cache_root(), fingerprint, artifacts)
+            cache.store(cache.cache_root(), fingerprint, artifacts, context.validation)
         watcher.check()
         document = result.build_result(
             [item for item in (_artifact_record(a) for a in artifacts)],
@@ -189,7 +232,7 @@ def run(
             _telemetry(envelope, sampler),
             context.validation,
         )
-        result.emit(document)
+        result.emit(document, stream=reserved.restore())
         return 0
     except AdapterError as error:
         _report(error)
@@ -207,6 +250,8 @@ def run(
         _report(AdapterError(ERROR, f"{type(error).__name__}: {error}"))
         return ERROR
     finally:
+        if reserved is not None:
+            reserved.restore()
         if watcher is not None:
             watcher.stop()
         if sampler is not None:

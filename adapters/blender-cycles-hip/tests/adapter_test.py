@@ -1,5 +1,7 @@
 """blender-cycles-hip contract tests. No GPU: blender and ffmpeg are stubs."""
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -38,7 +40,7 @@ class FakeContext:
     def __init__(self, root, params, profile=None):
         self.staging_directory = root / "staging"
         self.output_directory = self.staging_directory / "out"
-        self.output_directory.mkdir(parents=True)
+        self.output_directory.mkdir(parents=True, exist_ok=True)
         self.profile = profile or PROFILE
         self.params = params
         self.seed = 0
@@ -62,6 +64,37 @@ class BlenderProgramTests(unittest.TestCase):
         self.assertIn("scene.cycles.device = \"GPU\"", guard)
         self.assertIn("7900 XTX", verify)
         self.assertEqual(adapter.ENCODER["rocm"], "hevc_vaapi")
+        self.assertIn(
+            "bpy.app.handlers.render_init.append",
+            guard,
+            "the guard must run on the loaded scene right before rendering",
+        )
+
+    def test_guard_fails_when_denoising_use_gpu_is_missing(self):
+        _, guard, _ = adapter.blender_program(PROFILE)
+        with self.assertRaises(RuntimeError) as caught:
+            run_guard(guard, FakeScene(cycles=Cycles(denoising_use_gpu=_MISSING)))
+        self.assertIn("denoising_use_gpu", str(caught.exception))
+
+    def test_guard_enables_only_the_profile_device_type(self):
+        _, guard, _ = adapter.blender_program(PROFILE)
+        devices = [Device("AMD Radeon RX 7900 XTX", "HIP"), Device("CPU", "CPU")]
+        bpy = run_guard(guard, FakeScene(), devices=devices)
+        self.assertEqual([device.use for device in devices], [True, False])
+        scene = bpy.context.scene
+        self.assertEqual(scene.render.engine, "CYCLES")
+        self.assertEqual(scene.cycles.device, "GPU")
+        self.assertTrue(scene.cycles.denoising_use_gpu)
+        self.assertEqual(scene.cycles.denoiser, "OPENIMAGEDENOISE")
+        self.assertEqual(len(bpy.app.handlers.render_init), 1)
+
+    def test_guard_refuses_a_scene_loaded_without_cycles(self):
+        _, guard, _ = adapter.blender_program(PROFILE)
+        bpy = run_guard(guard, FakeScene())
+        handler = bpy.app.handlers.render_init[0]
+        with self.assertRaises(RuntimeError) as caught:
+            handler(FakeScene(engine="BLENDER_EEVEE"))
+        self.assertIn("engine", str(caught.exception))
 
     def test_cuda_uses_optix_and_nvenc(self):
         cuda = dict(PROFILE, backend="cuda", device="gpu:nomad-4090l", deviceMatch="4090")
@@ -74,6 +107,60 @@ class BlenderProgramTests(unittest.TestCase):
         with self.assertRaises(AdapterError) as caught:
             adapter.blender_program(dict(PROFILE, backend="xpu"))
         self.assertEqual(caught.exception.code, 13)
+
+
+_MISSING = object()
+
+
+class Cycles:
+    def __init__(self, denoising_use_gpu=False, device="CPU"):
+        self.use_denoising = False
+        self.denoiser = None
+        self.device = device
+        if denoising_use_gpu is not _MISSING:
+            self.denoising_use_gpu = denoising_use_gpu
+
+
+class FakeScene:
+    def __init__(self, engine="CYCLES", cycles=None):
+        self.render = types.SimpleNamespace(engine=engine)
+        self.cycles = cycles if cycles is not None else Cycles()
+
+
+class Device:
+    def __init__(self, name, kind):
+        self.name = name
+        self.type = kind
+        self.use = False
+
+
+def run_guard(guard, scene, devices=None):
+    """Execute the Blender guard with a stub bpy, as `--python-expr` does."""
+    bpy = types.ModuleType("bpy")
+    devices = devices or [Device("AMD Radeon RX 7900 XTX", "HIP")]
+    prefs = types.SimpleNamespace(
+        compute_device_type=None, devices=devices, get_devices=lambda: None
+    )
+    bpy.context = types.SimpleNamespace(
+        preferences=types.SimpleNamespace(
+            addons={"cycles": types.SimpleNamespace(preferences=prefs)}
+        ),
+        scene=scene,
+    )
+    bpy.app = types.SimpleNamespace(
+        handlers=types.SimpleNamespace(render_init=[])
+    )
+    saved = sys.modules.get("bpy")
+    sys.modules["bpy"] = bpy
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            exec(compile(guard, "<guard>", "exec"), {"__name__": "__guard__"})
+    finally:
+        if saved is None:
+            sys.modules.pop("bpy", None)
+        else:
+            sys.modules["bpy"] = saved
+    return bpy
 
 
 class RenderTests(unittest.TestCase):
@@ -89,7 +176,12 @@ class RenderTests(unittest.TestCase):
         adapter.BLENDER, adapter.FFMPEG, adapter.VAAPI_DEVICE = self.saved
 
     def context(self, **params):
-        return FakeContext(self.root, {"blenderScript": str(self.script), **params})
+        values = {
+            "blenderScript": str(self.script),
+            "framesRoot": str(self.root / "frames"),
+        }
+        values.update(params)
+        return FakeContext(self.root, values)
 
     def test_command_runs_guard_script_and_verify_in_order(self):
         context = self.context()
@@ -161,6 +253,90 @@ class RenderTests(unittest.TestCase):
         with self.assertRaises(AdapterError) as caught:
             adapter.render(context)
         self.assertEqual(caught.exception.code, 14)
+
+    def test_guard_python_exit_is_a_backend_mismatch(self):
+        def fake_run(command, env, log_path, cancel):
+            Path(log_path).write_text(adapter.GUARD_OK + " []\nRuntimeError: refused\n")
+            return 13
+
+        adapter._run = fake_run
+        with self.assertRaises(AdapterError) as caught:
+            adapter.render(self.context())
+        self.assertEqual(caught.exception.code, 13)
+
+    def test_out_of_memory_text_exits_12(self):
+        def fake_run(command, env, log_path, cancel):
+            Path(log_path).write_text(adapter.GUARD_OK + " []\nOut of memory\n")
+            return 1
+
+        adapter._run = fake_run
+        with self.assertRaises(AdapterError) as caught:
+            adapter.render(self.context())
+        self.assertEqual(caught.exception.code, 12)
+
+    def test_exit_12_is_oom(self):
+        def fake_run(command, env, log_path, cancel):
+            Path(log_path).write_text(adapter.GUARD_OK + " []\n")
+            return 12
+
+        adapter._run = fake_run
+        with self.assertRaises(AdapterError) as caught:
+            adapter.render(self.context())
+        self.assertEqual(caught.exception.code, 12)
+
+    def test_frames_are_retained_and_reused_by_fingerprint(self):
+        renders = []
+
+        def fake_run(command, env, log_path, cancel):
+            if command[0] == adapter.BLENDER:
+                renders.append(env["INFERNIX_FRAMES_DIR"])
+                Path(log_path).write_text(
+                    adapter.GUARD_OK + " []\n" + adapter.VERIFY_OK + " []\n"
+                )
+                (Path(env["INFERNIX_FRAMES_DIR"]) / "0001.png").write_bytes(b"png")
+            else:
+                Path(log_path).write_text("")
+            return 0
+
+        adapter._run = fake_run
+        adapter.available_encoders = lambda: " V..... hevc_vaapi"
+        adapter.render(self.context())
+        self.assertEqual(len(renders), 1)
+        first = json.loads((self.root / "staging" / "out" / "frames.json").read_text())
+        self.assertFalse(first["reused"])
+
+        adapter.render(self.context())
+        self.assertEqual(len(renders), 1, "a verified retained sequence is reused")
+        second = json.loads((self.root / "staging" / "out" / "frames.json").read_text())
+        self.assertTrue(second["reused"])
+        self.assertEqual(second["frames"]["sha256"], first["frames"]["sha256"])
+
+        (Path(renders[0]) / "0001.png").write_bytes(b"tampered")
+        adapter.render(self.context())
+        self.assertEqual(len(renders), 2, "a mismatched retained frame is re-rendered")
+
+    def test_frames_root_inside_staging_is_invalid(self):
+        with self.assertRaises(AdapterError) as caught:
+            adapter.render(
+                self.context(framesRoot=str(self.root / "staging" / "frames"))
+            )
+        self.assertEqual(caught.exception.code, 14)
+
+    def test_output_name_traversal_is_invalid(self):
+        def fake_run(command, env, log_path, cancel):
+            if command[0] == adapter.BLENDER:
+                Path(log_path).write_text(
+                    adapter.GUARD_OK + " []\n" + adapter.VERIFY_OK + " []\n"
+                )
+                (Path(env["INFERNIX_FRAMES_DIR"]) / "0001.png").write_bytes(b"png")
+            return 0
+
+        adapter._run = fake_run
+        adapter.available_encoders = lambda: " V..... hevc_vaapi"
+        with self.assertRaises(AdapterError) as caught:
+            adapter.render(self.context(outputName="../escape.mp4"))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertFalse((self.root / "staging" / "escape.mp4").exists())
 
     def test_missing_encoder_exits_13(self):
         def fake_run(command, env, log_path, cancel):

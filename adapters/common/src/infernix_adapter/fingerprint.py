@@ -56,6 +56,8 @@ def content_fingerprint(
         "runtime": {
             "python": runtime.get("python"),
             "torch": runtime.get("torch"),
+            "hip": runtime.get("hip"),
+            "cuda": runtime.get("cuda"),
             "package": runtime.get("package"),
         },
         "operation": operation,

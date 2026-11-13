@@ -64,7 +64,7 @@ def lookup(root, fingerprint, output_directory):
     return manifest
 
 
-def store(root, fingerprint, artifacts):
+def store(root, fingerprint, artifacts, validation=None):
     """Publish files into the cache atomically; the manifest lands last."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -84,7 +84,12 @@ def store(root, fingerprint, artifacts):
                     "size": destination.stat().st_size,
                 }
             )
-        manifest = {"v": 1, "fingerprint": fingerprint, "artifacts": records}
+        manifest = {
+            "v": 1,
+            "fingerprint": fingerprint,
+            "validation": validation or {"state": "ok", "findings": []},
+            "artifacts": records,
+        }
         (staging / MANIFEST).write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
         entry = entry_path(root, fingerprint)
         if entry.exists():
@@ -94,3 +99,15 @@ def store(root, fingerprint, artifacts):
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def stored_validation(manifest):
+    """The validation recorded with a cache entry, restored on a hit."""
+    validation = manifest.get("validation") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(validation, dict)
+        or validation.get("state") not in ("ok", "warn", "fail")
+        or not isinstance(validation.get("findings"), list)
+    ):
+        return {"state": "ok", "findings": []}
+    return validation

@@ -37,7 +37,7 @@ def produce(context):
 
 
 def main():
-    return run(produce, package_version="audio2face-sdk", use_cache=False)
+    return run(produce, package="audio2face-sdk", use_cache=False)
 
 
 if __name__ == "__main__":

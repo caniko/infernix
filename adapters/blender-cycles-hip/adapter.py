@@ -4,9 +4,10 @@
 Section 4 Blender rule: the operation runs under `--python-expr` that pins the
 Cycles device type to this profile's backend, enables only those devices, sets
 `scene.cycles.device = "GPU"` with OIDN GPU denoise, and refuses (exit 13) when
-no matching device is enabled. A second `--python-expr` after the operation
-script re-asserts the settings on the scene that was actually rendered, so an
-operation cannot silently switch back to the CPU.
+no matching device is enabled or `denoising_use_gpu` is missing. The same guard
+is installed as a `render_init` handler, so it runs on the scene the operation
+actually loaded, right before rendering. A second `--python-expr` after the
+operation script re-asserts the settings on the rendered scene.
 
 The operation script lives in studio-pipeline; its path comes from
 `params.blenderScript`. It receives everything through the environment:
@@ -19,8 +20,10 @@ The operation script lives in studio-pipeline; its path comes from
     INFERNIX_FPS            delivery frame rate
 
 Outputs: the encoded master and a frame-sequence locator, both under
-`outputDirectory`. Frames stay under `INFERNIX_FRAMES_ROOT` (default: the
-output directory) because frame sequences are worker-local, not artifacts.
+`outputDirectory`. Frames stay under the persistent frames root (params or
+profile `framesRoot`, else `INFERNIX_FRAMES_ROOT`, else the cache directory),
+content-addressed by the job fingerprint; a retained sequence is reused only
+after every frame matches the recorded sha256.
 """
 
 import json
@@ -29,11 +32,12 @@ import shutil
 import socket
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import infernix_adapter as adapter
 from infernix_adapter import AdapterError, run
+from infernix_adapter.cache import cache_root
+from infernix_adapter.exits import is_oom
 
 DEVICE_TYPE = {"rocm": "HIP", "cuda": "OPTIX"}
 ENCODER = {"rocm": "hevc_vaapi", "cuda": "hevc_nvenc"}
@@ -42,33 +46,57 @@ BLENDER = os.environ.get("INFERNIX_BLENDER", "blender")
 FFMPEG = os.environ.get("INFERNIX_FFMPEG", "ffmpeg")
 GUARD_OK = "INFERNIX_BLENDER_GUARD_OK"
 VERIFY_OK = "INFERNIX_BLENDER_VERIFY_OK"
+FRAMES_MANIFEST = "frames.json"
 
 GUARD = """
 import bpy
-device_type = {device_type}
-prefs = bpy.context.preferences.addons["cycles"].preferences
-prefs.compute_device_type = device_type
-if hasattr(prefs, "get_devices"):
-    prefs.get_devices()
-else:
-    prefs.refresh_devices()
-enabled = []
-for device in prefs.devices:
-    device.use = device.type == device_type
-    if device.use:
-        enabled.append(device.name)
-if not enabled:
-    raise RuntimeError("no %s device enabled" % device_type)
-scene = bpy.context.scene
-scene.render.engine = "CYCLES"
-scene.cycles.device = "GPU"
-scene.cycles.use_denoising = True
-scene.cycles.denoiser = "OPENIMAGEDENOISE"
-if hasattr(scene.cycles, "denoising_use_gpu"):
-    scene.cycles.denoising_use_gpu = True
-print("{ok}", json.dumps(enabled) if "json" in dir() else enabled)
+import json
+device_type = __DEVICE_TYPE__
+match = __DEVICE_MATCH__
+
+
+def _infernix_apply(scene, strict):
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+    prefs.compute_device_type = device_type
+    if hasattr(prefs, "get_devices"):
+        prefs.get_devices()
+    else:
+        prefs.refresh_devices()
+    enabled = []
+    for device in prefs.devices:
+        device.use = device.type == device_type
+        if device.use:
+            enabled.append(device.name)
+    problems = []
+    if not enabled:
+        problems.append("no " + device_type + " device enabled")
+    if match and not any(match in name for name in enabled):
+        problems.append("no device matching " + repr(match) + " in " + repr(enabled))
+    if strict and scene.render.engine != "CYCLES":
+        problems.append("engine==" + str(scene.render.engine))
+    scene.render.engine = "CYCLES"
+    scene.cycles.device = "GPU"
+    if not hasattr(scene.cycles, "denoising_use_gpu"):
+        problems.append("cycles.denoising_use_gpu is missing")
+    else:
+        scene.cycles.denoising_use_gpu = True
+        if scene.cycles.denoising_use_gpu is not True:
+            problems.append("cycles.denoising_use_gpu is off")
+    scene.cycles.use_denoising = True
+    scene.cycles.denoiser = "OPENIMAGEDENOISE"
+    if problems:
+        raise RuntimeError("infernix GPU guard failed: " + "; ".join(problems))
+    print(__OK__, json.dumps(enabled))
+
+
+def _infernix_gpu_guard(scene, *args):
+    _infernix_apply(scene, True)
+
+
+_infernix_apply(bpy.context.scene, False)
+if _infernix_gpu_guard not in bpy.app.handlers.render_init:
+    bpy.app.handlers.render_init.append(_infernix_gpu_guard)
 """
-GUARD = "import json\n" + GUARD.format(device_type="%r", ok=GUARD_OK)
 
 VERIFY = """
 import bpy
@@ -82,6 +110,8 @@ if scene.render.engine != "CYCLES":
     problems.append("engine==" + str(scene.render.engine))
 if scene.cycles.device != "GPU":
     problems.append("cycles.device==" + str(scene.cycles.device))
+if not getattr(scene.cycles, "denoising_use_gpu", False):
+    problems.append("cycles.denoising_use_gpu is off")
 if not enabled:
     problems.append("no enabled devices")
 if match and not any(match in name for name in enabled):
@@ -97,9 +127,71 @@ def blender_program(profile):
     if device_type is None:
         backend = profile.get("backend")
         raise adapter.AdapterError(13, f"no Cycles device type for backend {backend!r}")
-    guard = GUARD.replace("%r", repr(device_type), 1)
-    verify = VERIFY.format(match=profile.get("deviceMatch") or "", ok=VERIFY_OK)
+    match = profile.get("deviceMatch") or ""
+    guard = (
+        GUARD.replace("__DEVICE_TYPE__", repr(device_type))
+        .replace("__DEVICE_MATCH__", repr(match))
+        .replace("__OK__", repr(GUARD_OK))
+    )
+    verify = VERIFY.format(match=match, ok=VERIFY_OK)
     return device_type, guard, verify
+
+
+def frames_root(profile, params, staging_directory):
+    """The persistent frame-sequence root, never inside the attempt staging."""
+    configured = (
+        params.get("framesRoot")
+        or profile.get("framesRoot")
+        or os.environ.get("INFERNIX_FRAMES_ROOT")
+    )
+    root = Path(configured) if configured else cache_root() / "frames"
+    staging = Path(staging_directory).resolve()
+    resolved = root.resolve()
+    if resolved == staging or staging in resolved.parents:
+        raise AdapterError(14, f"framesRoot {root} is inside the attempt staging directory")
+    return resolved
+
+
+def retained_frames(frames, fingerprint):
+    """The retained manifest when every frame still matches, else None."""
+    try:
+        manifest = json.loads((Path(frames) / FRAMES_MANIFEST).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict) or manifest.get("fingerprint") != fingerprint:
+        return None
+    entries = manifest.get("frames")
+    if not isinstance(entries, list) or not entries:
+        return None
+    names = []
+    for entry in entries:
+        name = entry.get("name")
+        digest = entry.get("sha256")
+        if not isinstance(name, str) or not isinstance(digest, str):
+            return None
+        path = Path(frames) / name
+        if not path.is_file() or adapter.sha256_file(path) != digest:
+            return None
+        names.append(name)
+    produced = sorted(path.name for path in Path(frames).glob("*.png"))
+    if produced != sorted(names):
+        return None
+    return manifest
+
+
+def publish_frames(frames, fingerprint, produced):
+    manifest = {
+        "v": 1,
+        "fingerprint": fingerprint,
+        "pattern": "%04d.png",
+        "frames": [
+            {"name": path.name, "sha256": adapter.sha256_file(path)} for path in produced
+        ],
+    }
+    (Path(frames) / FRAMES_MANIFEST).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    return manifest
 
 
 def _run(command, env, log_path, cancel):
@@ -125,6 +217,20 @@ def _read_log(path):
         return ""
 
 
+def _classify_blender_exit(code, text):
+    """Map the Blender subprocess exit before the generic failure branch."""
+    findings = [line for line in text.splitlines()[-20:] if line.strip()]
+    if code == 13:
+        return AdapterError(
+            13, "blender refused the operation (exit 13)", findings=findings
+        )
+    if code == 12 or is_oom(RuntimeError(text)):
+        return AdapterError(12, f"blender ran out of memory (exit {code})", findings=findings)
+    if code != 0:
+        return AdapterError(1, f"blender exited {code}", findings=findings)
+    return None
+
+
 def render(context):
     profile = context.profile
     params = context.params
@@ -136,9 +242,7 @@ def render(context):
     if not script_path.is_file():
         raise AdapterError(14, f"params.blenderScript not found: {script}")
 
-    frames_root = Path(os.environ.get("INFERNIX_FRAMES_ROOT") or context.output_directory)
-    frames = frames_root / context.fingerprint
-    frames.mkdir(parents=True, exist_ok=True)
+    frames = frames_root(profile, params, context.staging_directory) / context.fingerprint
     start = int(params.get("frameStart", 1))
     end = int(params.get("frameEnd", start))
     fps = float(params.get("fps", 24))
@@ -158,52 +262,58 @@ def render(context):
     )
 
     context.check_cancel()
-    command = [
-        BLENDER,
-        "--background",
-        "--factory-startup",
-        "--python-exit-code",
-        "13",
-        "--python-expr",
-        guard,
-        "--python",
-        str(script_path),
-        "--python-expr",
-        verify,
-    ]
-    log_path = logs / "blender.log"
-    code = _run(command, environment, log_path, context.cancel)
-    text = _read_log(log_path)
-    if GUARD_OK not in text:
-        raise adapter.AdapterError(
-            13,
-            f"Cycles {device_type} guard refused the operation (blender exit {code})",
-            findings=[line for line in text.splitlines()[-20:] if line.strip()],
-        )
-    if code != 0:
-        raise adapter.AdapterError(
-            1,
-            f"blender exited {code}",
-            findings=[line for line in text.splitlines()[-20:] if line.strip()],
-        )
-    if VERIFY_OK not in text:
-        raise adapter.AdapterError(
-            13, "post-render GPU assertion did not run", findings=[text[-2000:]]
-        )
-
-    produced = sorted(frames.glob("*.png"))
-    if not produced:
-        raise AdapterError(14, f"operation wrote no PNG frames into {frames}")
+    retained = retained_frames(frames, context.fingerprint)
+    if retained is not None:
+        produced = sorted(frames.glob("*.png"))
+    else:
+        if frames.exists():
+            shutil.rmtree(frames)
+        frames.mkdir(parents=True, exist_ok=True)
+        command = [
+            BLENDER,
+            "--background",
+            "--factory-startup",
+            "--python-exit-code",
+            "13",
+            "--python-expr",
+            guard,
+            "--python",
+            str(script_path),
+            "--python-expr",
+            verify,
+        ]
+        log_path = logs / "blender.log"
+        code = _run(command, environment, log_path, context.cancel)
+        text = _read_log(log_path)
+        if GUARD_OK not in text:
+            raise adapter.AdapterError(
+                13,
+                f"Cycles {device_type} guard refused the operation (blender exit {code})",
+                findings=[line for line in text.splitlines()[-20:] if line.strip()],
+            )
+        failure = _classify_blender_exit(code, text)
+        if failure is not None:
+            raise failure
+        if VERIFY_OK not in text:
+            raise adapter.AdapterError(
+                13, "post-render GPU assertion did not run", findings=[text[-2000:]]
+            )
+        produced = sorted(frames.glob("*.png"))
+        if not produced:
+            raise AdapterError(14, f"operation wrote no PNG frames into {frames}")
+        publish_frames(frames, context.fingerprint, produced)
 
     context.check_cancel()
     encoder = ENCODER[profile["backend"]]
     output_name = params.get("outputName") or "master.mp4"
-    master = context.output_directory / output_name
+    master = adapter.output_path(context.output_directory, output_name)
     master.parent.mkdir(parents=True, exist_ok=True)
     _encode(encoder, frames, fps, start, master, logs, context)
 
     locator = {
         "host": socket.gethostname(),
+        "fingerprint": context.fingerprint,
+        "reused": retained is not None,
         "frames": {
             "path": str(frames),
             "pattern": "%04d.png",
@@ -215,7 +325,7 @@ def render(context):
         "encoder": encoder,
         "master": master.name,
     }
-    locator_path = context.output_directory / "frames.json"
+    locator_path = adapter.output_path(context.output_directory, FRAMES_MANIFEST)
     locator_path.write_text(json.dumps(locator, indent=2, sort_keys=True) + "\n")
 
     return [
@@ -269,7 +379,7 @@ def _encode(encoder, frames, fps, start, master, logs, context):
 
 
 def main():
-    return run(render, package_version="blender-cycles-hip", torch_guard=False)
+    return run(render, package="blender-cycles-hip", torch_guard=False)
 
 
 if __name__ == "__main__":

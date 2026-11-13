@@ -6,6 +6,8 @@ Two rules that are enforced here rather than documented:
 * the checkpoint is `black-forest-labs/FLUX.2-klein-4B` and nothing else — the
   9B and `dev` variants are FLUX Non-Commercial under the same repo family, so
   a profile that names one is refused (exit 13);
+* loading is bound to the profile's pinned revision, and a local copy must
+  match the declared file hashes. There is no free path override.
 * `enable_model_cpu_offload` is never called. The pipeline is moved to the GPU
   whole, every component is asserted on the GPU after load, and the assertion
   runs again after generation so an offload hook cannot hide.
@@ -21,10 +23,6 @@ from infernix_adapter import AdapterError, run
 REPO = "black-forest-labs/FLUX.2-klein-4B"
 
 
-def checkpoint_path(params, profile):
-    return params.get("modelPath") or (profile.get("checkpoint") or {}).get("localPath") or REPO
-
-
 def assert_checkpoint(profile):
     repo = (profile.get("checkpoint") or {}).get("repo")
     if repo != REPO:
@@ -34,16 +32,26 @@ def assert_checkpoint(profile):
         )
 
 
-def load_pipeline(path):
+def checkpoint_source(profile):
+    """`(local directory or repo, pinned revision)` for this profile."""
+    assert_checkpoint(profile)
+    return adapter.pinned_source(profile)
+
+
+def load_pipeline(source, revision):
     from diffusers import Flux2KleinPipeline
 
-    pipeline = Flux2KleinPipeline.from_pretrained(path, torch_dtype=torch.bfloat16)
+    pipeline = Flux2KleinPipeline.from_pretrained(
+        source,
+        revision=revision,
+        torch_dtype=torch.bfloat16,
+    )
     # No enable_model_cpu_offload: this adapter is GPU-only by contract.
-    return pipeline.to("cuda")
+    return pipeline.to(adapter.device_string())
 
 
 def generate(pipeline, params, seed):
-    generator = torch.Generator(device="cuda").manual_seed(int(seed))
+    generator = torch.Generator(device=adapter.device_string()).manual_seed(int(seed))
     return pipeline(
         prompt=params["prompt"],
         num_inference_steps=int(params.get("steps", 4)),
@@ -59,9 +67,9 @@ def produce(context):
     prompt = params.get("prompt")
     if not prompt or not isinstance(prompt, str):
         raise AdapterError(14, "params.prompt is required")
-    assert_checkpoint(context.profile)
+    source, revision = checkpoint_source(context.profile)
 
-    pipeline = load_pipeline(checkpoint_path(params, context.profile))
+    pipeline = load_pipeline(source, revision)
     adapter.assert_on_gpu(pipeline, label="flux2-klein")
     context.check_cancel()
 
@@ -70,14 +78,14 @@ def produce(context):
     context.check_cancel()
 
     name = params.get("outputName") or "frame.png"
-    target = context.output_directory / name
+    target = adapter.output_path(context.output_directory, name)
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target, format="PNG")
     return [context.artifact(params.get("artifactSource", "image"), name, "image/png")]
 
 
 def main():
-    return run(produce, package_version="diffusers")
+    return run(produce, package="diffusers")
 
 
 if __name__ == "__main__":

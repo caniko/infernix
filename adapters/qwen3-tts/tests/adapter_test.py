@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common" / "src"))
 import numpy as np  # noqa: E402
 
 import adapter  # noqa: E402
-from infernix_adapter import AdapterError  # noqa: E402
+from infernix_adapter import AdapterError, gpu  # noqa: E402
 
 PROFILE = {
     "id": "qwen3-tts-0.6b-customvoice-rocm",
@@ -38,8 +38,12 @@ class FakeModule:
 
 
 class FakeModel:
-    def __init__(self, device="cuda", samples=None):
+    def __init__(self, device="cuda", samples=None, speech_device="cuda", speech_tokenizer=True):
         self.model = FakeModule(device)
+        if speech_tokenizer:
+            self.model.speech_tokenizer = types.SimpleNamespace(
+                model=FakeModule(speech_device)
+            )
         self.calls = []
         self._samples = samples
 
@@ -71,6 +75,8 @@ class QwenTests(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix="qwen-adapter-"))
         self.saved = adapter.load_model
         self.addCleanup(self.restore)
+        gpu._SELECTED_DEVICE = 0
+        self.addCleanup(setattr, gpu, "_SELECTED_DEVICE", None)
 
     def restore(self):
         adapter.load_model = self.saved
@@ -95,7 +101,7 @@ class QwenTests(unittest.TestCase):
         saved = sys.modules.get("qwen_tts")
         sys.modules["qwen_tts"] = module
         try:
-            adapter.load_model("local/path")
+            adapter.load_model("local/path", "abc123", "cuda:0")
         finally:
             if saved is None:
                 sys.modules.pop("qwen_tts", None)
@@ -103,11 +109,12 @@ class QwenTests(unittest.TestCase):
                 sys.modules["qwen_tts"] = saved
         self.assertEqual(recorded["kwargs"]["attn_implementation"], "sdpa")
         self.assertEqual(recorded["kwargs"]["device_map"], "cuda:0")
+        self.assertEqual(recorded["kwargs"]["revision"], "abc123")
         self.assertEqual(recorded["path"], "local/path")
 
     def test_writes_a_readable_wav(self):
         model = FakeModel()
-        adapter.load_model = lambda path: model
+        adapter.load_model = lambda source, revision, device: model
         specs = adapter.produce(self.context())
         self.assertEqual(specs, [("audio", "line.wav", "audio/wav")])
         path = self.root / "staging" / "out" / "line.wav"
@@ -119,10 +126,38 @@ class QwenTests(unittest.TestCase):
         self.assertEqual(model.calls[0]["language"], "Auto")
 
     def test_cpu_placed_model_exits_13(self):
-        adapter.load_model = lambda path: FakeModel(device="cpu")
+        adapter.load_model = lambda source, revision, device: FakeModel(device="cpu")
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(self.context())
         self.assertEqual(caught.exception.code, 13)
+
+    def test_speech_tokenizer_on_the_cpu_exits_13(self):
+        adapter.load_model = lambda source, revision, device: FakeModel(speech_device="cpu")
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(self.context())
+        self.assertEqual(caught.exception.code, 13)
+        self.assertIn("speech_tokenizer", str(caught.exception))
+
+    def test_missing_speech_tokenizer_exits_13(self):
+        adapter.load_model = lambda source, revision, device: FakeModel(speech_tokenizer=False)
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(self.context())
+        self.assertEqual(caught.exception.code, 13)
+
+    def test_unpinned_profile_is_invalid(self):
+        profile = {**PROFILE, "checkpoint": {"repo": adapter.MODEL, "files": []}}
+        context = self.context()
+        context.profile = profile
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(context)
+        self.assertEqual(caught.exception.code, 14)
+
+    def test_output_name_traversal_is_invalid(self):
+        adapter.load_model = lambda source, revision, device: FakeModel()
+        with self.assertRaises(AdapterError) as caught:
+            adapter.produce(self.context(outputName="../escape.wav"))
+        self.assertEqual(caught.exception.code, 14)
+        self.assertFalse((self.root / "staging" / "escape.wav").exists())
 
     def test_missing_text_is_invalid(self):
         with self.assertRaises(AdapterError) as caught:
@@ -135,14 +170,16 @@ class QwenTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 14)
 
     def test_limit_marks_a_warning(self):
-        adapter.load_model = lambda path: FakeModel(samples=[np.zeros(48001, dtype=np.float32)])
+        adapter.load_model = lambda source, revision, device: FakeModel(
+            samples=[np.zeros(48001, dtype=np.float32)]
+        )
         context = self.context()
         context.profile = dict(PROFILE, limits={"maxInputSeconds": 1.0})
         adapter.produce(context)
         self.assertEqual(context.validation["state"], "warn")
 
     def test_empty_audio_fails(self):
-        adapter.load_model = lambda path: FakeModel(samples=[])
+        adapter.load_model = lambda source, revision, device: FakeModel(samples=[])
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(self.context())
         self.assertEqual(caught.exception.code, 1)

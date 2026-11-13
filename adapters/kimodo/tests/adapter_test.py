@@ -3,6 +3,8 @@
 The verification code is real: every test provisions a checkpoint and three
 Hugging Face snapshots in a temporary directory, hash-declares them, and lets
 `verified_checkpoint`/`verify_snapshots`/`configure_environment` run against it.
+`EncoderAssemblyTests` is the one exception to the fakes: it runs real PEFT on a
+tiny randomly-initialised Llama, still with no GPU and no pinned weights.
 """
 
 import fcntl
@@ -633,7 +635,7 @@ class KimodoTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("byte for byte", str(caught.exception))
 
-    def test_text_encoder_loads_the_staged_base_and_both_loras_by_path(self):
+    def test_text_encoder_loads_the_staged_base_and_stacks_both_loras(self):
         import kimodo.model.llm2vec as llm2vec_module
         import peft
 
@@ -643,36 +645,59 @@ class KimodoTests(unittest.TestCase):
             json.dumps({"base_model_name_or_path": "attacker/model"})
         )
         snapshots = adapter.staged_snapshots(self.staging())
-        loaded = {"kwargs": None, "stacks": []}
+        loaded = {"kwargs": None, "stacks": [], "merges": [], "frozen": False}
+
+        class Stack:
+            def __init__(self, model, path, kwargs):
+                self.model, self.path, self.kwargs = model, path, kwargs
+
+            def merge_and_unload(self):
+                loaded["merges"].append((self.model, self.path))
+                return f"merged:{self.path}"
+
+        class Llm2Vec:
+            def __init__(self):
+                self.model = "llama"
+
+            def eval(self):
+                loaded["frozen"] = True
+                return self
+
+            def parameters(self):
+                return iter(())
 
         class Recorder:
             def __init__(self, **kwargs):
                 loaded["kwargs"] = kwargs
-                self.model = types.SimpleNamespace(model="llama")
+                self.model = Llm2Vec()
 
         def stack(model, path, **kwargs):
-            loaded["stacks"].append((model, path, kwargs))
-            return f"stacked:{path}"
+            loaded["stacks"].append(Stack(model, path, kwargs))
+            return loaded["stacks"][-1]
 
         with (
             mock.patch.object(llm2vec_module, "LLM2VecEncoder", Recorder),
             mock.patch.object(peft.PeftModel, "from_pretrained", stack),
         ):
             self.real["build_text_encoder"]("cuda:0", snapshots)
-        self.assertEqual(loaded["kwargs"]["base_model_name_or_path"], snapshots[adapter.BASE_LLAMA])
         self.assertEqual(
-            loaded["kwargs"]["peft_model_name_or_path"], snapshots[adapter.LLM2VEC]
+            loaded["kwargs"]["base_model_name_or_path"], snapshots[adapter.BASE_LLAMA]
+        )
+        # The encoder is asked for the base alone: both LoRAs are attached here.
+        self.assertIsNone(loaded["kwargs"]["peft_model_name_or_path"])
+        # mntp first, merged into the base, then supervised on the merged weights.
+        supervised = (
+            f"merged:{snapshots[adapter.LLM2VEC]}",
+            snapshots[adapter.LLM2VEC_SUPERVISED],
         )
         self.assertEqual(
-            loaded["stacks"],
-            [
-                (
-                    "llama",
-                    snapshots[adapter.LLM2VEC_SUPERVISED],
-                    {"trust_remote_code": False},
-                )
-            ],
+            [(stack.model, stack.path) for stack in loaded["stacks"]],
+            [("llama", snapshots[adapter.LLM2VEC]), supervised],
         )
+        self.assertEqual(loaded["merges"], [("llama", snapshots[adapter.LLM2VEC])])
+        for stack in loaded["stacks"]:
+            self.assertIs(stack.kwargs["trust_remote_code"], False)
+        self.assertTrue(loaded["frozen"])
         for path in snapshots.values():
             self.assertTrue(Path(path).is_absolute())
             self.assertNotEqual(Path(path), shadow)
@@ -685,9 +710,22 @@ class KimodoTests(unittest.TestCase):
         snapshots = adapter.staged_snapshots(self.staging())
         seen = {}
 
+        class Stack:
+            def merge_and_unload(self):
+                return self
+
+        class Llm2Vec:
+            model = "llama"
+
+            def eval(self):
+                return self
+
+            def parameters(self):
+                return iter(())
+
         class Recorder:
             def __init__(self, **kwargs):
-                self.model = types.SimpleNamespace(model="llama")
+                self.model = Llm2Vec()
 
         def config(*args, **kwargs):
             seen["config"] = kwargs
@@ -695,7 +733,7 @@ class KimodoTests(unittest.TestCase):
 
         def stack(model, path, **kwargs):
             seen.setdefault("peft", []).append(kwargs)
-            return f"stacked:{path}"
+            return Stack()
 
         with (
             mock.patch.object(llm2vec_module, "LLM2VecEncoder", Recorder),
@@ -704,7 +742,9 @@ class KimodoTests(unittest.TestCase):
         ):
             self.real["build_text_encoder"]("cuda:0", snapshots)
         self.assertIs(seen["config"]["trust_remote_code"], False)
-        self.assertIs(seen["peft"][0]["trust_remote_code"], False)
+        self.assertEqual(len(seen["peft"]), 2)
+        for kwargs in seen["peft"]:
+            self.assertIs(kwargs["trust_remote_code"], False)
 
     def test_the_staged_adapter_config_names_the_staged_base(self):
         snapshots = adapter.staged_snapshots(self.staging())
@@ -1317,6 +1357,7 @@ class KimodoTests(unittest.TestCase):
         self.assertEqual(runtime["kimodo"], COMMIT)
         self.assertIn(f"{adapter.LLM2VEC}@{ENCODER_REVISION}", runtime["textEncoder"])
         self.assertIn(f"{adapter.BASE_LLAMA}@{LLAMA_REVISION}", runtime["textEncoder"])
+        self.assertEqual(runtime["encoderAssembly"], adapter.ENCODER_ASSEMBLY_VERSION)
 
     def test_duration_frames_matches_the_model_frame_rate(self):
         self.assertEqual(adapter.duration_frames(self.profile, {"durationSeconds": 3.5}, 30.0), 105)
@@ -1334,6 +1375,144 @@ class KimodoTests(unittest.TestCase):
         self.assertIn("Frames: 2", text)
         self.assertEqual(text.count("JOINT"), 77)
         self.assertTrue(torch.is_tensor(skeleton.joint_parents))
+
+
+class EncoderAssemblyTests(unittest.TestCase):
+    """The real PEFT stack on a tiny random Llama: mntp merged, supervised on top.
+
+    No GPU and no real weights: a tiny `LlamaBiModel` and two tiny LoRA
+    checkpoints, written into a temporary staging tree. PEFT itself is real,
+    because the bug this covers lived in PEFT's adapter bookkeeping: stacking a
+    second `PeftModel` on the unmerged mntp one reuses the default adapter name,
+    zeroes the trained mntp tensors and only warns about the keys that no longer
+    match.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="kimodo-assembly-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.addCleanup(self.restore_env)
+        self.restore_env()
+        base = self.root / "base"
+        write_tiny_base(base)
+        write_tiny_lora(self.root / adapter._slug(adapter.LLM2VEC), 0.5)
+        write_tiny_lora(self.root / adapter._slug(adapter.LLM2VEC_SUPERVISED), 0.25)
+        self.snapshots = {
+            adapter.BASE_LLAMA: str(base),
+            adapter.LLM2VEC: str(self.root / adapter._slug(adapter.LLM2VEC)),
+            adapter.LLM2VEC_SUPERVISED: str(
+                self.root / adapter._slug(adapter.LLM2VEC_SUPERVISED)
+            ),
+        }
+
+    def restore_env(self):
+        # A stale TEXT_ENCODERS_DIR would be joined onto the staged paths.
+        for name in ENV_NAMES:
+            os.environ.pop(name, None)
+
+    def build(self):
+        return adapter.build_text_encoder("cpu", self.snapshots)
+
+    def merged(self, encoder):
+        """The base model under the supervised adapter, with the mntp LoRA merged."""
+        return encoder.model.model.base_model.model
+
+    def test_the_mntp_lora_is_merged_into_the_base(self):
+        from kimodo.model.llm2vec.models.bidirectional_llama import LlamaBiModel
+
+        merged = self.merged(self.build())
+        # The same dtype as the assembled encoder, so only the merge can differ.
+        reference = LlamaBiModel.from_pretrained(
+            self.snapshots[adapter.BASE_LLAMA], torch_dtype=torch.bfloat16
+        )
+        before = reference.layers[0].self_attn.q_proj.weight.detach()
+        after = merged.layers[0].self_attn.q_proj.weight.detach()
+        delta = float((after - before).abs().max())
+        # A merged mntp LoRA moves the base weights; a reset one leaves them equal.
+        self.assertGreater(delta, 0.0)
+
+    def test_the_supervised_lora_loads_on_the_merged_weights(self):
+        encoder = self.build()
+        tensors = {
+            name: parameter.detach()
+            for name, parameter in encoder.model.model.named_parameters()
+            if "lora_B" in name
+        }
+        self.assertTrue(tensors, "the supervised LoRA must be attached")
+        for name, tensor in tensors.items():
+            # A checkpoint key PEFT could not match stays at its zero init.
+            self.assertGreater(float(tensor.abs().sum()), 0.0, name)
+            self.assertTrue(torch.allclose(tensor, torch.full_like(tensor, 0.25)), name)
+
+    def test_a_checkpoint_with_foreign_keys_is_refused_at_each_attach(self):
+        from safetensors.torch import load_file, save_file
+
+        for repo, step in (
+            (adapter.LLM2VEC, "mntp"),
+            (adapter.LLM2VEC_SUPERVISED, "supervised"),
+        ):
+            with self.subTest(step=step):
+                path = Path(self.snapshots[repo]) / "adapter_model.safetensors"
+                original = load_file(path)
+                save_file(
+                    {f"base_model.model.{key}": value for key, value in original.items()},
+                    path,
+                )
+                try:
+                    with self.assertRaises(AdapterError) as caught:
+                        self.build()
+                finally:
+                    save_file(original, path)
+                self.assertEqual(caught.exception.code, 14)
+                self.assertIn(f"the {step} LoRA", str(caught.exception))
+
+
+def tiny_llama_config():
+    from transformers import LlamaConfig
+
+    return LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+    )
+
+
+def write_tiny_base(directory):
+    """A tiny random bidirectional Llama and a tokenizer, as a staged base."""
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    from kimodo.model.llm2vec.models.bidirectional_llama import LlamaBiModel
+
+    LlamaBiModel(tiny_llama_config()).save_pretrained(directory)
+    PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            models.WordLevel({"<unk>": 0, "walk": 1}, unk_token="<unk>")
+        ),
+        unk_token="<unk>",
+        eos_token="</s>",
+    ).save_pretrained(directory)
+
+
+def write_tiny_lora(directory, scale):
+    """A tiny LoRA whose B tensors hold `scale`, so a lost one reads as zero."""
+    from peft import LoraConfig, get_peft_model
+
+    from kimodo.model.llm2vec.models.bidirectional_llama import LlamaBiModel
+
+    model = get_peft_model(
+        LlamaBiModel(tiny_llama_config()),
+        LoraConfig(r=2, target_modules=["q_proj", "v_proj"], lora_alpha=4),
+    )
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "lora_B" in name:
+                parameter.fill_(scale)
+    model.save_pretrained(directory)
 
 
 if __name__ == "__main__":

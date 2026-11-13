@@ -23,7 +23,10 @@ names, and every string leaf is confined to the staged tree. That resolved
 config is what Hydra instantiates — upstream never reads the file again. The
 text encoder is built from the staged snapshot directories only: the base model
 and both LoRAs are attached by path, and a staged `adapter_config.json` names
-the staged base, so no `from_pretrained` call receives a repository id.
+the staged base, so no `from_pretrained` call receives a repository id. The two
+LoRAs stack in LLM2Vec's training order — the mntp adapter is merged into the
+base, then the supervised adapter is attached on top — and a PEFT key warning at
+either step is fatal.
 """
 
 import contextlib
@@ -39,6 +42,7 @@ import stat
 import sys
 import tempfile
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -112,11 +116,20 @@ _ANCHOR_BODY = CHECKPOINT_TOKEN[2:]
 # is sealed read-only — so no tree built by an earlier version may be reused.
 STAGING_DIRECTORY = "kimodo-staging"
 STAGING_VERSION = "2"
+# How the text encoder is assembled from the staged snapshots. v1 merges the mntp
+# LoRA before attaching the supervised one, in LLM2Vec's own order; the encoder
+# built before v1 attached the supervised adapter to the unmerged mntp PeftModel,
+# which reset the trained mntp tensors, so no result it produced may be reused.
+ENCODER_ASSEMBLY_VERSION = "1"
 ENCODER_DIRECTORY = "encoders"
 HF_HOME_DIRECTORY = ".hf-home"
 HF_HUB_DIRECTORY = ".hf-hub"
 MANIFEST_SUFFIX = ".manifest.json"
 LOCK_POLL_SECONDS = 0.5
+# PEFT's own diagnostics for an adapter that did not match the model it is
+# attached to: missing or unexpected adapter keys, or a second adapter stacked
+# under the name the first one already holds. Each one is fatal here.
+ENCODER_KEY_WARNING = re.compile(r"adapter keys?|unexpected key|peft_config attribute")
 # A config key that names a path, and a value that looks like one. They decide
 # only whether a string that names nothing must still be refused; any string
 # that resolves outside the staging tree is refused whatever its key.
@@ -1019,6 +1032,30 @@ def configure_environment(staging):
     os.environ.pop("CHECKPOINT_DIR", None)
 
 
+def _attach(model, path, step):
+    """Attach one verified LoRA to `model`; a key mismatch is fatal, not a warning.
+
+    PEFT only warns when a checkpoint's tensors do not match the model they are
+    attached to, so a warning here means the verified adapter was not applied at
+    all. Both attaches are guarded: the mntp stage is merged into the base and
+    the supervised one stacks on top, and neither may be dropped silently.
+    """
+    from peft import PeftModel
+
+    with warnings.catch_warnings(record=True) as caught:
+        # Record every warning, including one this line already emitted once.
+        warnings.simplefilter("always")
+        attached = PeftModel.from_pretrained(model, path, trust_remote_code=False)
+    for warning in caught:
+        if ENCODER_KEY_WARNING.search(str(warning.message)):
+            raise AdapterError(
+                14,
+                f"the {step} LoRA at {path} does not match the model it attaches "
+                f"to: {warning.message}",
+            )
+    return attached
+
+
 def build_text_encoder(device, snapshots):
     """LLM2Vec over the verified snapshots, in bf16, on the selected GPU.
 
@@ -1028,30 +1065,43 @@ def build_text_encoder(device, snapshots):
     model is supplied, so `base_model_name_or_path` is never re-resolved, and a
     directory named like a repository in the working directory cannot be picked
     up in its place.
+
+    The two LoRAs stack the way LLM2Vec trains them: the mntp adapter is merged
+    into the base, and the supervised adapter is attached to the merged weights.
+    Attaching the supervised adapter to the unmerged mntp `PeftModel` instead
+    reuses PEFT's default adapter name, resets the trained mntp tensors and adds
+    another `base_model.model` prefix, so the encoder would silently lose the
+    masked-next-token stage.
     """
     from kimodo.model.llm2vec import LLM2VecEncoder
-    from peft import PeftModel
     from transformers import AutoConfig
 
     base = snapshots[BASE_LLAMA]
     hidden = AutoConfig.from_pretrained(base, trust_remote_code=False).hidden_size
     # Upstream's LLM2VecEncoder takes no trust_remote_code kwarg and forwards no
-    # extra kwargs, so its internal AutoTokenizer/AutoConfig/AutoModel and PEFT
-    # calls run with the transformers default, which refuses remote code; every
-    # auto_map value is confined to the staged tree by this adapter.
+    # extra kwargs, so its internal AutoTokenizer/AutoConfig/AutoModel calls run
+    # with the transformers default, which refuses remote code; every auto_map
+    # value is confined to the staged tree by this adapter. It is asked for the
+    # base model alone (`peft_model_name_or_path=None`), because both LoRAs are
+    # attached here, in the order LLM2Vec trains them.
     encoder = LLM2VecEncoder(
         base_model_name_or_path=base,
-        peft_model_name_or_path=snapshots[LLM2VEC],
+        peft_model_name_or_path=None,
         dtype="bfloat16",
         llm_dim=int(hidden),
         device=device,
     )
-    # The supervised LoRA stacks on the mntp one, both by verified directory.
-    encoder.model.model = PeftModel.from_pretrained(
-        encoder.model.model,
-        snapshots[LLM2VEC_SUPERVISED],
-        trust_remote_code=False,
-    )
+    # With no LoRA to attach, upstream reads `llm2vec_config.json` from the base
+    # directory; no pinned snapshot declares one, so the pooling and length
+    # settings stay LLM2Vec's own defaults, as they were for the previous
+    # assembly, whose config lookup found none either.
+    merged = _attach(encoder.model.model, snapshots[LLM2VEC], "mntp").merge_and_unload()
+    encoder.model.model = _attach(merged, snapshots[LLM2VEC_SUPERVISED], "supervised")
+    # The attachments are new parameters and upstream froze only the base, so
+    # the assembled encoder goes back into the inference mode it was built in.
+    encoder.model.eval()
+    for parameter in encoder.model.parameters():
+        parameter.requires_grad = False
     return encoder
 
 
@@ -1231,9 +1281,11 @@ def encode_bvh(output, skeleton, fps, standard_tpose=True):
 def runtime_versions(envelope):
     """Every runtime identity the fingerprint must cover.
 
-    The code commit, the three encoder pins, and the staging key: the staged
-    rewrites are a pure function of the pins and `STAGING_VERSION`, so a change
-    to either can never reuse a cached result.
+    The code commit, the three encoder pins, the staging key and the encoder
+    assembly version: the staged rewrites are a pure function of the pins and
+    `STAGING_VERSION`, and the encoder is a pure function of the snapshots and
+    `ENCODER_ASSEMBLY_VERSION`, so a change to any of them can never reuse a
+    cached result.
     """
     profile = envelope.profile or {}
     helper = text_encoder_helper(profile)
@@ -1244,6 +1296,7 @@ def runtime_versions(envelope):
         "kimodo": verified_source(profile),
         "textEncoder": encoders,
         "staging": staging_key(profile, helper),
+        "encoderAssembly": ENCODER_ASSEMBLY_VERSION,
     }
 
 

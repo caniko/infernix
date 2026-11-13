@@ -694,22 +694,28 @@ every other file in the snapshot must be declared too. `refs/main` must match
 the pin byte for byte, with no newline tolerance and no case folding, and the
 cache may hold only the three declared repositories. Everything loads by path
 from the staged snapshots: the base Llama and both LoRAs are attached from their
-staged directories, so no `from_pretrained` call receives a repo id. A staged
-`adapter_config.json` we write ourselves names the staged base, and every
-path-bearing value of every staged snapshot config (`*_file`, `*_path`, `*_dir`,
-`*name_or_path`, and the `auto_map` entries) is confined to the tree the same
-way — a `tokenizer_file` outside it is exit 14, an internal one is pinned to its
-staged path. Tokenizer vocabulary, merges and added tokens are data, not paths,
-and are never confined: a merge such as `/ /` is accepted. `HF_HOME` and
-`HF_HUB_CACHE` point at empty directories inside the staging
-tree, `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set,
+staged directories, so no `from_pretrained` call receives a repo id. The two
+LoRAs stack in LLM2Vec's own training order: the mntp adapter is attached from
+its staged directory and merged into the base, then the supervised adapter is
+attached to those merged weights. A PEFT warning about missing or unexpected
+adapter keys at either attach — or about a second adapter reusing the default
+name — is exit 14, so a checkpoint that silently failed to apply cannot look
+like a loaded one. A staged `adapter_config.json` we write ourselves names the
+staged base, and every path-bearing value of every staged snapshot config
+(`*_file`, `*_path`, `*_dir`, `*name_or_path`, and the `auto_map` entries) is
+confined to the tree the same way — a `tokenizer_file` outside it is exit 14, an
+internal one is pinned to its staged path. Tokenizer vocabulary, merges and
+added tokens are data, not paths, and are never confined: a merge such as `/ /`
+is accepted. `HF_HOME` and `HF_HUB_CACHE` point at empty directories inside the
+staging tree, `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set,
 `TEXT_ENCODERS_DIR` and `CHECKPOINT_DIR` are cleared, and `TEXT_ENCODER_DEVICE`
 is pinned to the selected GPU — upstream's `TEXT_ENCODER_DEVICE=cpu` path is
 never taken. Frame bounds are checked against the config's own `fps` before any
 model loads. The fingerprint covers the installed `kimodo` distribution's
-PEP 610 commit, the three encoder pins and the staging key (a change to the
-staged rewrites bumps `STAGING_VERSION`), so
-a cache entry cannot be reused across a source or encoder change.
+PEP 610 commit, the three encoder pins, the staging key (a change to the
+staged rewrites bumps `STAGING_VERSION`) and the encoder assembly version (a
+change to how the LoRAs are stacked bumps `ENCODER_ASSEMBLY_VERSION`), so
+a cache entry cannot be reused across a source, encoder or assembly change.
 
 ROCm: Kimodo is pure PyTorch plus that one CPU-only C++ extension, so nothing
 in it is CUDA-only. `torch.backends.cuda` TF32 and `torch.backends.cudnn` flags

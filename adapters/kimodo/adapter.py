@@ -7,36 +7,46 @@ forward, 30 fps, standard T-pose rest) — the format Kimodo's own CLI exports
 and Blender imports natively.
 
 The text encoder is LLM2Vec over the gated Meta-Llama-3-8B-Instruct. Every
-input to the upstream loaders is declared and hash-verified before anything is
-built: the checkpoint directory (config.yaml included, because it instantiates
-classes and picks weight paths), and the three Hugging Face snapshots (base
-weights, both LLM2Vec LoRA adapters). The process then runs offline with every
-cache variable pinned to the verified tree, so a job can only load bytes the
-profile names.
+input to the upstream loaders is declared and hash-verified: the checkpoint
+directory (config.yaml included, because it instantiates classes and picks
+weight paths) and the three Hugging Face snapshots (base weights, both LLM2Vec
+LoRA adapters). The declared files are then materialised into one read-only
+staging tree under the adapter cache, and the process changes into it and
+points every cache variable at empty directories inside it, so a job can only
+load bytes the profile names.
 
-Nothing is resolved twice. `config.yaml` is read once after its hash check, its
-one checkpoint anchor is substituted with the verified directory, any other
-`${...}` resolver is refused, every `_target_` must be one of the classes the
-shipped config names, and every path it declares is rewritten to its canonical
-absolute path inside the checkpoint. That resolved config is what Hydra
-instantiates — upstream never reads the file again. The text encoder is built
-from the verified snapshot *directories* only: the base model and both LoRAs are
-attached by path, so no `from_pretrained` call receives a repository id.
+Nothing is resolved twice. `config.yaml` is read once from its staged copy,
+parsed as plain YAML, and its one checkpoint anchor is substituted with the
+staged directory; every other `${...}` interpolation — escaped or defaulted —
+is refused, every `_target_` must be one of the classes the shipped config
+names, and every string leaf is confined to the staged tree. That resolved
+config is what Hydra instantiates — upstream never reads the file again. The
+text encoder is built from the staged snapshot directories only: the base model
+and both LoRAs are attached by path, and a staged `adapter_config.json` names
+the staged base, so no `from_pretrained` call receives a repository id.
 """
 
+import contextlib
 import importlib.metadata
 import json
 import math
 import os
 import re
+import shutil
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 import infernix_adapter as adapter
 from infernix_adapter import AdapterError, run
+from infernix_adapter.cache import cache_root
+from infernix_adapter.fingerprint import digest
+from infernix_adapter.hub import sha256_file
 
 MODEL_DIR = "Kimodo-SOMA-RP-v1.2"
 BASE_LLAMA = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -86,10 +96,22 @@ ALLOWED_TARGETS = frozenset(
     }
 )
 # Upstream's one checkpoint anchor. Its loader merges `checkpoint_dir` into the
-# config; here it is the verified directory itself, never a resolver.
+# config; here it is the staged directory itself, never a resolver. The defaulted
+# form (`${oc.select:checkpoint_dir,default}`) is not this token and is refused.
 CHECKPOINT_TOKEN = "${oc.select:checkpoint_dir}"
-# A config key that names a path, and a value that looks like one.
-PATH_KEY = re.compile(r"(^|_)(path|dir|file|stats)$")
+_ANCHOR_BODY = CHECKPOINT_TOKEN[2:]
+# The verified staging tree: one directory per pin digest, holding only declared
+# files, plus our manifest and the two empty Hugging Face cache directories.
+STAGING_DIRECTORY = "kimodo-staging"
+STAGING_VERSION = "1"
+ENCODER_DIRECTORY = "encoders"
+HF_HOME_DIRECTORY = ".hf-home"
+HF_HUB_DIRECTORY = ".hf-hub"
+MANIFEST = "manifest.json"
+# A config key that names a path, and a value that looks like one. They decide
+# only whether a string that names nothing must still be refused; any string
+# that resolves outside the staging tree is refused whatever its key.
+PATH_KEY = re.compile(r"(^|_)(path|paths|dir|dirs|file|files|folder|root|stats)$")
 PATH_VALUE = re.compile(r"\.(safetensors|npy|pt|bin|json|ya?ml)$")
 
 
@@ -294,18 +316,428 @@ def verify_snapshots(helper):
     return snapshots
 
 
-def configure_environment(helper):
+def _slug(repo):
+    """A repository id as one path segment."""
+    return repo.replace("/", "--")
+
+
+def _pin(helper, repo):
+    return next(pin for pin in helper["checkpoints"] if pin["repo"] == repo)
+
+
+def _pin_files(entries):
+    """The declared path/sha256 pairs, canonically ordered."""
+    pairs = [
+        [
+            Path(str(entry.get("path") or "")).as_posix(),
+            str(entry.get("sha256") or "").lower(),
+        ]
+        for entry in entries
+        if isinstance(entry, dict)
+    ]
+    return sorted(pairs, key=lambda pair: pair[0])
+
+
+def staging_key(profile, helper):
+    """What a staging tree is built from: the pins, never the paths they sit at.
+
+    The staged rewrites are a pure function of these bytes and
+    `STAGING_VERSION`, so this value — and the content fingerprint that covers
+    it — changes whenever a staged file could contain different bytes.
+    """
+    checkpoint = profile.get("checkpoint") or {}
+    return digest(
+        {
+            "v": STAGING_VERSION,
+            "checkpoint": {
+                "revision": checkpoint.get("revision"),
+                "files": _pin_files(checkpoint.get("files") or []),
+            },
+            "encoders": sorted(
+                (
+                    {
+                        "repo": pin["repo"],
+                        "revision": str(pin["revision"]).lower(),
+                        "files": _pin_files(pin["files"]),
+                    }
+                    for pin in helper["checkpoints"]
+                ),
+                key=lambda pin: pin["repo"],
+            ),
+        }
+    )
+
+
+def _replace_file(path, payload):
+    """Write our own staged copy, breaking a hardlink to the source file."""
+    temporary = path.with_name(f".{path.name}.infernix")
+    temporary.write_text(payload)
+    os.replace(temporary, path)
+
+
+def _materialise(staging, sources, records):
+    """Link or copy every declared file into the tree, then re-hash it.
+
+    A hardlink is the same bytes on the same filesystem; anywhere else the file
+    is copied. Either way the materialised file is hashed again against its
+    declaration, so a source that changed after verification is refused here
+    instead of being loaded.
+    """
+    declared = set()
+    for source_root, entries, prefix in sources:
+        for entry in entries:
+            relative = Path(prefix) / Path(entry["path"]).as_posix()
+            if relative in declared:
+                raise AdapterError(14, f"two declared files collide at {relative}")
+            declared.add(relative)
+            target = Path(staging) / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = Path(os.path.realpath(Path(source_root) / entry["path"]))
+            try:
+                os.link(source, target)
+                linked = True
+            except OSError:
+                try:
+                    shutil.copyfile(source, target)
+                except OSError as error:
+                    raise AdapterError(
+                        14, f"declared file {relative} cannot be staged: {error}"
+                    ) from error
+                linked = False
+            expected = str(entry["sha256"]).lower()
+            actual = sha256_file(target)
+            if actual != expected:
+                raise AdapterError(
+                    14,
+                    f"staged copy of {relative} hashes {actual} != the declared "
+                    f"{expected}: the source changed after it was verified",
+                )
+            records[relative.as_posix()] = {
+                "path": relative.as_posix(),
+                "sha256": actual,
+                "size": target.stat().st_size,
+                "linked": linked,
+                "rewritten": False,
+            }
+
+
+def _confined(value, base, tree, staging, path_like=False):
+    """One string leaf: its published absolute path, or the value unchanged.
+
+    A value that resolves to an existing path must resolve inside the tree and
+    is rewritten to the absolute path it will have once the tree is published,
+    so no loader can resolve it against the working directory or another base.
+    An absolute value, one that resolves outside the tree, or (`path_like`) one
+    that names nothing the tree holds is exit 14: the pin does not contain it.
+    """
+    tree, staging = str(tree), str(staging)
+    candidate = value if os.path.isabs(value) else os.path.join(base, value)
+    real = os.path.realpath(candidate)
+    relative = os.path.relpath(real, tree)
+    inside = relative != ".." and not relative.startswith(".." + os.sep)
+    if os.path.exists(real):
+        if not inside:
+            raise AdapterError(
+                14,
+                f"{value!r} resolves to {real}, outside the verified staging tree "
+                f"{staging}; only a declared file may be loaded",
+            )
+        return os.path.normpath(os.path.join(staging, relative))
+    if os.path.isabs(value) or not inside or path_like:
+        raise AdapterError(
+            14,
+            f"{value!r} names no declared file in the verified staging tree {staging}; "
+            "only a declared file may be loaded",
+        )
+    return value
+
+
+def _path_like(key, value):
+    return (
+        (key is not None and PATH_KEY.search(key))
+        or bool(PATH_VALUE.search(value))
+        or "/" in value
+        or value.startswith(".")
+    )
+
+
+def _confine_config(node, tree, staging, key=None):
+    """Confine every string leaf of the parsed checkpoint config."""
+    if isinstance(node, dict):
+        return {
+            name: _confine_config(value, tree, staging, name)
+            for name, value in node.items()
+        }
+    if isinstance(node, (list, tuple)):
+        return [_confine_config(value, tree, staging, key) for value in node]
+    if isinstance(node, str) and node:
+        return _confined(node, tree, tree, staging, _path_like(key, node))
+    return node
+
+
+def _confine_snapshot(node, base, tree, staging):
+    """Confine every string leaf of a staged Hugging Face config.
+
+    These configs steer loading from inside the snapshot (a `tokenizer_file`, a
+    task-specific file), so a value that resolves inside the tree is pinned to
+    its published absolute path and one that resolves outside it, or is absolute
+    at all, is refused. Values that resolve to nothing are left as they are:
+    with the cache directories empty and offline mode on, they cannot load bytes.
+    """
+    if isinstance(node, dict):
+        return {
+            name: _confine_snapshot(value, base, tree, staging)
+            for name, value in node.items()
+        }
+    if isinstance(node, (list, tuple)):
+        return [_confine_snapshot(value, base, tree, staging) for value in node]
+    if isinstance(node, str) and node:
+        return _confined(node, base, tree, staging)
+    return node
+
+
+def _staged_configs(tree, staging, adapters):
+    """Rewrite every staged snapshot config that needs it; yield each one.
+
+    `adapters` maps a published LoRA directory to the published base directory
+    it must attach to: its `adapter_config.json` is our own copy, so
+    `base_model_name_or_path` names the staged base instead of a repository id
+    the loader could resolve from a cache or the working directory. Weight
+    indexes are not configs: their shards were checked against the pin, and a
+    loader joins them to the snapshot directory.
+    """
+    tree = Path(tree)
+    staging = Path(staging)
+    for base, _directories, names in os.walk(tree / ENCODER_DIRECTORY):
+        for name in sorted(names):
+            path = Path(base) / name
+            if not name.endswith(".json") or name.endswith(".index.json"):
+                continue
+            try:
+                document = json.loads(path.read_text())
+            except (OSError, ValueError) as error:
+                raise AdapterError(
+                    14, f"staged config {path} is unreadable: {error}"
+                ) from error
+            updated = _confine_snapshot(document, path.parent, tree, staging)
+            adapter_base = adapters.get(staging / path.parent.relative_to(tree))
+            if adapter_base is not None and name == "adapter_config.json":
+                if not isinstance(updated, dict):
+                    raise AdapterError(
+                        14, f"staged adapter config {path} is not a mapping"
+                    )
+                updated = dict(updated, base_model_name_or_path=str(adapter_base))
+            if updated == document:
+                continue
+            _replace_file(path, json.dumps(updated, sort_keys=True, indent=2) + "\n")
+            yield path
+
+
+def _seal(staging, records):
+    """Close the tree for writing, except where a hardlink is shared.
+
+    Directories become read-only, so no entry can be added, removed or renamed,
+    and every file we own (a copy or a rewrite) becomes read-only. A hardlinked
+    file keeps the mode of the verified source it shares an inode with: chmod
+    would change the checkpoint or the hub cache as well.
+    """
+    staging = Path(staging)
+    for base, directories, names in os.walk(staging, topdown=False):
+        for name in names:
+            relative = (Path(base) / name).relative_to(staging).as_posix()
+            if not records.get(relative, {}).get("linked"):
+                os.chmod(os.path.join(base, name), 0o444)
+        for name in directories:
+            os.chmod(os.path.join(base, name), 0o555)
+    os.chmod(staging, 0o555)
+    for name in (HF_HOME_DIRECTORY, HF_HUB_DIRECTORY):
+        os.chmod(staging / name, 0o755)
+
+
+def _build_staging(staging, key, checkpoint, checkpoint_files, helper, snapshots):
+    """Fill `staging` (a temporary tree) for the tree published at `key`."""
+    records = {}
+    _materialise(
+        staging,
+        [
+            (checkpoint, checkpoint_files, Path()),
+            *[
+                (
+                    snapshots[repo],
+                    _pin(helper, repo)["files"],
+                    Path(ENCODER_DIRECTORY) / _slug(repo),
+                )
+                for repo in ENCODERS
+            ],
+        ],
+        records,
+    )
+    published = Path(staging).parent / key
+    base = published / ENCODER_DIRECTORY / _slug(BASE_LLAMA)
+    for path in _staged_configs(
+        staging,
+        published,
+        {
+            published / ENCODER_DIRECTORY / _slug(repo): base
+            for repo in (LLM2VEC, LLM2VEC_SUPERVISED)
+        },
+    ):
+        relative = path.relative_to(staging).as_posix()
+        records[relative]["sha256"] = sha256_file(path)
+        records[relative]["size"] = path.stat().st_size
+        records[relative]["rewritten"] = True
+    for name in (HF_HOME_DIRECTORY, HF_HUB_DIRECTORY):
+        (Path(staging) / name).mkdir()
+    manifest = {
+        "v": 1,
+        "key": key,
+        "files": sorted(records.values(), key=lambda record: record["path"]),
+    }
+    (Path(staging) / MANIFEST).write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n"
+    )
+    _seal(staging, records)
+
+
+def _reusable(staging, key):
+    """The staging manifest when the tree still matches it, else None.
+
+    Cheap on purpose: sizes and file identity, not a re-hash of every weight.
+    """
+    try:
+        manifest = json.loads((Path(staging) / MANIFEST).read_text())
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("v") != 1
+        or manifest.get("key") != key
+    ):
+        return None
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        return None
+    declared = set()
+    for record in files:
+        if not isinstance(record, dict):
+            return None
+        relative, size = record.get("path"), record.get("size")
+        if not isinstance(relative, str) or not relative or not isinstance(size, int):
+            return None
+        try:
+            info = os.lstat(Path(staging) / relative)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            return None
+        declared.add(relative)
+    seen = 0
+    for base, directories, names in os.walk(staging):
+        if any(os.path.islink(os.path.join(base, name)) for name in directories):
+            return None
+        for name in names:
+            if os.path.islink(os.path.join(base, name)):
+                return None
+            seen += 1
+    if seen != len(declared) + 1:
+        return None
+    return manifest
+
+
+def _discard(path):
+    """Remove a staging tree, including its read-only contents.
+
+    Only directories are opened for writing: a file may be a hardlink into the
+    verified source, whose mode must not change.
+    """
+    path = Path(path)
+    if not path.exists():
+        return
+    for base, directories, _names in os.walk(path):
+        for name in directories:
+            try:
+                os.chmod(os.path.join(base, name), 0o700)
+            except OSError:
+                pass
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def staging_tree(profile, helper, checkpoint, snapshots):
+    """The verified staging tree for these pins, built once and reused.
+
+    Every declared file of the checkpoint and of the three encoder snapshots is
+    materialised under one directory and hashed again against its declaration,
+    so the bytes upstream reads are the bytes the pin verified. Only declared
+    files exist there — no symlink, no extra file — and the tree is read-only
+    once published. It is built in a temporary directory and renamed into
+    place, so a concurrent job reuses it instead of reading a partial tree.
+    """
+    root = Path(cache_root()) / STAGING_DIRECTORY
+    key = staging_key(profile, helper)
+    staging = root / key
+    root.mkdir(parents=True, exist_ok=True)
+    if _reusable(staging, key) is None:
+        temporary = Path(tempfile.mkdtemp(prefix=f".tmp-{key[:16]}-", dir=root))
+        try:
+            if staging.exists():
+                _discard(staging)
+            _build_staging(
+                temporary,
+                key,
+                checkpoint,
+                (profile.get("checkpoint") or {}).get("files") or [],
+                helper,
+                snapshots,
+            )
+            try:
+                os.replace(temporary, staging)
+            except OSError:
+                # Another job published the same pins first; reuse its tree.
+                if not staging.is_dir():
+                    raise
+        finally:
+            _discard(temporary)
+    if _reusable(staging, key) is None:
+        raise AdapterError(14, f"the verified staging tree {staging} is incomplete")
+    return staging
+
+
+def staged_snapshots(staging):
+    """The staged directory of each pinned text encoder snapshot."""
+    root = Path(staging) / ENCODER_DIRECTORY
+    return {repo: str(root / _slug(repo)) for repo in ENCODERS}
+
+
+@contextlib.contextmanager
+def _working_directory(path):
+    """Run inside `path`: a relative path cannot resolve anywhere else."""
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield path
+    finally:
+        os.chdir(previous)
+
+
+def configure_environment(staging):
     """Pin every cache and offline switch before huggingface_hub binds them.
 
     `huggingface_hub` reads these at import, so an inherited value must be
-    replaced (or cleared) before the first snapshot is resolved. Upstream joins
-    `TEXT_ENCODERS_DIR` onto both snapshot arguments, so it is cleared: the
-    paths this adapter passes are already verified and absolute.
+    replaced (or cleared) before the first snapshot is resolved. The cache
+    directories are empty ones inside the staging tree: a repository id cannot
+    resolve to anything, and the paths this adapter passes are staged
+    directories. Upstream joins `TEXT_ENCODERS_DIR` onto both snapshot
+    arguments, so it is cleared.
     """
-    cache = _hub_cache(helper)
-    os.environ["HF_HOME"] = helper["localPath"]
-    os.environ["HF_HUB_CACHE"] = str(cache)
-    os.environ["HUGGINGFACE_CACHE_DIR"] = str(cache)
+    staging = Path(staging)
+    hub = staging / HF_HUB_DIRECTORY
+    os.environ["HF_HOME"] = str(staging / HF_HOME_DIRECTORY)
+    os.environ["HF_HUB_CACHE"] = str(hub)
+    os.environ["HUGGINGFACE_CACHE_DIR"] = str(hub)
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ.pop("TEXT_ENCODERS_DIR", None)
@@ -345,69 +777,6 @@ def build_text_encoder(device, snapshots):
     return encoder
 
 
-def _canonical_config_path(value, root_real, declared):
-    """One config path: canonical absolute, inside the checkpoint, declared.
-
-    Relative values resolve against the verified checkpoint directory, never the
-    working directory, so a bare filename cannot be shadowed from elsewhere.
-    """
-    candidate = value if os.path.isabs(value) else os.path.join(root_real, value)
-    real = os.path.realpath(candidate)
-    if real != root_real and Path(root_real) not in Path(real).parents:
-        raise AdapterError(
-            14,
-            f"checkpoint config references {value!r}, outside the verified "
-            f"checkpoint {root_real}",
-        )
-    if os.path.isdir(real):
-        seen = set()
-        for base, directories, names in os.walk(real, followlinks=True):
-            current = os.path.realpath(base)
-            if current in seen:
-                directories[:] = []
-                continue
-            seen.add(current)
-            directories.sort()
-            for name in sorted(names):
-                path = os.path.join(base, name)
-                relative = Path(os.path.relpath(path, root_real)).as_posix()
-                if relative not in declared:
-                    raise AdapterError(
-                        14,
-                        f"checkpoint config references {value!r}, which contains "
-                        f"the undeclared file {relative}",
-                    )
-        return real
-    relative = Path(os.path.relpath(real, root_real)).as_posix()
-    if relative not in declared:
-        raise AdapterError(
-            14,
-            f"checkpoint config references {value!r}, which checkpoint.files "
-            "does not declare",
-        )
-    return real
-
-
-def _names_path(key, value):
-    return (key is not None and PATH_KEY.search(key)) or bool(PATH_VALUE.search(value))
-
-
-def _rewrite_config_paths(node, root_real, declared, key=None):
-    """Rewrite every path-valued string to its canonical absolute path."""
-    if isinstance(node, dict):
-        return {
-            name: _rewrite_config_paths(value, root_real, declared, name)
-            for name, value in node.items()
-        }
-    if isinstance(node, (list, tuple)):
-        return [
-            _rewrite_config_paths(value, root_real, declared, key) for value in node
-        ]
-    if isinstance(node, str) and _names_path(key, node):
-        return _canonical_config_path(node, root_real, declared)
-    return node
-
-
 def _targets(node):
     if isinstance(node, dict):
         for key, value in node.items():
@@ -420,17 +789,52 @@ def _targets(node):
             yield from _targets(value)
 
 
-def verify_config(profile, directory):
-    """The checkpoint config, resolved once into the object upstream instantiates.
+def _substitute_anchor(node, staging, where):
+    """Replace upstream's one anchor in every string; refuse any other resolver.
 
-    `config.yaml` is a declared, hash-verified file. It is read once here; every
-    interpolation is refused (upstream may not resolve `oc.env` and friends), so
-    only upstream's own `checkpoint_dir` anchor is substituted with the verified
-    directory. Each `_target_` must be one of the classes the shipped config
-    names, and every path it mentions is rewritten to a declared file or
-    directory inside the checkpoint.
+    The substitution runs on the parsed YAML, never on the text: an escaped
+    `\\${oc.env:X}` and a quoted `${oc.env:X}` are the same string once loaded,
+    and `${oc.select:checkpoint_dir,default}` is not the anchor, so a defaulted
+    form cannot smuggle a resolver past the check.
     """
-    root = Path(directory)
+    if isinstance(node, dict):
+        return {
+            name: _substitute_anchor(value, staging, where)
+            for name, value in node.items()
+        }
+    if isinstance(node, (list, tuple)):
+        return [_substitute_anchor(value, staging, where) for value in node]
+    if not isinstance(node, str):
+        return node
+    out = []
+    rest = node
+    while "${" in rest:
+        head, _, tail = rest.partition("${")
+        out.append(head)
+        if not tail.startswith(_ANCHOR_BODY):
+            raise AdapterError(
+                14,
+                f"checkpoint config {where} uses the interpolation {node!r}; only "
+                f"{CHECKPOINT_TOKEN} is substituted, so resolvers such as "
+                "${oc.env:…} are refused",
+            )
+        out.append(str(staging))
+        rest = tail[len(_ANCHOR_BODY) :]
+    out.append(rest)
+    return "".join(out)
+
+
+def verify_config(profile, staging):
+    """The staged checkpoint config, resolved once into what upstream instantiates.
+
+    `config.yaml` is declared and hash-verified, and read from its staged copy.
+    It is parsed as plain YAML, so the check runs on values rather than on text:
+    every string leaf may only name a staged file, and only upstream's own
+    `checkpoint_dir` anchor is substituted. Each `_target_` must be one of the
+    classes the shipped config names. The result is a plain mapping with no
+    OmegaConf resolver left to run.
+    """
+    staging = Path(staging)
     files = (profile.get("checkpoint") or {}).get("files") or []
     declared = {
         Path(entry["path"]).as_posix()
@@ -445,31 +849,24 @@ def verify_config(profile, directory):
         )
     from omegaconf import OmegaConf
 
-    root_real = os.path.realpath(root)
+    path = staging / "config.yaml"
     try:
-        raw = (root / "config.yaml").read_text()
+        text = path.read_text()
     except OSError as error:
         raise AdapterError(
-            14, f"checkpoint config {root / 'config.yaml'} is unreadable: {error}"
+            14, f"checkpoint config {path} is unreadable: {error}"
         ) from error
-    text = raw.replace(CHECKPOINT_TOKEN, root_real)
-    if "${" in text:
-        raise AdapterError(
-            14,
-            f"checkpoint config {root / 'config.yaml'} uses an interpolation; the "
-            "config may only name verified paths, so resolvers such as ${oc.env:…} "
-            "are refused",
-        )
     try:
-        resolved = OmegaConf.to_container(OmegaConf.create(text), resolve=True)
-    except Exception as error:  # noqa: BLE001 - any unreadable config is invalid input
+        document = yaml.safe_load(text)
+    except yaml.YAMLError as error:
         raise AdapterError(
-            14, f"checkpoint config {root / 'config.yaml'} cannot be resolved: {error}"
+            14, f"checkpoint config {path} is not valid YAML: {error}"
         ) from error
-    if not isinstance(resolved, dict):
-        raise AdapterError(
-            14, f"checkpoint config {root / 'config.yaml'} is not a mapping"
-        )
+    if not isinstance(document, dict):
+        raise AdapterError(14, f"checkpoint config {path} is not a mapping")
+    resolved = _confine_config(
+        _substitute_anchor(document, staging, path), staging, staging
+    )
     for target in _targets(resolved):
         if not isinstance(target, str) or target not in ALLOWED_TARGETS:
             raise AdapterError(
@@ -477,11 +874,12 @@ def verify_config(profile, directory):
                 f"checkpoint config instantiates {target!r}, which is not one of the "
                 f"classes the shipped config names: {', '.join(sorted(ALLOWED_TARGETS))}",
             )
-    return _rewrite_config_paths(resolved, root_real, declared)
+    # A plain object with no interpolation left: nothing can resolve later.
+    return OmegaConf.to_container(OmegaConf.create(resolved), resolve=False)
 
 
 def verified_checkpoint(profile):
-    """The declared local checkpoint directory with its resolved config."""
+    """The declared local checkpoint directory, verified file by file."""
     local = (profile.get("checkpoint") or {}).get("localPath")
     if not isinstance(local, str) or not local:
         raise AdapterError(
@@ -497,7 +895,7 @@ def verified_checkpoint(profile):
             f"checkpoint.localPath must be a directory named {MODEL_DIR}: "
             f"{path} is not, and a rename would make kimodo download unpinned weights",
         )
-    return path, verify_config(profile, path)
+    return path
 
 
 def config_fps(config):
@@ -545,13 +943,22 @@ def encode_bvh(output, skeleton, fps, standard_tpose=True):
 
 
 def runtime_versions(envelope):
-    """Every runtime identity the fingerprint must cover: code commit and encoder pins."""
+    """Every runtime identity the fingerprint must cover.
+
+    The code commit, the three encoder pins, and the staging key: the staged
+    rewrites are a pure function of the pins and `STAGING_VERSION`, so a change
+    to either can never reuse a cached result.
+    """
     profile = envelope.profile or {}
     helper = text_encoder_helper(profile)
     encoders = ",".join(
         f"{pin['repo']}@{str(pin['revision']).lower()}" for pin in helper["checkpoints"]
     )
-    return {"kimodo": verified_source(profile), "textEncoder": encoders}
+    return {
+        "kimodo": verified_source(profile),
+        "textEncoder": encoders,
+        "staging": staging_key(profile, helper),
+    }
 
 
 def duration_seconds(profile, params):
@@ -622,39 +1029,45 @@ def produce(context):
     prompt, name, steps = validate_params(
         profile, params, context.seed, context.output_directory
     )
-    _checkpoint, config = verified_checkpoint(profile)
+    checkpoint = verified_checkpoint(profile)
+    helper = text_encoder_helper(profile)
+    snapshots = verify_snapshots(helper)
+    # Every declared file is now materialised and re-hashed: only those bytes
+    # exist in the tree, and only that tree is reachable by a relative path.
+    staging = staging_tree(profile, helper, checkpoint, snapshots)
+    config = verify_config(profile, staging)
     # Frame bounds are checked against the config's own fps before any model
     # loads: an out-of-range job must not spend a GPU load first.
     frames = duration_frames(profile, params, config_fps(config))
-    helper = text_encoder_helper(profile)
     # huggingface_hub binds its cache and offline flags at import, so the
     # environment must be complete before the first snapshot is resolved.
-    configure_environment(helper)
+    configure_environment(staging)
     device = adapter.device_string()
     os.environ["TEXT_ENCODER_DEVICE"] = device
-    snapshots = verify_snapshots(helper)
     # The encoder and the diffusion model must both be pinned before either loads.
     verified_source(profile)
 
-    encoder = build_text_encoder(device, snapshots)
-    adapter.assert_on_gpu(encoder.model, label="kimodo text encoder")
-    model = load_model(config, device, encoder)
-    adapter.assert_on_gpu(model, label="kimodo")
-    context.check_cancel()
+    with _working_directory(staging):
+        encoder = build_text_encoder(device, staged_snapshots(staging))
+        adapter.assert_on_gpu(encoder.model, label="kimodo text encoder")
+        model = load_model(config, device, encoder)
+        adapter.assert_on_gpu(model, label="kimodo")
+        context.check_cancel()
 
-    output = model(
-        [prompt.strip()],
-        [frames],
-        num_denoising_steps=steps,
-        multi_prompt=True,
-        num_samples=1,
-        post_processing=True,
-        return_numpy=True,
-        progress_bar=lambda items: items,
-    )
-    context.check_cancel()
+        output = model(
+            [prompt.strip()],
+            [frames],
+            num_denoising_steps=steps,
+            multi_prompt=True,
+            num_samples=1,
+            post_processing=True,
+            return_numpy=True,
+            progress_bar=lambda items: items,
+        )
+        context.check_cancel()
 
-    text = encode_bvh(output, model.output_skeleton, model.fps)
+        text = encode_bvh(output, model.output_skeleton, model.fps)
+
     with adapter.open_output(context.output_directory, name) as handle:
         handle.write(text.encode("utf-8"))
 

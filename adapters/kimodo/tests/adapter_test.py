@@ -39,6 +39,7 @@ ENV_NAMES = (
     "TEXT_ENCODERS_DIR",
     "TEXT_ENCODER_DEVICE",
     "CHECKPOINT_DIR",
+    "INFERNIX_ADAPTER_CACHE_DIR",
 )
 
 CONFIG_YAML = b"""_target_: kimodo.model.Kimodo
@@ -217,8 +218,10 @@ class FakeContext:
 class KimodoTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="kimodo-adapter-"))
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.addCleanup(adapter._discard, self.root)
         self.addCleanup(self.restore_env)
+        # The read-only staging trees live under the adapter cache root.
+        os.environ["INFERNIX_ADAPTER_CACHE_DIR"] = str(self.root / "cache")
         self.profile = provision(self.root)
         self.loads = []
         saved = (
@@ -268,6 +271,18 @@ class KimodoTests(unittest.TestCase):
 
     def helper(self):
         return self.profile["helpers"][0]
+
+    def staging(self, profile=None):
+        """The real staging tree for `profile`, built from the verified sources."""
+        profile = profile or self.profile
+        helper = adapter.text_encoder_helper(profile)
+        snapshots = adapter.verify_snapshots(helper)
+        checkpoint = adapter.verified_checkpoint(profile)
+        return adapter.staging_tree(profile, helper, checkpoint, snapshots)
+
+    def resolved_config(self, profile=None):
+        profile = profile or self.profile
+        return adapter.verify_config(profile, self.staging(profile))
 
     def redeclare(self, pin, relative, payload):
         """Rewrite a snapshot file and update the pin's declared hash."""
@@ -337,15 +352,27 @@ class KimodoTests(unittest.TestCase):
         for path in snapshots.values():
             self.assertTrue(Path(path).is_absolute())
             self.assertTrue(path.startswith(str(self.root)))
+            self.assertTrue(Path(path).is_dir())
 
     def test_inherited_cache_environment_is_overridden(self):
         for name in ENV_NAMES:
-            os.environ[name] = f"/unverified/{name}"
+            if name != "INFERNIX_ADAPTER_CACHE_DIR":
+                os.environ[name] = f"/unverified/{name}"
+        os.environ["INFERNIX_ADAPTER_CACHE_DIR"] = str(self.root / "cache")
         adapter.produce(self.context())
-        local = self.helper()["localPath"]
-        self.assertEqual(os.environ["HF_HOME"], local)
-        self.assertEqual(os.environ["HF_HUB_CACHE"], str(Path(local) / "hub"))
-        self.assertEqual(os.environ["HUGGINGFACE_CACHE_DIR"], str(Path(local) / "hub"))
+        home = Path(os.environ["HF_HOME"])
+        hub = Path(os.environ["HF_HUB_CACHE"])
+        self.assertTrue(home.is_dir())
+        self.assertTrue(hub.is_dir())
+        # Empty directories inside the staging tree: a repository id finds
+        # nothing there, and neither can an inherited cache path.
+        self.assertEqual(home.parent, hub.parent)
+        self.assertEqual(home.name, adapter.HF_HOME_DIRECTORY)
+        self.assertEqual(hub.name, adapter.HF_HUB_DIRECTORY)
+        self.assertEqual(os.listdir(home), [])
+        self.assertEqual(os.listdir(hub), [])
+        self.assertNotEqual(home.parent, Path(self.helper()["localPath"]))
+        self.assertEqual(os.environ["HUGGINGFACE_CACHE_DIR"], str(hub))
         self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
         self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
         self.assertNotIn("TEXT_ENCODERS_DIR", os.environ)
@@ -429,35 +456,35 @@ class KimodoTests(unittest.TestCase):
         ]
         profile = with_checkpoint(self.profile, files=files)
         with self.assertRaises(AdapterError) as caught:
-            adapter.verified_checkpoint(profile)
+            adapter.verify_config(profile, self.staging(profile))
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("config.yaml", str(caught.exception))
 
     def test_config_reference_outside_the_checkpoint_is_refused(self):
         payload = b"denoiser:\n  ckpt_path: ${oc.select:checkpoint_dir}/../escape.safetensors\n"
-        adapter.verified_checkpoint(self.profile)
-        weights = Path(self.profile["checkpoint"]["localPath"])
-        (weights / "config.yaml").write_bytes(payload)
-        for entry in self.profile["checkpoint"]["files"]:
-            if entry["path"] == "config.yaml":
-                entry["sha256"] = digest(payload)
+        self.redeclare_config(payload)
         with self.assertRaises(AdapterError) as caught:
-            adapter.verified_checkpoint(self.profile)
+            self.resolved_config()
         self.assertEqual(caught.exception.code, 14)
-        self.assertIn("outside the verified checkpoint", str(caught.exception))
+        self.assertIn("verified staging tree", str(caught.exception))
+        self.assertIn("escape.safetensors", str(caught.exception))
 
-    def test_config_reference_to_an_undeclared_file_is_refused(self):
+    def test_config_path_that_names_nothing_staged_is_refused(self):
         (Path(self.profile["checkpoint"]["localPath"]) / "stats/motion/body/extra.npy").write_bytes(
             b"unlisted"
         )
+        self.redeclare_config(
+            b"denoiser:\n  ckpt_path: ${oc.select:checkpoint_dir}/stats/motion/body/extra.npy\n"
+        )
         with self.assertRaises(AdapterError) as caught:
-            adapter.verified_checkpoint(self.profile)
+            self.resolved_config()
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("extra.npy", str(caught.exception))
 
-    def test_config_paths_resolve_to_the_verified_checkpoint(self):
-        checkpoint, config = adapter.verified_checkpoint(self.profile)
-        root = os.path.realpath(checkpoint)
+    def test_config_paths_resolve_into_the_staging_tree(self):
+        staging = self.staging()
+        config = adapter.verify_config(self.profile, staging)
+        root = os.path.realpath(staging)
         self.assertEqual(
             config["denoiser"]["ckpt_path"], os.path.join(root, "model.safetensors")
         )
@@ -467,34 +494,73 @@ class KimodoTests(unittest.TestCase):
         )
         self.assertNotIn("${", json.dumps(config))
         self.assertNotIn("checkpoint_dir", config)
-        # A bare filename is a path too: it is rewritten to the verified file,
+        # A bare filename is a path too: it is rewritten to the staged file,
         # not to a same-named file in the working directory.
         shadow = self.working_directory() / "model.safetensors"
         shadow.write_bytes(b"shadow")
         self.redeclare_config(b"denoiser:\n  ckpt_path: model.safetensors\n")
-        _, bare = adapter.verified_checkpoint(self.profile)
+        bare_staging = self.staging()
+        bare = adapter.verify_config(self.profile, bare_staging)
         self.assertEqual(
-            bare["denoiser"]["ckpt_path"], os.path.join(root, "model.safetensors")
+            bare["denoiser"]["ckpt_path"],
+            os.path.join(os.path.realpath(bare_staging), "model.safetensors"),
         )
         self.assertNotEqual(bare["denoiser"]["ckpt_path"], str(shadow))
 
     def test_config_bare_undeclared_checkpoint_path_is_refused(self):
-        # A bare filename resolves inside the verified checkpoint, never the CWD,
-        # so a file with that name in the working directory cannot satisfy it.
+        # A bare filename resolves inside the staging tree, never the CWD, so a
+        # file with that name in the working directory cannot satisfy it.
         self.working_directory().joinpath("other.safetensors").write_bytes(b"shadow")
         self.redeclare_config(b"denoiser:\n  ckpt_path: other.safetensors\n")
         with self.assertRaises(AdapterError) as caught:
-            adapter.verified_checkpoint(self.profile)
+            self.resolved_config()
         self.assertEqual(caught.exception.code, 14)
-        self.assertIn("does not declare", str(caught.exception))
+        self.assertIn("names no declared file", str(caught.exception))
         self.assertIn("other.safetensors", str(caught.exception))
+
+    def test_config_folders_outside_the_staging_tree_are_refused(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (Path(self.root / "cache" / adapter.STAGING_DIRECTORY) / "sibling").mkdir(
+            parents=True, exist_ok=True
+        )
+        for payload in (
+            b"denoiser:\n  folder: " + str(outside).encode() + b"\n",
+            b"denoiser:\n  _args_:\n  - " + str(outside).encode() + b"\n",
+            b"denoiser:\n  motion_rep:\n    stats:\n      folder: "
+            + str(outside).encode()
+            + b"\n",
+            b"denoiser:\n  folder: ../sibling\n",
+            b"denoiser:\n  folder: /nonexistent/weights\n",
+        ):
+            with self.subTest(payload=payload):
+                self.redeclare_config(payload)
+                with self.assertRaises(AdapterError) as caught:
+                    self.resolved_config()
+                self.assertEqual(caught.exception.code, 14)
+                self.assertIn("verified staging tree", str(caught.exception))
 
     def test_config_interpolation_is_refused(self):
         self.redeclare_config(b"denoiser:\n  ckpt_path: ${oc.env:KIMODO_CKPT}\n")
         with self.assertRaises(AdapterError) as caught:
-            adapter.verified_checkpoint(self.profile)
+            self.resolved_config()
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("interpolation", str(caught.exception))
+
+    def test_escaped_and_defaulted_interpolations_are_refused(self):
+        # OmegaConf interpolates these even though a text check for a bare
+        # `${` does not see the escaped form, and `oc.select` takes a default.
+        for payload in (
+            b"denoiser:\n  ckpt_path: \\${oc.env:KIMODO_CKPT}\n",
+            b"denoiser:\n  ckpt_path: '${oc.env:KIMODO_CKPT}'\n",
+            b"denoiser:\n  ckpt_path: ${oc.select:checkpoint_dir,model.safetensors}\n",
+        ):
+            with self.subTest(payload=payload):
+                self.redeclare_config(payload)
+                with self.assertRaises(AdapterError) as caught:
+                    self.resolved_config()
+                self.assertEqual(caught.exception.code, 14)
+                self.assertIn("interpolation", str(caught.exception))
 
     def test_config_may_only_instantiate_the_shipped_classes(self):
         self.redeclare_config(
@@ -502,16 +568,17 @@ class KimodoTests(unittest.TestCase):
             b"  reader:\n    _target_: pathlib.Path.read_text\n"
         )
         with self.assertRaises(AdapterError) as caught:
-            adapter.verified_checkpoint(self.profile)
+            self.resolved_config()
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("pathlib.Path.read_text", str(caught.exception))
 
     def test_model_is_instantiated_from_the_resolved_config_without_a_reread(self):
         import kimodo.model.loading as loading
 
-        checkpoint, config = adapter.verified_checkpoint(self.profile)
-        # The file is gone; a load that re-read it would fail.
-        (Path(checkpoint) / "config.yaml").unlink()
+        staging = self.staging()
+        config = adapter.verify_config(self.profile, staging)
+        # Only the staged copy is read; the source is gone.
+        (Path(self.profile["checkpoint"]["localPath"]) / "config.yaml").unlink()
         captured = {}
 
         def instantiate(cfg, overrides=None):
@@ -526,7 +593,7 @@ class KimodoTests(unittest.TestCase):
         self.assertIsNone(captured["config"]["text_encoder"])
         self.assertEqual(
             captured["config"]["denoiser"]["ckpt_path"],
-            os.path.join(os.path.realpath(checkpoint), "model.safetensors"),
+            os.path.join(os.path.realpath(staging), "model.safetensors"),
         )
         self.assertIs(model.text_encoder, encoder)
 
@@ -545,7 +612,7 @@ class KimodoTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("byte for byte", str(caught.exception))
 
-    def test_text_encoder_loads_the_base_and_both_loras_by_path(self):
+    def test_text_encoder_loads_the_staged_base_and_both_loras_by_path(self):
         import kimodo.model.llm2vec as llm2vec_module
         import peft
 
@@ -554,7 +621,7 @@ class KimodoTests(unittest.TestCase):
         (shadow / "adapter_config.json").write_text(
             json.dumps({"base_model_name_or_path": "attacker/model"})
         )
-        snapshots = adapter.verify_snapshots(self.helper())
+        snapshots = adapter.staged_snapshots(self.staging())
         loaded = {"kwargs": None, "stacks": []}
 
         class Recorder:
@@ -583,6 +650,18 @@ class KimodoTests(unittest.TestCase):
             self.assertTrue(Path(path).is_absolute())
             self.assertNotEqual(Path(path), shadow)
 
+    def test_the_staged_adapter_config_names_the_staged_base(self):
+        snapshots = adapter.staged_snapshots(self.staging())
+        # The shipped config names a repository id; the staged copy we write
+        # names the staged base directory, so PEFT can never resolve an id.
+        for repo in (adapter.LLM2VEC, adapter.LLM2VEC_SUPERVISED):
+            document = json.loads(
+                (Path(snapshots[repo]) / "adapter_config.json").read_text()
+            )
+            self.assertEqual(
+                document["base_model_name_or_path"], snapshots[adapter.BASE_LLAMA]
+            )
+
     def test_undeclared_shard_under_a_symlinked_directory_is_refused(self):
         elsewhere = self.root / "elsewhere"
         (elsewhere / "shard").mkdir(parents=True)
@@ -600,6 +679,138 @@ class KimodoTests(unittest.TestCase):
             adapter.verify_snapshots(self.helper())
         self.assertEqual(caught.exception.code, 14)
         self.assertIn("shard/extra.safetensors", str(caught.exception))
+
+    def test_staging_tree_holds_only_the_declared_files(self):
+        # An undeclared file in the source does not exist in the tree: there is
+        # nothing for a loader to pick up that the pin did not name.
+        (Path(self.profile["checkpoint"]["localPath"]) / "stats/motion/body/extra.npy").write_bytes(
+            b"unlisted"
+        )
+        staging = self.staging()
+        declared = {
+            Path(entry["path"]).as_posix()
+            for entry in self.profile["checkpoint"]["files"]
+        }
+        declared |= {
+            (
+                Path(adapter.ENCODER_DIRECTORY)
+                / adapter._slug(pin["repo"])
+                / Path(entry["path"]).as_posix()
+            ).as_posix()
+            for pin in self.helper()["checkpoints"]
+            for entry in pin["files"]
+        }
+        found = set()
+        for base, directories, names in os.walk(staging):
+            for name in directories + names:
+                self.assertFalse(
+                    (Path(base) / name).is_symlink(),
+                    f"{Path(base) / name} is a symlink",
+                )
+            for name in names:
+                found.add((Path(base) / name).relative_to(staging).as_posix())
+        self.assertEqual(sorted(found - {adapter.MANIFEST}), sorted(declared))
+        self.assertNotIn("stats/motion/body/extra.npy", found)
+        self.assertEqual(os.listdir(staging / adapter.HF_HOME_DIRECTORY), [])
+        self.assertEqual(os.listdir(staging / adapter.HF_HUB_DIRECTORY), [])
+        self.assertFalse(staging.stat().st_mode & 0o222, "the tree must be read-only")
+        manifest = json.loads((staging / adapter.MANIFEST).read_text())
+        self.assertEqual(manifest["key"], adapter.staging_key(self.profile, self.helper()))
+        rewritten = {
+            record["path"] for record in manifest["files"] if record["rewritten"]
+        }
+        self.assertEqual(
+            rewritten,
+            {
+                f"{adapter.ENCODER_DIRECTORY}/{adapter._slug(repo)}/adapter_config.json"
+                for repo in (adapter.LLM2VEC, adapter.LLM2VEC_SUPERVISED)
+            },
+        )
+
+    def test_a_blob_symlink_is_staged_as_a_regular_file(self):
+        pin = self.helper()["checkpoints"][1]
+        root = (
+            Path(self.helper()["localPath"])
+            / "hub"
+            / f"models--{pin['repo'].replace('/', '--')}"
+        )
+        snapshot = root / "snapshots" / pin["revision"]
+        payload = (snapshot / "adapter_model.safetensors").read_bytes()
+        (root / "blobs").mkdir()
+        blob = root / "blobs" / digest(payload)
+        blob.write_bytes(payload)
+        (snapshot / "adapter_model.safetensors").unlink()
+        (snapshot / "adapter_model.safetensors").symlink_to(blob)
+        staging = self.staging()
+        staged = (
+            Path(staging)
+            / adapter.ENCODER_DIRECTORY
+            / adapter._slug(adapter.LLM2VEC)
+            / "adapter_model.safetensors"
+        )
+        self.assertFalse(staged.is_symlink())
+        self.assertEqual(staged.read_bytes(), payload)
+
+    def test_a_source_that_changes_after_verification_is_refused(self):
+        helper = self.helper()
+        snapshots = adapter.verify_snapshots(helper)
+        checkpoint = adapter.verified_checkpoint(self.profile)
+        blob = Path(snapshots[adapter.LLM2VEC]) / "adapter_model.safetensors"
+        blob.write_bytes(b"tampered-after-verification")
+        with self.assertRaises(AdapterError) as caught:
+            adapter.staging_tree(self.profile, helper, checkpoint, snapshots)
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("changed after it was verified", str(caught.exception))
+
+    def test_a_tampered_staging_tree_is_rebuilt(self):
+        staging = self.staging()
+        manifest = json.loads((Path(staging) / adapter.MANIFEST).read_text())
+        # A file we wrote ourselves has a private inode; tampering it cannot
+        # reach the verified source.
+        relative = next(
+            record["path"] for record in manifest["files"] if record["rewritten"]
+        )
+        target = Path(staging) / relative
+        os.chmod(target, 0o644)
+        target.write_bytes(b"tampered")
+        self.assertIsNone(adapter._reusable(staging, manifest["key"]))
+        rebuilt = self.staging()
+        self.assertEqual(rebuilt, staging)
+        self.assertNotEqual((Path(rebuilt) / relative).read_bytes(), b"tampered")
+
+    def test_a_tokenizer_config_may_not_name_a_file_outside_the_tree(self):
+        secret = self.root / "elsewhere" / "tokenizer.json"
+        secret.parent.mkdir()
+        secret.write_bytes(b"undeclared tokenizer")
+        payload = json.dumps(
+            {"tokenizer_class": "PreTrainedTokenizerFast", "tokenizer_file": str(secret)}
+        ).encode()
+        self.redeclare(self.helper()["checkpoints"][1], "tokenizer_config.json", payload)
+        with self.assertRaises(AdapterError) as caught:
+            self.staging()
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("outside the verified staging tree", str(caught.exception))
+
+    def test_a_tokenizer_config_inside_the_tree_is_pinned_to_its_staged_path(self):
+        payload = json.dumps({"tokenizer_file": "tokenizer.json"}).encode()
+        self.redeclare(self.helper()["checkpoints"][1], "tokenizer_config.json", payload)
+        staging = self.staging()
+        staged = (
+            Path(staging)
+            / adapter.ENCODER_DIRECTORY
+            / adapter._slug(adapter.LLM2VEC)
+            / "tokenizer_config.json"
+        )
+        document = json.loads(staged.read_text())
+        self.assertEqual(
+            document["tokenizer_file"], str(staged.parent / "tokenizer.json")
+        )
+        self.assertTrue((staged.parent / "tokenizer.json").is_file())
+        manifest = json.loads((Path(staging) / adapter.MANIFEST).read_text())
+        rewritten = {
+            record["path"] for record in manifest["files"] if record["rewritten"]
+        }
+        self.assertIn(staged.relative_to(staging).as_posix(), rewritten)
 
     def test_encoder_requires_exactly_the_three_pins(self):
         missing = dict(

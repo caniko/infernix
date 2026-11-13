@@ -66,16 +66,15 @@ def _verify_entries(root, entries):
 
     A Hugging Face cache stores every snapshot file as a symlink into `blobs/`,
     so the hash is taken from the realpath target the adapter will load.
-
-    ponytail: verification and loading reopen paths, so a writer that can reach
-    the verified tree could swap bytes in between (TOCTOU). Accepted: the
-    production model root is owned by infernix-worker, the job's own user, so no
-    other user can write it. Upgrade path: load from an immutable verified
-    staging copy instead of reopening the source tree.
     """
     for entry in entries:
         relative = entry.get("path")
         expected = entry.get("sha256")
+        if Path(relative).is_absolute() or ".." in Path(relative).parts:
+            raise invalid(
+                f"checkpoint.files path {relative!r} is not a relative path inside "
+                "the checkpoint"
+            )
         path = root / relative
         if not path.is_file():
             raise invalid(f"pinned checkpoint file missing: {path}")
@@ -91,59 +90,15 @@ def verify_files(profile, directory):
     return entries
 
 
-def index_referenced_files(directory):
-    """Every shard a weight index names, relative to `directory`.
+def _walk_files(root):
+    """Every file under `root`, following symlinked directories.
 
-    Indexes are discovered recursively, and each shard resolves against the
-    directory holding its own index. The result must stay inside the checkpoint
-    root, so a nested index cannot point `../../outside.safetensors` at a file
-    the profile never declared.
-    """
-    root = Path(directory)
-    root_real = Path(os.path.realpath(root))
-    referenced = set()
-    for index in sorted(root.rglob(f"*{INDEX_SUFFIX}")):
-        try:
-            document = json.loads(index.read_text())
-        except (OSError, ValueError) as error:
-            raise invalid(f"weight index {index.name} is unreadable: {error}") from error
-        weight_map = document.get("weight_map") if isinstance(document, dict) else None
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise invalid(f"weight index {index.name} declares no weight_map")
-        for shard in weight_map.values():
-            if not isinstance(shard, str) or not shard:
-                raise invalid(f"weight index {index.name} names an invalid shard {shard!r}")
-            resolved = Path(os.path.realpath(index.parent / shard))
-            if resolved != root_real and root_real not in resolved.parents:
-                raise invalid(
-                    f"weight index {index.name} names shard {shard!r}, which escapes "
-                    f"the checkpoint root {root}"
-                )
-            if not resolved.is_file():
-                raise invalid(
-                    f"weight index {index.name} names shard {shard!r}, which is not "
-                    "a file in the checkpoint"
-                )
-            referenced.add(resolved.relative_to(root_real).as_posix())
-    return referenced
-
-
-def refuse_unlisted_weights(root, entries, suffixes=WEIGHT_SUFFIXES):
-    """A local directory may not smuggle files the profile does not declare.
-
-    `suffixes` limits the rule to weight files (the default); `None` requires
-    every file in the directory to be declared, which is how a Hugging Face
-    snapshot whose configs steer loading is verified.
-
-    Hugging Face caches are symlink farms (`snapshots/<sha>/model.safetensors`
-    -> `blobs/<sha>`), so the walk follows links and checks every file under
-    the path it is found at. Cycles are cut by ancestry, not by a global set of
-    visited real directories: `transformer -> a` is a second relative path onto
-    the same directory, and a weight behind it is undeclared even when `a/` was
-    walked first.
+    A Hugging Face cache is a symlink farm, so a walk that ignores links misses
+    real files. Cycles are cut by ancestry, not by a global set of visited real
+    directories: `transformer -> a` is a second relative path onto the same
+    directory, and what it holds is still a file of this checkpoint.
     """
     root = Path(root)
-    declared = {Path(entry["path"]).as_posix() for entry in entries}
     for base, directories, files in os.walk(root, followlinks=True):
         from_root = Path(os.path.relpath(base, root))
         ancestors = (
@@ -156,18 +111,96 @@ def refuse_unlisted_weights(root, entries, suffixes=WEIGHT_SUFFIXES):
             continue
         directories.sort()
         for name in sorted(files):
-            candidate = Path(base) / name
-            if suffixes is not None and candidate.suffix.lower() not in suffixes:
-                continue
-            if not candidate.is_file():
-                continue
-            relative = candidate.relative_to(root).as_posix()
-            if relative not in declared:
-                kind = "weight file" if suffixes is not None else "file"
+            yield Path(base) / name
+
+
+def _containment_root(root_real):
+    """The directory a checkpoint's symlinks may resolve into.
+
+    A Hugging Face snapshot holds every file as a link to `../../blobs/<sha>`,
+    so a shard a weight index names resolves into the repository cache directory
+    holding both `blobs/` and `snapshots/`. That whole repository directory is
+    the reachable tree for such a link; nothing outside it is ever loaded.
+    """
+    for parent in Path(root_real).parents:
+        if (parent / "blobs").is_dir() and (parent / "snapshots").is_dir():
+            return parent
+    return Path(root_real)
+
+
+def index_referenced_files(directory):
+    """Every shard a weight index names, relative to `directory`.
+
+    Indexes are discovered recursively, including behind a symlinked directory,
+    and each shard resolves against the directory holding its own index. A shard
+    may be a Hugging Face blob symlink, which must still resolve inside the
+    repository cache the checkpoint lives in; the path recorded is the one the
+    index names, so "every shard must be declared" stays a check on the pin.
+    """
+    root = Path(directory)
+    root_real = Path(os.path.realpath(root))
+    base = _containment_root(root_real)
+    referenced = set()
+    for index in sorted(
+        path for path in _walk_files(root) if path.name.endswith(INDEX_SUFFIX)
+    ):
+        try:
+            document = json.loads(index.read_text())
+        except (OSError, ValueError) as error:
+            raise invalid(f"weight index {index.name} is unreadable: {error}") from error
+        weight_map = document.get("weight_map") if isinstance(document, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise invalid(f"weight index {index.name} declares no weight_map")
+        for shard in weight_map.values():
+            if not isinstance(shard, str) or not shard:
+                raise invalid(f"weight index {index.name} names an invalid shard {shard!r}")
+            named = Path(os.path.normpath(index.parent / shard))
+            resolved = Path(os.path.realpath(named))
+            if resolved != base and base not in resolved.parents:
                 raise invalid(
-                    f"checkpoint directory contains an unlisted {kind}: {relative}; "
-                    "every file the adapter may load needs its sha256 in the declared files"
+                    f"weight index {index.name} names shard {shard!r}, which escapes "
+                    f"the checkpoint root {root}"
                 )
+            if not resolved.is_file():
+                raise invalid(
+                    f"weight index {index.name} names shard {shard!r}, which is not "
+                    "a file in the checkpoint"
+                )
+            relative = Path(os.path.relpath(named, root)).as_posix()
+            if ".." in Path(relative).parts:
+                raise invalid(
+                    f"weight index {index.name} names shard {shard!r}, which escapes "
+                    f"the checkpoint root {root}"
+                )
+            referenced.add(relative)
+    return referenced
+
+
+def refuse_unlisted_weights(root, entries, suffixes=WEIGHT_SUFFIXES):
+    """A local directory may not smuggle files the profile does not declare.
+
+    `suffixes` limits the rule to weight files (the default); `None` requires
+    every file in the directory to be declared, which is how a Hugging Face
+    snapshot whose configs steer loading is verified.
+
+    The walk follows symlinked directories and checks every file under the path
+    it is found at, so a weight behind a second link onto the same directory is
+    undeclared even when the linked directory was walked first.
+    """
+    root = Path(root)
+    declared = {Path(entry["path"]).as_posix() for entry in entries}
+    for candidate in _walk_files(root):
+        if suffixes is not None and candidate.suffix.lower() not in suffixes:
+            continue
+        if not candidate.is_file():
+            continue
+        relative = candidate.relative_to(root).as_posix()
+        if relative not in declared:
+            kind = "weight file" if suffixes is not None else "file"
+            raise invalid(
+                f"checkpoint directory contains an unlisted {kind}: {relative}; "
+                "every file the adapter may load needs its sha256 in the declared files"
+            )
 
 
 def verify_directory(directory, entries, suffixes=WEIGHT_SUFFIXES):

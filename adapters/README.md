@@ -46,9 +46,12 @@ Adapters load only that checkpoint, and `checkpoint.py` enforces the pin:
   the walk follows symlinked directories (a Hugging Face cache is a
   `snapshots/<sha>/model.safetensors` → `blobs/<sha>` link farm) and hashes the
   file each declared path resolves to;
-- every `*.index.json` is found recursively, and each shard it names resolves
-  against that index's own directory, must stay inside the checkpoint root, and
-  must be a declared file — a nested index cannot name `../../outside.safetensors`;
+- every `*.index.json` is found recursively — through a symlinked directory too —
+  and each shard it names resolves against that index's own directory. A shard
+  may be a Hugging Face `blobs/<sha>` link, which must still resolve inside the
+  repository cache holding the snapshot, and the path recorded is the path the
+  index names, so every shard must be a declared file: a nested index cannot
+  name `../../outside.safetensors`, and a link cannot reach another repository;
 - a local file (`checkpoint.localPath` for an adapter that loads one file) needs
   a matching `files` entry, or it is refused.
 
@@ -154,7 +157,7 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-107 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+111 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
 again when it drops to the CPU *after* generation); a tensor on the wrong GPU
 index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP or
@@ -168,7 +171,10 @@ versions, an adapter-specific renderer version or source commit, and a null
 identity refused); full-sha, local-directory and local-file checkpoint
 resolution (branch/tag/short sha rejected, undeclared weights, undeclared files
 and a weight index naming an undeclared shard rejected, a nested index escaping
-the checkpoint root rejected); output-path traversal, realpath escapes and
+the checkpoint root rejected, a Hugging Face snapshot whose shards are
+`../../blobs/<sha>` links accepted while a link out of the repository cache and
+a weight index behind a symlinked directory are refused); output-path
+traversal, realpath escapes and
 symlinks (also through `O_NOFOLLOW`); cache corruption/missing file forcing a
 recompute; and a cache hit restoring the stored validation. The XPU branches
 are covered without an Intel card: device selection and mismatch, `mem_get_info`
@@ -638,19 +644,36 @@ model folder `CHECKPOINT_DIR/<display name>`. A remote-only or misnamed
 checkpoint is `invalid_input` rather than a silent unpinned download.
 `pinned_source` verifies every declared sha256, refuses an undeclared weight,
 and requires every shard named by a weights index — including an index in a
-subdirectory, resolved against its own directory and kept inside the root — to
-be declared. `config.yaml` must be one of the declared files. It is read once,
-after its hash check, and turned into the one config Hydra instantiates: the
-adapter's own `checkpoint_dir` anchor becomes the verified directory, any other
-`${...}` resolver (`oc.env` included) is refused, every `_target_` must be one
-of the four classes the shipped config names (`kimodo.model.Kimodo`,
+subdirectory, resolved against its own directory, and including a Hugging Face
+`blobs/<sha>` link that stays inside the repository cache — to be declared.
+
+Every declared file of the checkpoint and of the three encoder snapshots is then
+materialised into one staging tree at
+`$INFERNIX_ADAPTER_CACHE_DIR/kimodo-staging/<sha256 of every pin>/` — a hardlink
+on the same filesystem, a copy otherwise — and hashed again against its
+declaration, so the bytes upstream reads are the bytes that were verified and a
+source that changed after verification is refused. Only declared files exist in
+that tree (no symlink, no extra file), the directories are read-only, and the
+tree is published by renaming a fully built temporary directory, so a
+concurrent job reuses it instead of reading a partial one. It is reused while a
+cheap size check holds; a tampered tree is rebuilt. The process changes into the
+staging tree for the whole load, so a relative path cannot resolve anywhere
+else.
+
+`config.yaml` must be one of the declared files. It is read once from the staged
+copy, parsed as plain YAML, and turned into the one config Hydra instantiates:
+the adapter's own `checkpoint_dir` anchor becomes the staging directory, every
+other `${...}` interpolation — including an escaped `\${oc.env:…}` and a
+defaulted `${oc.select:checkpoint_dir,…}` — is refused, every `_target_` must be
+one of the four classes the shipped config names (`kimodo.model.Kimodo`,
 `kimodo.model.twostage_denoiser.TwostageDenoiser`,
 `kimodo.motion_rep.KimodoMotionRep`, `kimodo.skeleton.SOMASkeleton30`), and
-every path it names (`ckpt_path`, `*_path`, `*_dir`, `*_file`, `stats`, and any
-value ending in `.safetensors`, `.npy`, `.pt`, `.bin`, `.json` or `.yaml`) is
-rewritten to its canonical absolute path inside the checkpoint. Upstream never
-re-reads the file, so the bytes that were verified are the bytes that are
-instantiated.
+every string leaf is confined to the staging tree: a value that resolves inside
+it is pinned to its published absolute path, and one that resolves outside it,
+is an absolute path, or names nothing the tree holds is exit 14. That is what
+covers `folder`, `stats.folder`, `_args_` and any field added later, without a
+key list. Upstream never re-reads the file, so the bytes that were verified are
+the bytes that are instantiated.
 
 The text encoder is LLM2Vec over the gated Meta-Llama-3-8B-Instruct: the base
 8B weights plus two stacked LoRA adapters (mntp, then mntp-supervised). All
@@ -660,18 +683,20 @@ verified file by file: the loader's files (weights, shard index, config.json,
 adapter_config.json, tokenizer files, generation_config) must be declared, and
 every other file in the snapshot must be declared too. `refs/main` must match
 the pin byte for byte, with no newline tolerance and no case folding, and the
-cache may hold only the three declared repositories. Everything loads by path:
-the base Llama and both LoRAs are attached from their verified absolute snapshot
-directories, so no `from_pretrained` call receives a repo id, a working-directory
-directory named like one cannot shadow it, and `adapter_config.json`'s
-`base_model_name_or_path` is only checked (it may name the declared base), never
-resolved. The process clears `TEXT_ENCODERS_DIR` and `CHECKPOINT_DIR` and pins
-`HF_HOME`, `HF_HUB_CACHE`, `HUGGINGFACE_CACHE_DIR`, `HF_HUB_OFFLINE=1` and
-`TRANSFORMERS_OFFLINE=1` to the verified cache, so no resolution can reach the
-Hub, and `TEXT_ENCODER_DEVICE` is pinned to the selected GPU — upstream's
-`TEXT_ENCODER_DEVICE=cpu` path is never taken. Frame bounds are checked against
-the config's own `fps` before any model loads. The fingerprint covers the
-installed `kimodo` distribution's PEP 610 commit and the three encoder pins, so
+cache may hold only the three declared repositories. Everything loads by path
+from the staged snapshots: the base Llama and both LoRAs are attached from their
+staged directories, so no `from_pretrained` call receives a repo id. A staged
+`adapter_config.json` we write ourselves names the staged base, and every string
+leaf of every staged snapshot config is confined to the tree the same way — a
+`tokenizer_file` outside it is exit 14, an internal one is pinned to its staged
+path. `HF_HOME` and `HF_HUB_CACHE` point at empty directories inside the staging
+tree, `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set,
+`TEXT_ENCODERS_DIR` and `CHECKPOINT_DIR` are cleared, and `TEXT_ENCODER_DEVICE`
+is pinned to the selected GPU — upstream's `TEXT_ENCODER_DEVICE=cpu` path is
+never taken. Frame bounds are checked against the config's own `fps` before any
+model loads. The fingerprint covers the installed `kimodo` distribution's
+PEP 610 commit, the three encoder pins and the staging key (a change to the
+staged rewrites bumps `STAGING_VERSION`), so
 a cache entry cannot be reused across a source or encoder change.
 
 ROCm: Kimodo is pure PyTorch plus that one CPU-only C++ extension, so nothing

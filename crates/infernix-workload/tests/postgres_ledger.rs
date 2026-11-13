@@ -477,6 +477,80 @@ async fn expired_lease_is_recovered_by_another_worker() {
 }
 
 #[tokio::test]
+async fn complete_is_refused_after_a_cancellation_request() {
+    let cluster = TestCluster::start();
+    let client = fresh_database(&cluster).await.unwrap();
+    client.enqueue(&job("job")).await.unwrap();
+    let atlas = worker("atlas");
+    let lease = claim_one(&client, &atlas).await;
+
+    client.cancel(&JobId::new("job").unwrap()).await.unwrap();
+    assert!(
+        !client
+            .complete(&lease, &serde_json::json!({"late": true}))
+            .await
+            .unwrap(),
+        "COMPLETE must refuse a job whose cancellation was requested"
+    );
+    let status = client
+        .status(&JobId::new("job").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, JobState::Leased);
+    assert!(status.result.is_none());
+
+    // The worker confirms the cancellation instead.
+    assert!(client.confirm_cancelled(&lease).await.unwrap());
+    let status = client
+        .status(&JobId::new("job").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.state, JobState::Cancelled);
+    assert!(status.result.is_none());
+}
+
+#[tokio::test]
+async fn complete_requires_an_unexpired_lease() {
+    let cluster = TestCluster::start();
+    let client = fresh_database(&cluster).await.unwrap();
+    client.enqueue(&job("job")).await.unwrap();
+    let atlas = worker("atlas");
+    client.register_worker(&atlas).await.unwrap();
+    let lease = client
+        .claim(
+            &atlas.id,
+            &atlas.boot_id,
+            &capabilities(),
+            &pairs(),
+            Duration::seconds(1),
+        )
+        .await
+        .unwrap()
+        .expect("a queued job is claimable")
+        .lease;
+
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(
+        !client
+            .complete(&lease, &serde_json::json!({"late": true}))
+            .await
+            .unwrap(),
+        "COMPLETE needs the same unexpired lease as HEARTBEAT"
+    );
+    assert!(
+        client
+            .status(&JobId::new("job").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .result
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn migrations_are_additive_and_idempotent() {
     let cluster = TestCluster::start();
     let client = fresh_database(&cluster).await.unwrap();

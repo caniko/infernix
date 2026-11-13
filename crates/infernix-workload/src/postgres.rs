@@ -209,6 +209,10 @@ impl WorkloadClient {
             workload: row.get("workload"),
             queue: row.get("queue"),
             input_fingerprint: row.get("input_fingerprint"),
+            requirements: row
+                .get::<_, Vec<String>>("requirements")
+                .into_iter()
+                .collect(),
             payload: row.get("payload"),
         }))
     }

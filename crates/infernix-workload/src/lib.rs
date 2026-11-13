@@ -42,6 +42,8 @@ pub enum WorkloadError {
     TerminalJob(String),
     #[error("cancellation for job `{job}` was not requested")]
     CancelNotRequested { job: String },
+    #[error("cancellation for job `{job}` was requested before completion")]
+    CancelRequested { job: String },
     #[error("job `{job}` was not completed by worker `{worker}`")]
     NotCompletedBy { job: String, worker: String },
     #[error("invalid workload profile field `{field}`")]
@@ -494,6 +496,10 @@ pub struct ClaimedJob {
     pub workload: String,
     pub queue: String,
     pub input_fingerprint: String,
+    /// The job's requirements, including the `profile:<id>` that selects the
+    /// worker's adapter.
+    #[serde(default)]
+    pub requirements: BTreeSet<String>,
     pub payload: Value,
 }
 
@@ -679,6 +685,23 @@ impl InMemoryQueue {
             .get_mut(&lease.job_id)
             .ok_or_else(|| WorkloadError::UnknownJob(lease.job_id.as_str().to_owned()))?;
         ensure_current_lease(record, lease)?;
+        // A requested cancellation outranks a completion: the worker must
+        // confirm the cancellation instead, exactly as the SQL contract does.
+        if record.cancel_requested_at.is_some() {
+            return Err(WorkloadError::CancelRequested {
+                job: lease.job_id.as_str().to_owned(),
+            });
+        }
+        // Like `HEARTBEAT`, completion needs a lease that has not expired yet.
+        if record
+            .lease
+            .as_ref()
+            .is_some_and(|current| current.expires_at <= completion.completed_at)
+        {
+            return Err(WorkloadError::StaleLease {
+                job: lease.job_id.as_str().to_owned(),
+            });
+        }
         record.state = JobState::Succeeded;
         record.result = Some(completion.artifact);
         record.error = None;
@@ -1149,6 +1172,10 @@ UPDATE infernix_workload_workers
     /// Completion is accepted only for the current lease generation. The
     /// completing worker and boot stay recorded so `MARK_DELIVERED` can be
     /// fenced on them; the lease token is retired.
+    ///
+    /// A requested cancellation wins over completion: the worker then confirms
+    /// the cancellation instead of completing. The lease must also still be
+    /// unexpired, the same predicate `HEARTBEAT` applies.
     pub const COMPLETE: &str = r#"
 UPDATE infernix_workload_jobs
    SET state = 'succeeded',
@@ -1162,7 +1189,9 @@ UPDATE infernix_workload_jobs
    AND state = 'leased'
    AND lease_owner = $2
    AND lease_boot_id = $3
-   AND lease_token = $4;
+   AND lease_token = $4
+   AND cancel_requested_at IS NULL
+   AND lease_expires_at > now();
 "#;
 
     /// `CANCEL`. A pending job is cancelled immediately, a leased job keeps its
@@ -1487,6 +1516,15 @@ mod tests {
         assert!(sql::WORKER_HEARTBEAT.contains("drained = FALSE"));
         assert!(sql::CLAIM.contains("worker.drained = FALSE"));
         assert!(sql::COMPLETE.contains("lease_boot_id = $3"));
+        assert!(sql::COMPLETE.contains("lease_token = $4"));
+        assert!(
+            sql::COMPLETE.contains("cancel_requested_at IS NULL"),
+            "a requested cancellation must refuse completion"
+        );
+        assert!(
+            sql::COMPLETE.contains("lease_expires_at > now()"),
+            "completion needs the same unexpired lease as HEARTBEAT"
+        );
         assert!(sql::SCHEMA.contains("UNIQUE (workload, queue, input_fingerprint)"));
     }
 
@@ -1697,6 +1735,61 @@ mod tests {
         assert!(
             record.not_before.is_none(),
             "a cancelled job is never claimable again, so it keeps no retry delay"
+        );
+    }
+
+    #[test]
+    fn complete_is_refused_after_a_cancellation_request() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        let lease = claim_one(&queue);
+        queue
+            .cancel(&JobId::new("job").unwrap(), Utc::now())
+            .unwrap();
+
+        assert_eq!(
+            queue.complete(
+                &lease,
+                Completion {
+                    artifact: serde_json::json!({"late": true}),
+                    completed_at: Utc::now(),
+                },
+            ),
+            Err(WorkloadError::CancelRequested { job: "job".into() })
+        );
+        let record = queue.get(&JobId::new("job").unwrap()).unwrap();
+        assert_eq!(record.state, JobState::Leased);
+        assert!(record.result.is_none(), "a cancelled job stores no result");
+
+        // The worker confirms the cancellation instead, atomically.
+        queue.confirm_cancelled(&lease, Utc::now()).unwrap();
+        assert_eq!(
+            queue.get(&JobId::new("job").unwrap()).unwrap().state,
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn complete_requires_an_unexpired_lease() {
+        let queue = InMemoryQueue::default();
+        queue.enqueue(job("job", 0, &[])).unwrap();
+        queue.register_worker(worker("atlas", &[])).unwrap();
+        let now = Utc::now();
+        let lease = queue
+            .claim(&WorkerId::new("atlas").unwrap(), now, Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            queue.complete(
+                &lease,
+                Completion {
+                    artifact: serde_json::json!({"late": true}),
+                    completed_at: now + Duration::seconds(2),
+                },
+            ),
+            Err(WorkloadError::StaleLease { job: "job".into() }),
+            "an expired lease cannot complete even before another claim"
         );
     }
 

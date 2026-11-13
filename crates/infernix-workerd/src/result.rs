@@ -18,18 +18,18 @@ use sha2::{Digest, Sha256};
 pub const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The one JSON object an adapter prints on exit 0.
+///
+/// Every field is required: a result missing `contentFingerprint`, `cacheHit`,
+/// `telemetry` or `validation` is rejected rather than stored half-formed.
+/// Extra keys stay tolerated.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdapterResult {
     pub artifacts: Vec<Artifact>,
-    #[serde(default)]
-    pub content_fingerprint: Option<String>,
-    #[serde(default)]
+    pub content_fingerprint: String,
     pub cache_hit: bool,
-    #[serde(default)]
-    pub telemetry: Option<Value>,
-    #[serde(default)]
-    pub validation: Option<Value>,
+    pub telemetry: Value,
+    pub validation: Value,
 }
 
 /// One artifact as declared by the adapter. `path` is relative to the attempt
@@ -79,6 +79,10 @@ impl ValidatedResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationError {
     NotJson,
+    InvalidShape,
+    InvalidFingerprint,
+    InvalidTelemetry,
+    InvalidValidation,
     InvalidSource,
     DuplicateSource,
     InvalidDigest,
@@ -96,6 +100,10 @@ impl ValidationError {
     pub fn code(self) -> &'static str {
         match self {
             Self::NotJson => "not_json",
+            Self::InvalidShape => "result_shape",
+            Self::InvalidFingerprint => "result_fingerprint",
+            Self::InvalidTelemetry => "result_telemetry",
+            Self::InvalidValidation => "result_validation",
             Self::InvalidSource => "artifact_source",
             Self::DuplicateSource => "artifact_source_duplicate",
             Self::InvalidDigest => "artifact_digest",
@@ -126,7 +134,8 @@ pub fn validate_result(
 ) -> std::result::Result<ValidatedResult, ValidationError> {
     let value: Value = serde_json::from_slice(stdout).map_err(|_| ValidationError::NotJson)?;
     let result: AdapterResult =
-        serde_json::from_value(value.clone()).map_err(|_| ValidationError::NotJson)?;
+        serde_json::from_value(value.clone()).map_err(|_| ValidationError::InvalidShape)?;
+    check_result_document(&result)?;
 
     let canonical_staging = staging
         .canonicalize()
@@ -179,7 +188,8 @@ pub fn retained_artifacts(
     staging: &Path,
 ) -> std::result::Result<Vec<ValidatedArtifact>, ValidationError> {
     let parsed: AdapterResult =
-        serde_json::from_value(result.clone()).map_err(|_| ValidationError::NotJson)?;
+        serde_json::from_value(result.clone()).map_err(|_| ValidationError::InvalidShape)?;
+    check_result_document(&parsed)?;
     let canonical_staging = staging
         .canonicalize()
         .map_err(|_| ValidationError::MissingFile)?;
@@ -208,6 +218,31 @@ pub fn retained_artifacts(
         });
     }
     Ok(artifacts)
+}
+
+/// Type-check the required result fields beyond what serde enforces.
+fn check_result_document(result: &AdapterResult) -> std::result::Result<(), ValidationError> {
+    if !valid_sha256(&result.content_fingerprint) {
+        return Err(ValidationError::InvalidFingerprint);
+    }
+    if !result.telemetry.is_object() {
+        return Err(ValidationError::InvalidTelemetry);
+    }
+    let validation = result
+        .validation
+        .as_object()
+        .ok_or(ValidationError::InvalidValidation)?;
+    let state = validation
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or(ValidationError::InvalidValidation)?;
+    if !matches!(state, "ok" | "warn" | "fail") {
+        return Err(ValidationError::InvalidValidation);
+    }
+    if !validation.get("findings").is_some_and(Value::is_array) {
+        return Err(ValidationError::InvalidValidation);
+    }
+    Ok(())
 }
 
 /// `[a-z0-9][a-z0-9_.-]{0,62}` from spec section 2.
@@ -331,5 +366,81 @@ mod tests {
             resolve_in_staging(&staging, Path::new("/etc/passwd")).unwrap_err(),
             ValidationError::PathEscapesStaging
         );
+    }
+
+    fn staging_fixture() -> (PathBuf, Value) {
+        let staging =
+            std::env::temp_dir().join(format!("infernix-result-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(staging.join("out")).unwrap();
+        std::fs::write(staging.join("out/line.wav"), b"audio").unwrap();
+        let document = serde_json::json!({
+            "artifacts": [{
+                "source": "audio",
+                "path": "out/line.wav",
+                "sha256": sha256_bytes(b"audio"),
+                "mime": "audio/wav",
+                "size": 5
+            }],
+            "contentFingerprint": "a".repeat(64),
+            "cacheHit": false,
+            "telemetry": {"peakVramBytes": 0},
+            "validation": {"state": "ok", "findings": []}
+        });
+        (staging, document)
+    }
+
+    #[test]
+    fn result_requires_every_contract_field() {
+        for key in ["contentFingerprint", "cacheHit", "telemetry", "validation"] {
+            let (staging, mut document) = staging_fixture();
+            document.as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                validate_result(document.to_string().as_bytes(), &staging).unwrap_err(),
+                ValidationError::InvalidShape,
+                "{key} is required"
+            );
+        }
+    }
+
+    #[test]
+    fn result_fields_are_type_checked() {
+        let (staging, mut document) = staging_fixture();
+        document["contentFingerprint"] = Value::String("not-a-digest".into());
+        assert_eq!(
+            validate_result(document.to_string().as_bytes(), &staging).unwrap_err(),
+            ValidationError::InvalidFingerprint
+        );
+
+        let (staging, mut document) = staging_fixture();
+        document["telemetry"] = Value::Array(vec![]);
+        assert_eq!(
+            validate_result(document.to_string().as_bytes(), &staging).unwrap_err(),
+            ValidationError::InvalidTelemetry
+        );
+
+        let (staging, mut document) = staging_fixture();
+        document["validation"] = serde_json::json!({"state": "maybe", "findings": []});
+        assert_eq!(
+            validate_result(document.to_string().as_bytes(), &staging).unwrap_err(),
+            ValidationError::InvalidValidation
+        );
+
+        let (staging, mut document) = staging_fixture();
+        document["validation"] = serde_json::json!({"state": "ok"});
+        assert_eq!(
+            validate_result(document.to_string().as_bytes(), &staging).unwrap_err(),
+            ValidationError::InvalidValidation,
+            "validation needs its findings list"
+        );
+    }
+
+    #[test]
+    fn extra_result_keys_are_tolerated() {
+        let (staging, mut document) = staging_fixture();
+        document["delivery"] = serde_json::json!({"hubUrl": "http://127.0.0.1:1"});
+        document["extra"] = Value::Bool(true);
+        let validated = validate_result(document.to_string().as_bytes(), &staging).unwrap();
+        assert_eq!(validated.artifacts.len(), 1);
+        assert_eq!(validated.value["extra"], true);
     }
 }

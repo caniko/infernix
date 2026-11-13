@@ -27,8 +27,9 @@ DEFAULT_GATE_TIMEOUT = 600.0
 POLL_SECONDS = 0.2
 VRAM_ROOT = Path("/sys/class/drm")
 
-# The device index `assert_gpu` selected for this process, if any.
+# The device index and torch device type `assert_gpu` selected, if any.
 _SELECTED_DEVICE = None
+_SELECTED_TYPE = "cuda"
 
 
 def amdgpu_device_dir(root=VRAM_ROOT):
@@ -43,6 +44,29 @@ def amdgpu_device_dir(root=VRAM_ROOT):
         if value > best_total:
             best, best_total = card, value
     return best
+
+
+def xpu_free_bytes(torch_module=None):
+    """Free device memory from torch.xpu, or None when it cannot be read."""
+    if torch_module is None:
+        try:
+            import torch as torch_module
+        except ImportError:
+            return None
+    xpu = getattr(torch_module, "xpu", None)
+    if xpu is None:
+        return None
+    try:
+        mem_get_info = getattr(xpu, "mem_get_info", None)
+        if mem_get_info is not None:
+            free, _total = mem_get_info()
+            return int(free)
+        # Older XPU builds lack mem_get_info; the allocator's reserved bytes are
+        # the part of the card already spoken for.
+        total = int(xpu.get_device_properties().total_memory)
+        return total - int(xpu.memory_reserved())
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
 
 
 def vram_free_bytes(backend, root=VRAM_ROOT):
@@ -75,6 +99,8 @@ def vram_free_bytes(backend, root=VRAM_ROOT):
             return int(values[0]) * (1 << 20)
         except ValueError:
             return None
+    if backend == "xpu":
+        return xpu_free_bytes()
     return None
 
 
@@ -174,6 +200,7 @@ def assert_gpu(profile, torch_module=None):
     version = torch.version
     hip = getattr(version, "hip", None)
     cuda = getattr(version, "cuda", None)
+    xpu = getattr(torch, "xpu", None)
     if backend == "rocm":
         if not hip:
             raise AdapterError(
@@ -187,12 +214,26 @@ def assert_gpu(profile, torch_module=None):
             )
         if not cuda:
             raise AdapterError(BACKEND_MISMATCH, "profile backend cuda but torch has no CUDA")
+    elif backend == "xpu":
+        if hip or cuda:
+            build = "ROCm" if hip else "CUDA"
+            raise AdapterError(
+                BACKEND_MISMATCH,
+                f"profile backend xpu but torch is a {build} build "
+                f"(hip={hip!r}, cuda={cuda!r}, xpu={getattr(version, 'xpu', None)!r})",
+            )
+        if xpu is None or not getattr(version, "xpu", None):
+            raise AdapterError(
+                BACKEND_MISMATCH,
+                f"profile backend xpu but torch has no XPU (xpu={getattr(version, 'xpu', None)!r})",
+            )
     else:
         raise AdapterError(BACKEND_MISMATCH, f"unknown profile backend {backend!r}")
 
-    if not torch.cuda.is_available():
+    runtime = xpu if backend == "xpu" else torch.cuda
+    if not runtime.is_available():
         raise AdapterError(GPU_UNAVAILABLE, "torch reports no visible GPU")
-    count = torch.cuda.device_count()
+    count = runtime.device_count()
     if not count:
         raise AdapterError(GPU_UNAVAILABLE, "torch reports zero devices")
     match = profile.get("deviceMatch")
@@ -201,14 +242,14 @@ def assert_gpu(profile, torch_module=None):
     # The marketing name is the primary identity. ROCm on this kernel reports
     # only "AMD Radeon Graphics" for an RX 7900 XTX, so the gfx arch is accepted
     # as the same device's identity; both are read from the driver, never guessed.
+    # XPU has no arch alias, so the device name is the whole identity.
     seen = []
     chosen = None
     for index in range(count):
-        properties = torch.cuda.get_device_properties(index)
-        candidates = [
-            torch.cuda.get_device_name(index),
-            getattr(properties, "gcnArchName", "") or "",
-        ]
+        candidates = [runtime.get_device_name(index)]
+        if backend != "xpu":
+            properties = torch.cuda.get_device_properties(index)
+            candidates.append(getattr(properties, "gcnArchName", "") or "")
         seen.extend(f"{index}:{candidate}" for candidate in candidates if candidate)
         if chosen is None and any(match.lower() in candidate.lower() for candidate in candidates):
             chosen = index
@@ -218,9 +259,10 @@ def assert_gpu(profile, torch_module=None):
             f"no visible device matches deviceMatch {match!r}",
             findings=seen,
         )
-    torch.cuda.set_device(chosen)
-    global _SELECTED_DEVICE
+    runtime.set_device(chosen)
+    global _SELECTED_DEVICE, _SELECTED_TYPE
     _SELECTED_DEVICE = chosen
+    _SELECTED_TYPE = "xpu" if backend == "xpu" else "cuda"
     return torch
 
 
@@ -233,7 +275,12 @@ def device_index():
 
 def device_string():
     """The torch device string for the selected index; never a hardcoded cuda:0."""
-    return f"cuda:{device_index()}"
+    return f"{_SELECTED_TYPE}:{device_index()}"
+
+
+def device_type():
+    """The selected torch device type: `cuda` on ROCm/CUDA, `xpu` on Intel."""
+    return _SELECTED_TYPE
 
 
 def _walk(obj, prefix=""):
@@ -252,6 +299,7 @@ def assert_on_gpu(obj, label="model", device=None):
     `assert_gpu` chose. A tensor on a different GPU is a backend mismatch.
     """
     expected = _SELECTED_DEVICE if device is None else device
+    expected_type = _SELECTED_TYPE
     offenders = []
     seen = 0
     for prefix, module in _walk(obj):
@@ -265,13 +313,14 @@ def assert_on_gpu(obj, label="model", device=None):
                 if kind_name is None:
                     continue
                 seen += 1
-                if kind_name != "cuda":
+                if kind_name != expected_type:
                     offenders.append(f"{prefix}{name}{suffix} on {kind_name}")
                     continue
                 index = getattr(location, "index", None)
                 if expected is not None and index is not None and index != expected:
                     offenders.append(
-                        f"{prefix}{name}{suffix} on cuda:{index}, not cuda:{expected}"
+                        f"{prefix}{name}{suffix} on {kind_name}:{index}, "
+                        f"not {expected_type}:{expected}"
                     )
     if offenders:
         shown = ", ".join(offenders[:8])

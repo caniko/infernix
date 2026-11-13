@@ -8,6 +8,10 @@ from pathlib import Path
 
 INTERVAL_SECONDS = 1.0
 GIB = 1 << 30
+FDINFO_ROOT = "/proc/self/fdinfo"
+I915_DRIVER = "i915"
+I915_ENGINES = ("drm-engine-render", "drm-engine-compute")
+I915_RESIDENT = "drm-resident-local0"
 
 
 def _read(path):
@@ -19,6 +23,59 @@ def _read(path):
 
 def _hwmon(card):
     return sorted(card.glob("device/hwmon/hwmon*"))
+
+
+def i915_fdinfo(root=FDINFO_ROOT):
+    """This process's i915 engine nanoseconds and resident device bytes.
+
+    Every DRM client the process opened has an entry under /proc/self/fdinfo
+    with cumulative per-engine nanoseconds and resident local-memory KiB, so an
+    unprivileged process can measure its own GPU use without root.
+    """
+    found = {}
+    try:
+        entries = sorted(Path(root).iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        try:
+            text = entry.read_text()
+        except OSError:
+            continue
+        values = {}
+        for line in text.splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                values[key.strip()] = value.strip()
+        if values.get("drm-driver") != I915_DRIVER:
+            continue
+        engines = {}
+        for key in I915_ENGINES:
+            try:
+                engines[key] = int(values[key].split()[0])
+            except (KeyError, IndexError, ValueError):
+                continue
+        try:
+            resident = int(values[I915_RESIDENT].split()[0]) * 1024
+        except (KeyError, IndexError, ValueError):
+            resident = 0
+        found[str(entry)] = {"engines": engines, "resident": resident}
+    return found
+
+
+def xpu_max_reserved():
+    """Peak device bytes this process's XPU allocator reserved, or 0."""
+    try:
+        import torch
+    except ImportError:
+        return 0
+    getter = getattr(getattr(torch, "xpu", None), "max_memory_reserved", None)
+    if getter is None:
+        return 0
+    try:
+        return int(getter())
+    except (OSError, RuntimeError):
+        return 0
 
 
 class Sampler:
@@ -36,6 +93,7 @@ class Sampler:
         self._thread = None
         self._card = None
         self._hwmon = None
+        self._engine_ns = {}
         if backend == "rocm":
             from .gpu import amdgpu_device_dir
 
@@ -99,10 +157,39 @@ class Sampler:
             "temp": number(parts[3]),
         }
 
+    def _sample_xpu(self, root=FDINFO_ROOT):
+        """Own-process i915 usage: engine nanoseconds and resident local bytes."""
+        busy_ns = 0
+        resident = 0
+        for path, info in i915_fdinfo(root).items():
+            for engine, value in info["engines"].items():
+                key = (path, engine)
+                previous = self._engine_ns.get(key)
+                # Engine counters are cumulative per DRM client.
+                if previous is not None and value >= previous:
+                    busy_ns += value - previous
+                self._engine_ns[key] = value
+            resident += info["resident"]
+        return {
+            "vram": resident,
+            "total": None,
+            "busy": None,
+            "busy_ns": busy_ns,
+            "power": None,
+            "temp": None,
+        }
+
+    def _sample(self):
+        if self.backend == "rocm":
+            return self._sample_rocm()
+        if self.backend == "xpu":
+            return self._sample_xpu()
+        return self._sample_cuda()
+
     def _run(self):
         last = time.monotonic()
         while not self._stop.is_set():
-            sample = self._sample_rocm() if self.backend == "rocm" else self._sample_cuda()
+            sample = self._sample()
             now = time.monotonic()
             elapsed = now - last
             last = now
@@ -113,7 +200,9 @@ class Sampler:
                     self.max_temp_c = max(self.max_temp_c, round(sample["temp"]))
                 if sample["power"] is not None:
                     self.max_power_w = max(self.max_power_w, round(sample["power"]))
-                if sample["busy"] is not None:
+                if sample.get("busy_ns") is not None:
+                    self.gpu_seconds += min(sample["busy_ns"] / 1e9, elapsed)
+                elif sample["busy"] is not None:
                     self.gpu_seconds += (sample["busy"] / 100.0) * elapsed
             else:
                 self.gpu_seconds += elapsed
@@ -132,8 +221,13 @@ class Sampler:
         return self.summary()
 
     def summary(self):
+        peak = self.peak_vram
+        if self.backend == "xpu":
+            # Resident bytes sampled from fdinfo miss transient allocations
+            # between samples; the allocator's high-water mark covers them.
+            peak = max(peak, xpu_max_reserved())
         return {
-            "peakVramBytes": self.peak_vram,
+            "peakVramBytes": peak,
             "gpuSeconds": round(self.gpu_seconds, 3),
             "maxTempC": self.max_temp_c,
             "maxPowerW": self.max_power_w,

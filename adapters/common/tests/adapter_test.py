@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest import mock
 
 from infernix_adapter import cache, checkpoint, fingerprint, gpu, hub, parse, result, run, runner
+from infernix_adapter import telemetry
 from infernix_adapter.cancel import CancelWatcher
 from infernix_adapter.exits import AdapterError
 
@@ -43,6 +44,14 @@ PROFILE = {
     "cpuThreads": 2,
     "peakVramGib": 1.0,
     "tenants": {"llamaSwapUrl": "http://127.0.0.1:1"},
+}
+
+XPU_PROFILE = {
+    **PROFILE,
+    "id": "test-xpu",
+    "backend": "xpu",
+    "device": "gpu:murph-a770",
+    "deviceMatch": "A770",
 }
 
 
@@ -77,6 +86,48 @@ def fake_torch(
         ),
         manual_seed=lambda value: None,
         set_num_threads=lambda count: None,
+    )
+
+
+def fake_xpu_torch(
+    name="Intel(R) Arc(TM) A770 Graphics",
+    available=True,
+    devices=None,
+    xpu_version="2026.1.0",
+    mem_get_info=(12 << 30, 16 << 30),
+    total_memory=16 << 30,
+    reserved=0,
+):
+    """An XPU torch build: no HIP, no CUDA, torch.xpu is the backend."""
+    calls = []
+    devices = devices or [name]
+    xpu_attributes = {
+        "is_available": lambda: available,
+        "device_count": lambda: len(devices) if available else 0,
+        "get_device_name": lambda index=0: devices[index],
+        "get_device_properties": lambda index=0: types.SimpleNamespace(
+            total_memory=total_memory
+        ),
+        "set_device": lambda index: calls.append(("set_device", index)),
+        "current_device": lambda: 0,
+        "manual_seed_all": lambda value: calls.append(("seed", value)),
+        "memory_reserved": lambda: reserved,
+        "max_memory_reserved": lambda: reserved,
+    }
+    if mem_get_info is not None:
+        xpu_attributes["mem_get_info"] = lambda: mem_get_info
+    return types.SimpleNamespace(
+        __version__="2.14.1+xpu",
+        version=types.SimpleNamespace(hip=None, cuda=None, xpu=xpu_version),
+        cuda=types.SimpleNamespace(
+            is_available=lambda: False,
+            device_count=lambda: 0,
+            manual_seed_all=lambda value: None,
+        ),
+        xpu=types.SimpleNamespace(**xpu_attributes),
+        manual_seed=lambda value: None,
+        set_num_threads=lambda count: None,
+        calls=calls,
     )
 
 
@@ -133,7 +184,9 @@ class Harness(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         gpu._SELECTED_DEVICE = None
+        gpu._SELECTED_TYPE = "cuda"
         self.addCleanup(setattr, gpu, "_SELECTED_DEVICE", None)
+        self.addCleanup(setattr, gpu, "_SELECTED_TYPE", "cuda")
         # The tmpfiles rule creates the gate inode; the adapter never does.
         self.locks.mkdir(parents=True, exist_ok=True)
         (self.locks / "atlas-7900xtx.lock").touch()
@@ -266,6 +319,100 @@ class GpuGuardTests(Harness):
                 gpu.ensure_device(4.0, "rocm")
         self.assertEqual(caught.exception.code, 10)
 
+    def test_ensure_device_short_of_xpu_memory_exits_10(self):
+        with mock.patch.object(gpu, "vram_free_bytes", return_value=2 << 30) as free:
+            with self.assertRaises(AdapterError) as caught:
+                gpu.ensure_device(4.0, "xpu")
+        self.assertEqual(caught.exception.code, 10)
+        free.assert_called_once_with("xpu")
+
+
+class XpuGuardTests(Harness):
+    def test_xpu_selects_the_matching_device_and_reports_its_string(self):
+        torch = fake_xpu_torch(
+            devices=[
+                "Intel(R) UHD Graphics 770",
+                "Intel(R) Arc(TM) A770 Graphics",
+            ]
+        )
+        self.assertIs(gpu.assert_gpu(XPU_PROFILE, torch), torch)
+        self.assertEqual(gpu.device_index(), 1)
+        self.assertEqual(gpu.device_type(), "xpu")
+        self.assertEqual(gpu.device_string(), "xpu:1")
+        self.assertIn(("set_device", 1), torch.calls)
+
+    def test_xpu_without_a_matching_device_exits_13(self):
+        torch = fake_xpu_torch(name="Intel(R) Arc(TM) A380 Graphics")
+        with self.assertRaises(AdapterError) as caught:
+            gpu.assert_gpu(XPU_PROFILE, torch)
+        self.assertEqual(caught.exception.code, 13)
+        self.assertIn("A770", str(caught.exception))
+
+    def test_xpu_without_a_visible_device_exits_11(self):
+        torch = fake_xpu_torch(available=False)
+        with self.assertRaises(AdapterError) as caught:
+            gpu.assert_gpu(XPU_PROFILE, torch)
+        self.assertEqual(caught.exception.code, 11)
+
+    def test_xpu_profile_with_a_cuda_torch_exits_13(self):
+        torch = fake_torch(hip=None, cuda="12.8", name="NVIDIA GeForce RTX 4090")
+        with self.assertRaises(AdapterError) as caught:
+            gpu.assert_gpu(XPU_PROFILE, torch)
+        self.assertEqual(caught.exception.code, 13)
+        self.assertIn("CUDA build", str(caught.exception))
+
+    def test_xpu_profile_with_a_cpu_torch_exits_13(self):
+        torch = fake_torch(hip=None, cuda=None, available=False, name="CPU")
+        with self.assertRaises(AdapterError) as caught:
+            gpu.assert_gpu(XPU_PROFILE, torch)
+        self.assertEqual(caught.exception.code, 13)
+        self.assertIn("no XPU", str(caught.exception))
+
+    def test_xpu_tensors_are_checked_against_the_selected_xpu(self):
+        gpu.assert_gpu(XPU_PROFILE, fake_xpu_torch())
+        on_xpu = FakePipeline({"m": FakeModule("gpu", {"w": FakeTensor("xpu", 0)})})
+        self.assertTrue(gpu.assert_on_gpu(on_xpu))
+        on_cpu = FakePipeline({"m": FakeModule("gpu", {"w": FakeTensor("cpu")})})
+        with self.assertRaises(AdapterError) as caught:
+            gpu.assert_on_gpu(on_cpu)
+        self.assertEqual(caught.exception.code, 13)
+        self.assertIn("on cpu", str(caught.exception))
+
+    def test_end_to_end_xpu_run_reports_the_xpu_backend(self):
+        (self.locks / "murph-a770.lock").touch()
+
+        def handler(ctx):
+            (ctx.output_directory / "line.wav").write_bytes(b"audio")
+            return [("audio", "line.wav", "audio/wav")]
+
+        document = envelope(self.staging, profile=XPU_PROFILE)
+        code = self.execute(handler, document, torch_module=fake_xpu_torch())
+        self.assertEqual(code, 0, self.stderr)
+        telemetry_summary = self.payload()["telemetry"]
+        self.assertEqual(telemetry_summary["backend"], "xpu")
+        self.assertEqual(telemetry_summary["device"], "gpu:murph-a770")
+
+
+class XpuMemoryTests(unittest.TestCase):
+    def test_xpu_free_bytes_prefers_mem_get_info(self):
+        torch = fake_xpu_torch(mem_get_info=(10 << 30, 16 << 30))
+        self.assertEqual(gpu.xpu_free_bytes(torch), 10 << 30)
+
+    def test_xpu_free_bytes_falls_back_to_total_minus_reserved(self):
+        torch = fake_xpu_torch(mem_get_info=None, total_memory=16 << 30, reserved=6 << 30)
+        self.assertEqual(gpu.xpu_free_bytes(torch), 10 << 30)
+
+    def test_xpu_free_bytes_without_xpu_is_none(self):
+        self.assertIsNone(gpu.xpu_free_bytes(fake_torch(hip=None, cuda=None)))
+
+    def test_vram_free_bytes_dispatches_xpu(self):
+        with mock.patch.object(gpu, "xpu_free_bytes", return_value=3 << 30):
+            self.assertEqual(gpu.vram_free_bytes("xpu"), 3 << 30)
+
+    def test_vram_free_bytes_without_torch_is_none(self):
+        with mock.patch.dict(sys.modules, {"torch": None}):
+            self.assertIsNone(gpu.vram_free_bytes("xpu"))
+
 
 class GateTests(Harness):
     def test_lock_name_matches_the_canix_gpu_gate(self):
@@ -330,11 +477,98 @@ class OomTests(Harness):
 
         self.assertEqual(self.execute(handler), 12)
 
+    def test_xpu_oom_message_exits_12(self):
+        def handler(ctx):
+            raise RuntimeError("XPU out of memory. Tried to allocate 512.00 MiB")
+
+        self.assertEqual(self.execute(handler), 12)
+
+    def test_level_zero_out_of_device_memory_exits_12(self):
+        def handler(ctx):
+            raise RuntimeError("UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY")
+
+        self.assertEqual(self.execute(handler), 12)
+
     def test_other_errors_are_untyped(self):
         def handler(ctx):
             raise ValueError("bad shape")
 
         self.assertEqual(self.execute(handler), 1)
+
+    def test_unrelated_ur_error_is_not_an_oom(self):
+        from infernix_adapter.exits import is_oom
+
+        self.assertFalse(is_oom(RuntimeError("UR_RESULT_ERROR_INVALID_ARGUMENT")))
+
+
+class XpuTelemetryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="fdinfo-")))
+        self.client = self.root / "7"
+        self.write_client(
+            self.client,
+            driver="i915",
+            render_ns=1_000,
+            compute_ns=2_000,
+            resident_kib=1024,
+        )
+
+    def write_client(self, path, *, driver, render_ns, compute_ns, resident_kib):
+        lines = ["pos:\t0", f"drm-driver:\t{driver}", "drm-client-id:\t9"]
+        if render_ns is not None:
+            lines.append(f"drm-engine-render:\t{render_ns} ns")
+        if compute_ns is not None:
+            lines.append(f"drm-engine-compute:\t{compute_ns} ns")
+        lines.append(f"drm-resident-local0:\t{resident_kib} KiB")
+        path.write_text("\n".join(lines) + "\n")
+
+    def test_reads_engines_and_resident_memory_for_i915_only(self):
+        (self.root / "8").write_text("drm-driver:\tamdgpu\ndrm-engine-render:\t99 ns\n")
+        (self.root / "9").write_text("pos:\t0\n")
+        found = telemetry.i915_fdinfo(self.root)
+        self.assertEqual(list(found), [str(self.client)])
+        self.assertEqual(found[str(self.client)]["engines"]["drm-engine-render"], 1_000)
+        self.assertEqual(found[str(self.client)]["engines"]["drm-engine-compute"], 2_000)
+        self.assertEqual(found[str(self.client)]["resident"], 1 << 20)
+
+    def test_missing_fdinfo_root_is_empty(self):
+        self.assertEqual(telemetry.i915_fdinfo(self.root / "absent"), {})
+
+    def test_engine_deltas_become_gpu_seconds_and_resident_becomes_peak(self):
+        sampler = telemetry.Sampler("xpu")
+        first = sampler._sample_xpu(root=self.root)
+        self.assertEqual(first["busy_ns"], 0)
+        self.assertEqual(first["vram"], 1 << 20)
+
+        self.write_client(
+            self.client,
+            driver="i915",
+            render_ns=1_500,
+            compute_ns=2_250,
+            resident_kib=2048,
+        )
+        second = sampler._sample_xpu(root=self.root)
+        self.assertEqual(second["busy_ns"], 750, "500 + 250 engine nanoseconds")
+        self.assertEqual(second["vram"], 2 << 20)
+        self.assertIsNone(second["busy"])
+        self.assertIsNone(second["temp"])
+
+    def test_summary_merges_the_allocator_peak(self):
+        sampler = telemetry.Sampler("xpu")
+        sampler.peak_vram = 1 << 20
+        with mock.patch.object(telemetry, "xpu_max_reserved", return_value=5 << 30):
+            summary = sampler.summary()
+        self.assertEqual(summary["peakVramBytes"], 5 << 30)
+        self.assertEqual(summary["backend"], "xpu")
+        with mock.patch.object(telemetry, "xpu_max_reserved", return_value=0):
+            self.assertEqual(sampler.summary()["peakVramBytes"], 1 << 20)
+
+    def test_cuda_and_rocm_summaries_ignore_the_allocator_peak(self):
+        sampler = telemetry.Sampler("cuda")
+        sampler.peak_vram = 7
+        with mock.patch.object(telemetry, "xpu_max_reserved", return_value=5 << 30) as peak:
+            self.assertEqual(sampler.summary()["peakVramBytes"], 7)
+        peak.assert_not_called()
 
 
 class CancelTests(Harness):
@@ -464,6 +698,29 @@ class RuntimeFingerprintTests(Harness):
             fingerprint.content_fingerprint(runtime=base, **values),
             fingerprint.content_fingerprint(runtime=blender, **values),
         )
+
+    def test_xpu_runtime_identity_is_recorded_and_changes_the_fingerprint(self):
+        values = {
+            "profile": XPU_PROFILE,
+            "operation": "tts",
+            "inputs": [],
+            "params": {},
+            "seed": 0,
+        }
+        xpu = runner._runtime_versions("demo-package", fake_xpu_torch(xpu_version="2026.1.0"))
+        other = runner._runtime_versions("demo-package", fake_xpu_torch(xpu_version="2025.3.0"))
+        self.assertEqual(xpu["xpu"], "2026.1.0")
+        self.assertIsNone(other["hip"])
+        self.assertIsNone(other["cuda"])
+        self.assertNotEqual(
+            fingerprint.content_fingerprint(runtime=xpu, **values),
+            fingerprint.content_fingerprint(runtime=other, **values),
+        )
+
+    def test_xpu_rng_is_seeded_from_the_payload_seed(self):
+        torch = fake_xpu_torch()
+        runner.seed_everything(11, torch)
+        self.assertIn(("seed", 11), torch.calls)
 
     def test_a_null_runtime_version_fails_fingerprinting(self):
         def handler(ctx):

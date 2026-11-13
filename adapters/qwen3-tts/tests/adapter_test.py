@@ -25,6 +25,14 @@ PROFILE = {
     "checkpoint": {"repo": adapter.MODEL, "revision": "0123456789abcdef0123456789abcdef01234567", "files": []},
 }
 
+XPU_PROFILE = {
+    **PROFILE,
+    "id": "qwen3-tts-0-6b-customvoice-xpu",
+    "backend": "xpu",
+    "device": "gpu:murph-a770",
+    "deviceMatch": "A770",
+}
+
 
 class FakeModule:
     def __init__(self, device):
@@ -76,7 +84,9 @@ class QwenTests(unittest.TestCase):
         self.saved = adapter.load_model
         self.addCleanup(self.restore)
         gpu._SELECTED_DEVICE = 0
+        gpu._SELECTED_TYPE = "cuda"
         self.addCleanup(setattr, gpu, "_SELECTED_DEVICE", None)
+        self.addCleanup(setattr, gpu, "_SELECTED_TYPE", "cuda")
 
     def restore(self):
         adapter.load_model = self.saved
@@ -177,6 +187,22 @@ class QwenTests(unittest.TestCase):
         context.profile = dict(PROFILE, limits={"maxInputSeconds": 1.0})
         adapter.produce(context)
         self.assertEqual(context.validation["state"], "warn")
+
+    def test_xpu_device_map_is_the_selected_xpu(self):
+        recorded = {}
+        model = FakeModel(device="xpu", speech_device="xpu")
+
+        def load(source, revision, device):
+            recorded["device"] = device
+            return model
+
+        adapter.load_model = load
+        gpu._SELECTED_DEVICE = 0
+        gpu._SELECTED_TYPE = "xpu"
+        context = self.context()
+        context.profile = XPU_PROFILE
+        adapter.produce(context)
+        self.assertEqual(recorded["device"], "xpu:0")
 
     def test_empty_audio_fails(self):
         adapter.load_model = lambda source, revision, device: FakeModel(samples=[])

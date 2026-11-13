@@ -1,5 +1,6 @@
 """sam2 adapter contract tests. The predictor is mocked; no GPU, no weights."""
 
+import contextlib
 import hashlib
 import json
 import sys
@@ -7,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "common" / "src"))
@@ -116,7 +118,9 @@ class SamTests(unittest.TestCase):
         self.saved = adapter.load_predictor
         self.addCleanup(self.restore)
         gpu._SELECTED_DEVICE = None
+        gpu._SELECTED_TYPE = "cuda"
         self.addCleanup(setattr, gpu, "_SELECTED_DEVICE", None)
+        self.addCleanup(setattr, gpu, "_SELECTED_TYPE", "cuda")
 
     def restore(self):
         adapter.load_predictor = self.saved
@@ -164,6 +168,30 @@ class SamTests(unittest.TestCase):
         with self.assertRaises(AdapterError) as caught:
             adapter.produce(self.context())
         self.assertEqual(caught.exception.code, 13)
+
+    def test_xpu_autocast_and_guard_follow_the_selected_backend(self):
+        seen = []
+
+        @contextlib.contextmanager
+        def fake_autocast(device_type, dtype=None):
+            seen.append(device_type)
+            yield
+
+        adapter.load_predictor = lambda path: FakePredictor(device="xpu")
+        context = self.context()
+        context.profile = {
+            **self.profile,
+            "id": "sam2-1-hiera-small-xpu",
+            "backend": "xpu",
+            "device": "gpu:murph-a770",
+            "deviceMatch": "A770",
+        }
+        gpu._SELECTED_DEVICE = 0
+        gpu._SELECTED_TYPE = "xpu"
+        with mock.patch.object(adapter.torch, "autocast", fake_autocast):
+            adapter.produce(context)
+        self.assertEqual(seen, ["xpu"])
+        self.assertTrue((self.root / "staging" / "out" / "mask.png").is_file())
 
     def test_postprocessing_is_disabled_for_rocm(self):
         source = Path(adapter.__file__).read_text()

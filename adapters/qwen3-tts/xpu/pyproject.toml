@@ -1,0 +1,25 @@
+[project]
+name = "infernix-adapter-qwen3-tts-xpu"
+version = "0.1.0"
+description = "Qwen3-TTS CustomVoice adapter for infernix animation (murph Intel XPU)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "infernix-adapter",
+  "numpy>=2.0",
+  "qwen-tts==0.1.1",
+  "torch==2.14.1",
+  "torchaudio==2.11.0",
+]
+
+[tool.uv]
+package = false
+index-strategy = "unsafe-best-match"
+
+[tool.uv.sources]
+infernix-adapter = { path = "../../common" }
+torch = { index = "pytorch-xpu" }
+torchaudio = { index = "pytorch-xpu" }
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"

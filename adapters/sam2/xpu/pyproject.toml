@@ -1,0 +1,29 @@
+[project]
+name = "infernix-adapter-sam2-xpu"
+version = "0.1.0"
+description = "SAM 2.1 image predictor adapter for infernix animation (murph Intel XPU)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "hydra-core>=1.3",
+  "infernix-adapter",
+  "iopath",
+  "numpy>=2.0",
+  "pillow>=12",
+  "sam-2 @ git+https://github.com/facebookresearch/sam2@2b90b9f5ceec907a1c18123530e92e794ad901a4",
+  "torch==2.14.1",
+  "torchvision==0.29.1",
+  "tqdm",
+]
+
+[tool.uv]
+package = false
+index-strategy = "unsafe-best-match"
+
+[tool.uv.sources]
+infernix-adapter = { path = "../../common" }
+torch = { index = "pytorch-xpu" }
+torchvision = { index = "pytorch-xpu" }
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"

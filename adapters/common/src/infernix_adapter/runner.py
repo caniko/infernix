@@ -93,6 +93,9 @@ def seed_everything(seed, torch_module=None):
     cuda = getattr(torch_module, "cuda", None)
     if cuda is not None and cuda.is_available():
         cuda.manual_seed_all(value)
+    xpu = getattr(torch_module, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        xpu.manual_seed_all(value)
     return value
 
 
@@ -116,6 +119,11 @@ def _runtime_versions(distribution, torch_module, runtime=None):
         "cuda": getattr(version, "cuda", None),
         "package": _installed_version(distribution),
     }
+    xpu = getattr(version, "xpu", None)
+    if xpu is not None:
+        # Only XPU builds carry it: a null here would change every ROCm/CUDA
+        # fingerprint and invalidate caches that are still valid.
+        versions["xpu"] = xpu
     if runtime:
         versions.update(runtime)
     return versions

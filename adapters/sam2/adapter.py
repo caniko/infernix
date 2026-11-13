@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""SAM 2.1 hiera-small image predictor on ROCm, no CUDA extension.
+"""SAM 2.1 hiera-small image predictor on ROCm or Intel XPU, no CUDA extension.
 
 `apply_postprocessing=False` is deliberate: the optional `_C` extension is
-CUDA-only, and on ROCm the predictor runs without it. Masks come from the
-prompt in `params` (points and/or a box); the adapter never downloads a
+CUDA-only, and on ROCm and XPU the predictor runs without it. Masks come from
+the prompt in `params` (points and/or a box); the adapter never downloads a
 background-removal model.
 """
 
@@ -76,7 +76,7 @@ def produce(context):
     adapter.assert_on_gpu(predictor.model, label="sam2")
 
     context.check_cancel()
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    with torch.inference_mode(), torch.autocast(adapter.device_type(), dtype=torch.bfloat16):
         predictor.set_image(image)
         masks, scores, _ = predictor.predict(
             point_coords=coordinates,

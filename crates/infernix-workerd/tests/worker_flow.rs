@@ -248,6 +248,21 @@ impl Fixture {
         heartbeat_interval_secs: u32,
         lease_duration_secs: u32,
     ) -> PathBuf {
+        self.write_config_sections(adapters, heartbeat_interval_secs, lease_duration_secs, "")
+    }
+
+    /// The same config plus an already-rendered `[worker.admission]` block.
+    fn write_config_admission(&self, adapters: &[(&str, &Path)], admission: &str) -> PathBuf {
+        self.write_config_sections(adapters, 1, 60, admission)
+    }
+
+    fn write_config_sections(
+        &self,
+        adapters: &[(&str, &Path)],
+        heartbeat_interval_secs: u32,
+        lease_duration_secs: u32,
+        admission: &str,
+    ) -> PathBuf {
         let blocks = adapters
             .iter()
             .map(|(profile, adapter)| {
@@ -285,10 +300,12 @@ staging_root = "{staging}"
 cancel_grace_secs = 2
 max_busy_releases = 30
 busy_retry_delay_secs = 0
+{admission}
 {blocks}"#,
             lease = lease_duration_secs,
             heartbeat = heartbeat_interval_secs,
             staging = self.staging_root.display(),
+            admission = admission,
             blocks = blocks,
         );
         let path = self.directory.join("workerd.toml");
@@ -790,6 +807,90 @@ async fn resource_busy_releases_the_job_without_spending_the_attempt() {
         row.get::<_, Option<chrono::DateTime<chrono::Utc>>>("not_before")
             .is_some()
     );
+}
+
+/// A probe that always denies, as an owner gaming on a shared desktop would.
+const DENY_ADMISSION: &str = r#"
+[worker.admission]
+command = ["sh", "-c", "echo owner is gaming; exit 1"]
+recheck_secs = 1
+timeout_secs = 5
+"#;
+
+/// A probe that denies while its marker file exists.
+fn preempt_admission(marker: &Path) -> String {
+    format!(
+        r#"
+[worker.admission]
+command = ["sh", "-c", "if [ -f '{marker}' ]; then echo owner is back; exit 1; fi"]
+recheck_secs = 1
+timeout_secs = 5
+preempt = true
+"#,
+        marker = marker.display()
+    )
+}
+
+#[tokio::test]
+async fn a_denied_admission_never_claims() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("denied", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", &marker_adapter("ran"));
+    let config = fixture.write_config_admission(&[("fixture-rocm", &adapter)], DENY_ADMISSION);
+
+    let spec = job("job-denied");
+    client.enqueue(&spec).await.unwrap();
+    fixture.run_once(&config).await;
+
+    let status = client.status(&spec.id).await.unwrap().unwrap();
+    assert_eq!(status.state, JobState::Pending);
+    assert_eq!(status.attempts, 0, "a denied worker must not lease the job");
+    assert!(
+        !fixture.copies.join("ran").exists(),
+        "the adapter must not run while admission denies"
+    );
+}
+
+#[tokio::test]
+async fn preemption_returns_the_job_to_pending_without_spending_an_attempt() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("preempt", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", CANCELLABLE_ADAPTER);
+    let marker = fixture.copies.join("deny");
+    let config =
+        fixture.write_config_admission(&[("fixture-rocm", &adapter)], &preempt_admission(&marker));
+
+    let spec = job("job-preempt");
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+
+    // The owner comes back: the next admission recheck preempts the adapter.
+    std::fs::write(&marker, b"owner is back\n").unwrap();
+    let status = fixture
+        .wait_for_state(&client, &spec.id, JobState::Pending)
+        .await;
+    assert_eq!(status.attempts, 0, "a preemption spends no attempt");
+    let row = client
+        .raw()
+        .query_one(
+            "SELECT busy_releases FROM infernix_workload_jobs WHERE id = $1",
+            &[&spec.id.as_str()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i32>("busy_releases"), 1);
+    assert!(
+        fixture.staging_root.join("job-preempt/1/sigterm").is_file(),
+        "preemption must SIGTERM the adapter group"
+    );
+
+    worker.stop().await;
 }
 
 #[tokio::test]

@@ -1,0 +1,76 @@
+{
+  "id": "kimodo-soma-rp-v1-2-rocm",
+  "model": "kimodo-soma",
+  "operation": "motion",
+  "state": "blocked",
+  "blockedReason": "The text encoder is LLM2Vec over the gated meta-llama/Meta-Llama-3-8B-Instruct, and the Hugging Face account behind the worker token is not in that repository's authorized list, so the 8B base weights cannot be provisioned and no motion can be generated. The two ungated LLM2Vec adapter snapshots and the Kimodo weights are pinned and provisioned.",
+  "checkpoint": {
+    "repo": "nvidia/Kimodo-SOMA-RP-v1.2",
+    "revision": "0e3c89024d896064b6851201373f7834784a386b",
+    "localPath": "/data/nvme0/models/animation-dev/kimodo/weights/Kimodo-SOMA-RP-v1.2",
+    "files": [
+      {"path": "model.safetensors", "sha256": "fdcef624140a12c0a4840192ce0b75cafb4e73228a893da3864b4a990d3e919e"},
+      {"path": "stats/motion/body/mean.npy", "sha256": "d42f35f8bb7ef52fdec66ae29c5cf590bd038f4f1aabd2d560d1d0f78663ed6f"},
+      {"path": "stats/motion/body/std.npy", "sha256": "965bbad497726ef4e6c46b519827e2cbcb29f974214b25718d20a725b82279ed"},
+      {"path": "stats/motion/global_root/mean.npy", "sha256": "6c110980f9a0386e57a8c186f8eac7f55dc05bade92f44c4b391450ada598da1"},
+      {"path": "stats/motion/global_root/std.npy", "sha256": "fb15aeed7143f5f0754611f0acf5fa5f55d1f6492a49c23e490fc62f7bf11fb0"},
+      {"path": "stats/motion/local_root/mean.npy", "sha256": "4c36e8e33d6d51e6c8206ac796a52b7b3a4da7f0dc49ebdbb4f130178e3e9d31"},
+      {"path": "stats/motion/local_root/std.npy", "sha256": "5f57b41f51ced7832cffa81702f6e04d8694e16475c184baec6c8be0e98c8dba"}
+    ]
+  },
+  "code": {
+    "repo": "https://github.com/nv-tlabs/kimodo",
+    "commit": "e1c219c99b4b94ba48be1fb6a1cbc64ecee4c954",
+    "package": null
+  },
+  "licence": {
+    "code": "Apache-2.0",
+    "weights": "NVIDIA Open Model Licence (global, commercial use permitted); text encoder under the Llama 3 Community Licence",
+    "gated": true,
+    "evidence": [
+      "https://huggingface.co/nvidia/Kimodo-SOMA-RP-v1.2",
+      "https://github.com/nv-tlabs/kimodo/blob/main/docs/source/getting_started/installation.md",
+      "https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct"
+    ],
+    "acceptedBy": "operator 2026-11-13"
+  },
+  "helpers": [
+    {
+      "name": "Meta-Llama-3-8B-Instruct text encoder (LLM2Vec mean pooling)",
+      "licence": "Llama 3 Community Licence (gated)",
+      "onGpu": true,
+      "localPath": "/data/nvme0/models/animation-dev/kimodo/hf-cache",
+      "checkpoints": [
+        {
+          "repo": "meta-llama/Meta-Llama-3-8B-Instruct",
+          "revision": "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2",
+          "files": []
+        },
+        {
+          "repo": "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp",
+          "revision": "31474e395ada192e8ed1586db6be79fb3b70c9c0",
+          "files": [
+            {"path": "adapter_model.safetensors", "sha256": "de9c8736618a13173c6a1623cdef1b75e86c69317f1073ae82cd516ac36a632d"}
+          ]
+        },
+        {
+          "repo": "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised",
+          "revision": "baa8ebf04a1c2500e61288e7dad65e8ae42601a7",
+          "files": [
+            {"path": "adapter_model.safetensors", "sha256": "53f8f94ebdf396667ba99dd96e78203edae27bbcdbd1cf5f12b611e1d916b225"}
+          ]
+        }
+      ]
+    }
+  ],
+  "backend": "rocm",
+  "device": "gpu:atlas-7900xtx",
+  "deviceMatch": "gfx1100",
+  "precision": "bf16",
+  "cpuPolicy": "forbidden",
+  "cpuThreads": 4,
+  "peakVramGib": null,
+  "tenants": {"llamaSwapUrl": "http://127.0.0.1:8013"},
+  "limits": {"maxInputSeconds": null, "maxOutputSeconds": 10, "maxFrames": 300},
+  "evidence": []
+}

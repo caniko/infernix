@@ -19,6 +19,7 @@ the profile.
 | `sam2/` | `mask` | atlas (ROCm), murph (XPU) | hardware-tested (ROCm) |
 | `blender-cycles-hip/` | `render_preview` / `render_final` | atlas (HIP), nomad (OPTIX) | hardware-tested (preview fixture) |
 | `triposg/` | `geometry` | nomad (CUDA) | see evidence table |
+| `kimodo/` | `motion` | atlas (ROCm) | blocked: gated text encoder (see evidence) |
 | `audio2face/` | `face` | nomad (CUDA) | **blocked, not built** |
 
 `profile.example.json` in each directory is a section-5 profile. The examples
@@ -214,6 +215,7 @@ with the desktop's 4 GiB). No run was skipped.
 | `triposg` | nomad 4090 Laptop | 1024² image + SAM mask → GLB | 188.32 s | 12.0 GiB | 179.26 | 188.22 | 88 | 81 | `hardware-tested` (hierarchical decoder, fp32) |
 | `qwen3-tts` | murph `A770` | 1 line → 24 kHz wav | — | — | — | — | — | — | not run: admission gate closed |
 | `sam2` | murph `A770` | 512², 1 point | — | — | — | — | — | — | not run: admission gate closed |
+| `kimodo` | atlas `gfx1100` | 3 s prompt → BVH | — | — | — | — | — | — | not run: gated text encoder |
 
 Notes that matter for a profile's `peakVramGib`:
 
@@ -244,6 +246,14 @@ Notes that matter for a profile's `peakVramGib`:
   `libze_intel_gpu`. `can` is not in `render`/`video`, but
   `/dev/dri/renderD128` is mode 0666, so the render node is accessible. The XPU
   backend stays `documented` in its profiles until a real run lands here.
+- Kimodo was **not** run end to end: its text encoder needs the gated
+  `meta-llama/Meta-Llama-3-8B-Instruct` weights, and the account behind the
+  worker token is not authorized for that repository (see "Blockers"). What did
+  run on atlas is a pipeline smoke test — the real pinned Kimodo weights and a
+  constant 4096-dim stub in place of the text encoder: 90 frames (3 s) at 100
+  denoising steps in 5.55 s after an 8.51 s load, 1.15 GiB allocator peak,
+  207 KB BVH, `Frames: 90`. The motion is conditioned on a constant embedding,
+  so it is not model output and is not in the table.
 
 ### Reproduce
 
@@ -348,6 +358,19 @@ sudo -u can $XPU_ROOT/.venvs/sam2/bin/python $XPU_ROOT/harness/run_job.py \
   --params '{"pointCoords":[[260,270]],"pointLabels":[1],"imageMime":"image/png"}'
 ```
 
+kimodo (atlas; the profile's `checkpoint.localPath` and
+`helpers[0].localPath` must point at the provisioned root, and the gated text
+encoder must be pinned and present first):
+
+```sh
+export DEV_ROOT=/data/nvme0/models/animation-dev
+$DEV_ROOT/.venvs/kimodo/bin/python harness/run_job.py \
+  --adapter $ADAPTERS/kimodo --python $DEV_ROOT/.venvs/kimodo/bin/python \
+  --profile $ADAPTERS/kimodo/profile.example.json --memory-max 24G \
+  --workdir $DEV_ROOT/runs/kimodo-1 --cache-root $DEV_ROOT/cache --lock-root $DEV_ROOT/locks \
+  --params '{"prompt":"a person walks forward and waves","durationSeconds":4.0}'
+```
+
 ### Environment build
 
 atlas (ROCm, PyTorch 2.14.1+rocm7.2, python 3.12):
@@ -400,7 +423,8 @@ the wheels still need the system Level Zero loader and Intel GPU driver:
 LD_LIBRARY_PATH=/run/opengl-driver/lib
 ```
 
-Weights (ungated Apache-2.0 / MIT only; nothing here accepts a licence gate):
+Weights (ungated Apache-2.0 / MIT only; nothing here accepts a licence gate
+except Kimodo's gated text encoder, provisioned separately below):
 
 ```sh
 python -c "from huggingface_hub import snapshot_download as d; d(repo_id='Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice', local_dir='$ANIM_ROOT/weights/qwen3-tts-0.6b-customvoice')"
@@ -408,6 +432,45 @@ python -c "from huggingface_hub import snapshot_download as d; d(repo_id='black-
 python -c "from huggingface_hub import snapshot_download as d; d(repo_id='facebook/sam2.1-hiera-small', local_dir='$ANIM_ROOT/weights/sam2.1-hiera-small')"
 python -c "from huggingface_hub import snapshot_download as d; d(repo_id='VAST-AI/TripoSG', local_dir='$ANIM_ROOT/weights/triposg')"
 ```
+
+Kimodo is the one adapter whose text encoder sits behind a licence gate, so its
+weights are provisioned separately. `kimodo` also builds a C++17 pybind11
+extension (`motion_correction`, foot-skate post-processing; no CUDA) at install
+time, so `cmake`, `make` and a C++17 compiler must be on `PATH`:
+
+```sh
+uv sync --frozen --project $ADAPTERS/kimodo     # UV_PROJECT_ENVIRONMENT=<venv>
+export HF_HOME=$DEV_ROOT/kimodo/hf-cache HF_TOKEN="$(cat $XDG_RUNTIME_DIR/agenix/can_hugging_face)"
+python - <<'PY'
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+# Kimodo's own weights are a plain directory: upstream resolves a checkpoint by
+# display name under CHECKPOINT_DIR, so the directory name is load-bearing.
+snapshot_download(
+    "nvidia/Kimodo-SOMA-RP-v1.2",
+    revision="0e3c89024d896064b6851201373f7834784a386b",
+    local_dir="/data/nvme0/models/animation-dev/kimodo/weights/Kimodo-SOMA-RP-v1.2",
+)
+# The encoder is resolved by repo id with HF_HUB_OFFLINE=1, so the cache ref
+# for `main` must name the pinned commit: that is what offline resolution reads.
+for repo, revision in [
+    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp", "31474e395ada192e8ed1586db6be79fb3b70c9c0"),
+    ("McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised", "baa8ebf04a1c2500e61288e7dad65e8ae42601a7"),
+    ("meta-llama/Meta-Llama-3-8B-Instruct", "8afb486c1db24fe5011ec46dfbe5b5dccdb575c2"),
+]:
+    path = Path(snapshot_download(repo, revision=revision, ignore_patterns=["original/*"]))
+    ref = path.parents[1] / "refs" / "main"
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_text(revision)
+PY
+```
+
+The first three downloads are ungated. The last one needs the Llama 3 licence
+acceptance on the account behind the token, and its four
+`model-*-of-00004.safetensors` sha256s must then be added to
+`helpers[0].checkpoints[0].files`; the adapter refuses to load a checkpoint that
+declares no hashes.
 
 ### Per-adapter notes
 
@@ -511,6 +574,55 @@ result's `validation.findings`, never applied silently. Nomad has no CUDA
 toolkit, so it runs `hierarchical`/`fp32`; the numbers below are from that
 configuration.
 
+**kimodo.** Text-to-motion on the SOMA skeleton: Kimodo-SOMA-RP-v1.2 runs on
+the reduced `somaskel30` internally and the adapter emits `somaskel77`. It calls
+the low-level API rather than the CLI, with upstream's SOMA defaults:
+
+```python
+model([prompt], [frames], num_denoising_steps=100, multi_prompt=True,
+      num_samples=1, post_processing=True, return_numpy=True)
+```
+
+`post_processing=True` runs the `motion_correction` C++ extension (foot-skate
+cleanup, CPU). `params`: `prompt` (required), `durationSeconds` (default 4,
+bounded by `limits.maxOutputSeconds` and by `limits.maxFrames` at the model's
+30 fps), `diffusionSteps` (default 100), `outputName` (default `motion.bvh`).
+The seed is `payload.seed`, applied by the shared runner before the checkpoint
+loads.
+
+The output is one BVH (`application/x-bvh`): the somaskel77 hierarchy, root
+translation plus per-joint ZYX local rotations, `Frame Time: 1/30`, offsets and
+root motion in centimetres (metres × 100, the BONES-SEED convention), and the
+standard T-pose as rest pose (`standard_tpose=True`), which is what Blender's
+BVH importer wants for retargeting. Clips run up to 10 s (300 frames at 30 fps).
+
+The checkpoint is resolved without a Hub lookup: `checkpoint.localPath` must be
+the directory named `Kimodo-SOMA-RP-v1.2` because upstream resolves a model as
+`CHECKPOINT_DIR/<display name>`, so the name is load-bearing; a directory by
+another name is `invalid_input` rather than a silent unpinned download.
+`pinned_source` verifies every declared sha256 first.
+
+The text encoder is LLM2Vec over the gated Meta-Llama-3-8B-Instruct: the base
+8B weights plus two stacked LoRA adapters (mntp, then mntp-supervised). All
+three snapshots are pinned in `helpers[0].checkpoints`, resolved from the
+Hugging Face cache in `helpers[0].localPath`, and verified file by file
+(every weight in the snapshot must be declared, and the cache must resolve each
+repo to the pinned snapshot). The process runs with `HF_HUB_OFFLINE=1`, so
+`from_pretrained` cannot reach the Hub at all, and `TEXT_ENCODER_DEVICE` is
+pinned to the selected GPU — upstream's `TEXT_ENCODER_DEVICE=cpu` path is never
+taken. The fingerprint covers the installed `kimodo` distribution's PEP 610
+commit and the three encoder pins, so a cache entry cannot be reused across a
+source or encoder change.
+
+ROCm: Kimodo is pure PyTorch plus that one CPU-only C++ extension, so nothing
+in it is CUDA-only. `torch.backends.cuda` TF32 and `torch.backends.cudnn` flags
+in `kimodo/tools.py` exist on ROCm builds too. Verified on atlas:
+`torch 2.14.1+rocm7.2` / `gfx1100` loads the pinned checkpoint, runs 100
+denoising steps and exports BVH. The denoiser runs in the checkpoint's own fp32
+dtype (the `bf16` in the profile is the text encoder's dtype, as upstream
+defaults it), which is why its allocator peak is only 1.15 GiB; the ~17 GiB the
+README quotes is the 8B text encoder.
+
 **audio2face.** Scaffold only. `README.md` in that directory carries the exact
 SDK build steps (CUDA 12.8–12.9, TensorRT 10.13–<11, python 3.8–3.10 for the
 model scripts) and the retarget blocker. The profile is `blocked`; a dispatch
@@ -519,13 +631,29 @@ engine.
 
 ## Blockers and deviations
 
+- **Kimodo's text encoder is gated and the worker token is not authorized.**
+  `meta-llama/Meta-Llama-3-8B-Instruct` answers 403 for the account behind
+  `can_hugging_face` (`canik0`): the Llama 3 licence acceptance exists, but the
+  account is not on the repository's authorized list, so the base 8B weights the
+  two LLM2Vec adapters sit on cannot be provisioned. The Kimodo weights and both
+  ungated LLM2Vec adapter snapshots are pinned and provisioned under
+  `/data/nvme0/models/animation-dev/kimodo`; the adapter fails closed with exit
+  14 and names the checkpoint rather than loading unverified weights. To finish:
+  grant that account access, download the four shards at `8afb486c`, add their
+  sha256s to `helpers[0].checkpoints[0].files`, and run the kimodo command under
+  "Reproduce". `peakVramGib` stays null and the profile stays `blocked` until
+  that run lands.
 - **Model root.** `/data/nvme0/models` and `/data/models` are root-owned on
   atlas and nomad. A `rops` request to create
   `/data/nvme0/models/animation` (atlas) and `/data/models/animation` (nomad)
   is queued. Until it lands, the runs above used
   `/data/nvme0/can/canix/ProjectState/models/animation` (atlas) and
   `/home/can/models/animation` (nomad); same filesystem, so the move is a
-  rename. The commands are written against `$ANIM_ROOT`.
+  rename. The commands are written against `$ANIM_ROOT`. Kimodo's development
+  root is the same story: `/data/nvme0/models/animation-dev` has its own queued
+  `rops` request, and until it lands the provisioned tree lives at
+  `/data/nvme0/can/canix/ProjectState/models/animation-dev` (same filesystem,
+  rename). The profile's `localPath`s name the final path.
 - **`diso` on nomad** is not built: it ships an sdist that needs a CUDA toolkit
   and there is none on that worker. TripoSG therefore runs the hierarchical
   (skimage) decoder; the flash decoder needs `diso` and is exited as

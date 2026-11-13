@@ -855,6 +855,51 @@ size=$(stat -c %s "$INFERNIX_WORKLOAD_OUTPUT_DIRECTORY/line.wav")
 printf '{"artifacts":[{"source":"audio","path":"out/line.wav","sha256":"%s","mime":"audio/wav","size":%s}],"contentFingerprint":"%s","cacheHit":false,"telemetry":{"peakVramBytes":1,"gpuSeconds":0.1,"cpuSeconds":0.1,"peakRssBytes":1,"maxTempC":null,"maxPowerW":null,"device":"gpu:test","backend":"rocm"},"validation":{"state":"ok","findings":[]}}\n' "$sha" "$size" "$sha"
 "#;
 
+/// A leader that leaves 1.5 s after SIGTERM, while an unreaped zombie keeps its
+/// group alive. The worker hands the group to termination 1.5 s after the
+/// heartbeat tick that renewed the lease, so a termination heartbeat that
+/// restarts its own interval first renews two seconds later, half a second
+/// after a 3 s lease expired.
+const DELAYED_EXIT_ADAPTER: &str = r#"#!/usr/bin/env python3
+import os
+import signal
+import sys
+import time
+
+staging = os.environ["INFERNIX_WORKLOAD_STAGING_DIRECTORY"]
+sys.stdin.buffer.read()
+
+
+def keep_zombie(adapter_pgid):
+    os.setpgid(0, 0)  # its own group, same session, so it survives the kill
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for descriptor in (0, 1, 2):
+        os.dup2(devnull, descriptor)
+    child = os.fork()
+    if child == 0:
+        os.setpgid(0, adapter_pgid)
+        os._exit(0)  # unreaped: a zombie that keeps the adapter group alive
+    with open(os.path.join(staging, "keeper.pid"), "w") as handle:
+        handle.write(str(os.getpid()))
+    while not os.path.exists(os.path.join(staging, "release")):
+        time.sleep(0.05)
+    os._exit(0)
+
+
+adapter_pgid = os.getpgid(0)
+keeper = os.fork()
+if keeper == 0:
+    keep_zombie(adapter_pgid)
+terminated = []
+signal.signal(signal.SIGTERM, lambda *_: terminated.append(time.monotonic()))
+with open(os.path.join(staging, "ready"), "w"):
+    pass
+while not terminated:
+    time.sleep(0.02)
+time.sleep(1.5)
+sys.exit(15)
+"#;
+
 /// An adapter whose process group can never empty: a keeper in another group
 /// holds an unreaped (zombie) member of the adapter's group until a test writes
 /// `<staging>/release`. SIGKILL cannot remove a zombie, which is the D-state
@@ -1097,5 +1142,59 @@ async fn a_short_lease_is_renewed_through_the_group_termination_wait() {
     fixture
         .wait_for_state(&client, &spec.id, JobState::Cancelled)
         .await;
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn the_termination_handoff_renews_before_any_wait() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("handoff", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.py", DELAYED_EXIT_ADAPTER);
+    // A 3 s lease with a 2 s heartbeat: the leader leaves 1.5 s after the tick
+    // that renewed the lease, so a termination heartbeat that restarts its
+    // interval renews 0.5 s after the lease has already expired.
+    let config = fixture.write_config_timed(&[("fixture-rocm", &adapter)], 2, 3);
+
+    let spec = job("job-handoff");
+    client.enqueue(&spec).await.unwrap();
+
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+    let staging = fixture.staging_root.join("job-handoff/1");
+    wait_for_file(&staging.join("ready")).await;
+    let (token, _) = lease_row(&client, &spec.id).await;
+
+    fixture.cancel(&config, spec.id.as_str()).await;
+
+    // The zombie never lets the group empty, so the worker heartbeats through
+    // the whole handoff and termination. The lease must stay current from the
+    // last supervision renewal (never a hole) and the job must stay with this
+    // worker, never re-claimed by another attempt.
+    let deadline = std::time::Instant::now() + Duration::from_secs(7);
+    while std::time::Instant::now() < deadline {
+        let (current, expires) = lease_row(&client, &spec.id).await;
+        assert_eq!(current, token, "another claim took the job");
+        assert!(
+            expires.is_some_and(|value| value > chrono::Utc::now()),
+            "the lease expired at the termination handoff"
+        );
+        assert_eq!(
+            client.status(&spec.id).await.unwrap().unwrap().state,
+            JobState::Leased,
+            "a live process group must never be confirmed as cancelled"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // Release the zombie; the group empties and the worker may confirm.
+    std::fs::write(staging.join("release"), b"").unwrap();
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Cancelled)
+        .await;
+    let status = client.status(&spec.id).await.unwrap().unwrap();
+    assert_eq!(status.attempts, 1, "the job was never re-claimed");
     worker.stop().await;
 }

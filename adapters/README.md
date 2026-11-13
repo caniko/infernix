@@ -103,10 +103,15 @@ buffered C output lands before the result rather than after it.
 
 The fingerprint covers an adapter-specific runtime identity as well: the
 Blender adapter hashes the parsed `blender --version` string, and the TripoSG
-adapter hashes the `HEAD` of the checkout at `$INFERNIX_TRIPOSG_CODE` after
-proving it equals the profile's `code.commit` and `git status --porcelain` is
-empty. A runtime identity the adapter cannot read, or a checkout that is not the
-pinned source, is `invalid_input` (14) instead of being hashed as null.
+adapter hashes `HEAD` of the checkout at `$INFERNIX_TRIPOSG_CODE` plus the
+sha256 of its vendored patches after proving the checkout is exactly that
+commit plus those patches. The expected tree is built by git itself (a
+throwaway worktree of the same repository, `git apply` in patch order), so both
+the tracked diff (`git diff --binary HEAD`) and `git status --porcelain` must be
+byte-equal to it; an unpatched checkout is refused like an edited or
+extra-file one. A runtime identity the adapter cannot read, or a checkout that
+is not the pinned source, is `invalid_input` (14) instead of being hashed as
+null.
 
 ### Tests
 
@@ -115,7 +120,7 @@ cd adapters/common
 uv run python -m unittest discover -s tests -p '*_test.py'
 ```
 
-66 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
+71 tests, no GPU and no model. They cover, as the plan requires: a CPU-only
 torch giving exit 13; a helper component placed on the CPU giving exit 13 (and
 again when it drops to the CPU *after* generation); a tensor on the wrong GPU
 index giving exit 13; OOM giving 12 (both `torch.OutOfMemoryError` and a HIP
@@ -378,9 +383,13 @@ code.
 
 The content fingerprint covers the verified checkout: the adapter resolves
 `$INFERNIX_TRIPOSG_CODE`, requires `git rev-parse HEAD` to equal the profile's
-`code.commit` and `git status --porcelain` to be empty, and hashes that `HEAD`,
-so a different or modified checkout can never reuse a cache entry. Three
-patches in `triposg/patches/` make the pinned checkout (fc5c409) runnable:
+`code.commit`, then rebuilds what that commit looks like with the vendored
+patches applied — `git worktree add --detach`, `git apply` each patch in order,
+`git diff --binary HEAD` — and requires the checkout's own `git diff --binary
+HEAD` and `git status --porcelain` to match it byte for byte. The fingerprint
+is `<head>+patches:<sha256 of the concatenated patches>`, so an unpatched,
+edited or extra-file checkout can never reuse a cache entry. Three patches in
+`triposg/patches/` make the pinned checkout (fc5c409) runnable:
 
 1. `diso` import made lazy — only the flash decoder uses `DiffDMC`, and `diso`
    ships an sdist that needs a CUDA toolkit to build.

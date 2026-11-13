@@ -630,6 +630,10 @@ struct AdapterRun {
     pid: u32,
     /// When SIGTERM's grace ends; `None` means terminate the group now.
     kill_at: Option<Instant>,
+    /// The supervision heartbeat. Termination keeps this interval (and its
+    /// phase) instead of starting a new one, whose first tick would be a whole
+    /// heartbeat away from the lease the last supervision tick renewed.
+    heartbeat: Interval,
 }
 
 async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) -> Result<()> {
@@ -675,10 +679,18 @@ async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) ->
         payload: job.payload.clone(),
     };
 
-    let run = run_adapter(&client, &config, &adapter, &lease, &envelope, &cancel_path).await?;
+    let mut run = run_adapter(&client, &config, &adapter, &lease, &envelope, &cancel_path).await?;
 
     if run.cancel_requested {
-        ensure_group_gone(&client, &config, &lease, run.pid, run.kill_at).await?;
+        ensure_group_gone(
+            &client,
+            &config,
+            &lease,
+            run.pid,
+            run.kill_at,
+            &mut run.heartbeat,
+        )
+        .await?;
         if client.confirm_cancelled(&lease).await? {
             info!(job = %lease.job_id.as_str(), "cancellation confirmed");
         } else {
@@ -704,7 +716,15 @@ async fn execute_job(client: WorkloadClient, config: Config, job: ClaimedJob) ->
         Some(EXIT_CANCELLED) => {
             // The adapter reported cancellation itself: its group still has to
             // be empty before the ledger records the cancellation.
-            ensure_group_gone(&client, &config, &lease, run.pid, run.kill_at).await?;
+            ensure_group_gone(
+                &client,
+                &config,
+                &lease,
+                run.pid,
+                run.kill_at,
+                &mut run.heartbeat,
+            )
+            .await?;
             if !client.confirm_cancelled(&lease).await? {
                 // The adapter cancelled without a ledger request: fail rather
                 // than leave the lease dangling until it expires.
@@ -823,6 +843,7 @@ async fn run_adapter(
         cancel_requested,
         pid,
         kill_at: cancel_deadline,
+        heartbeat,
     })
 }
 
@@ -872,21 +893,25 @@ async fn renew_lease(
 /// SIGKILL is sent once the SIGTERM grace is over and retried on every cycle.
 /// A group that survives SIGKILL (a D-state member) keeps its lease: the worker
 /// heartbeats and retries instead of confirming a cancellation it cannot prove.
-/// One heartbeat spans the whole termination, so a lease shorter than a wait can
-/// never expire while this worker still owns the job.
+/// The handoff renews the lease and the worker heartbeat immediately, before any
+/// wait, and then keeps the supervision interval: a lease shorter than a wait
+/// can never expire while this worker still owns the job.
 async fn ensure_group_gone(
     client: &WorkloadClient,
     config: &Config,
     lease: &infernix_workload::Lease,
     pid: u32,
     term_deadline: Option<Instant>,
+    heartbeat: &mut Interval,
 ) -> Result<()> {
     if pid == 0 {
         return Ok(());
     }
     let lease_duration = Duration::seconds(config.worker.lease_duration_secs as i64);
-    let mut heartbeat = interval(StdDuration::from_secs(config.worker.heartbeat_interval_secs));
-    heartbeat.tick().await; // the first tick resolves immediately
+    // The last supervision tick renewed the lease up to a whole heartbeat ago.
+    // Renewing here, before the first wait, means the next interval tick can
+    // never be the first renewal after the lease window has already closed.
+    renew_lease(client, lease, lease_duration, pid).await?;
     if let Some(deadline) = term_deadline {
         while Instant::now() < deadline && !group_gone(pid) {
             tokio::select! {
@@ -902,7 +927,7 @@ async fn ensure_group_gone(
             client,
             lease,
             lease_duration,
-            &mut heartbeat,
+            heartbeat,
             pid,
             GROUP_KILL_WAIT,
         )
@@ -1025,6 +1050,7 @@ async fn finish_success(
         output,
         pid,
         kill_at,
+        mut heartbeat,
         ..
     } = run;
     let job_id = lease.job_id.clone();
@@ -1062,7 +1088,7 @@ async fn finish_success(
     if !client.complete(lease, &stored).await? {
         // A requested cancellation refuses completion: the adapter's group must
         // be empty (ESRCH) before the worker confirms the cancellation.
-        ensure_group_gone(client, config, lease, pid, kill_at).await?;
+        ensure_group_gone(client, config, lease, pid, kill_at, &mut heartbeat).await?;
         if client.confirm_cancelled(lease).await? {
             info!(
                 job = %lease.job_id.as_str(),

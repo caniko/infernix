@@ -8,12 +8,16 @@ background-removal model: upstream's default pipeline downloads
 installs an import blocker that refuses `briarmbg` outright.
 """
 
+import hashlib
 import importlib.abc
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -27,6 +31,7 @@ FORBIDDEN_MODULES = ("briarmbg", "briaai")
 PADDING = 0.1
 SOURCE_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 CHECKOUT_ENV = "INFERNIX_TRIPOSG_CODE"
+PATCHES = Path(__file__).resolve().parent / "patches"
 
 
 class _BlockBackgroundRemoval(importlib.abc.MetaPathFinder):
@@ -202,22 +207,72 @@ def _simplify(mesh, faces_target):
 
 
 def _git(checkout, *arguments):
+    """Run git in `checkout` and return its raw stdout."""
     done = subprocess.run(
-        ["git", "-C", checkout, *arguments],
+        ["git", "-C", str(checkout), *arguments],
         capture_output=True,
-        text=True,
         timeout=60,
         check=True,
     )
     return done.stdout
 
 
-def verified_head(commit):
-    """The verified HEAD of the TripoSG checkout the adapter actually imports.
+def vendored_patches():
+    """The patch files that make the pinned checkout runnable, in apply order."""
+    patches = sorted(PATCHES.glob("*.patch"))
+    if not patches:
+        raise AdapterError(
+            14,
+            f"the vendored TripoSG patches are missing from {PATCHES}: the pinned "
+            "commit does not run unpatched",
+        )
+    return patches
+
+
+def patch_digest(patches):
+    """The sha256 of the concatenated vendored patches."""
+    digest = hashlib.sha256()
+    for patch in patches:
+        digest.update(patch.read_bytes())
+    return digest.hexdigest()
+
+
+def expected_tree(checkout, patches):
+    """`(diff, status)` of `HEAD` with the vendored patches applied.
+
+    The expected bytes are produced by git itself, in a throwaway worktree of
+    the same repository, so neither a hand-parsed diff nor the working tree
+    decides what "patched" means.
+    """
+    scratch = tempfile.mkdtemp(prefix="infernix-triposg-")
+    worktree = os.path.join(scratch, "patched")
+    try:
+        _git(checkout, "worktree", "add", "--detach", worktree, "HEAD")
+        try:
+            for patch in patches:
+                _git(worktree, "apply", "--binary", str(patch))
+            return (
+                _git(worktree, "diff", "--binary", "HEAD"),
+                _git(worktree, "status", "--porcelain"),
+            )
+        finally:
+            subprocess.run(
+                ["git", "-C", str(checkout), "worktree", "remove", "--force", worktree],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def verified_source(commit):
+    """The verified source identity of the TripoSG checkout that is imported.
 
     Hashing a profile label is not provenance: the checkout on disk must be the
-    pinned commit and carry no uncommitted change, or the fingerprint would name
-    source the operation never loaded.
+    pinned commit plus exactly the vendored patches (the pinned upstream commit
+    does not run unpatched), with no other tracked or untracked change, or the
+    fingerprint would name source the operation never loaded.
     """
     checkout = os.environ.get(CHECKOUT_ENV)
     if not checkout:
@@ -226,30 +281,39 @@ def verified_head(commit):
             f"{CHECKOUT_ENV} is required: the fingerprint must cover the TripoSG "
             "checkout that is imported",
         )
+    patches = vendored_patches()
     try:
-        head = _git(checkout, "rev-parse", "HEAD").strip().lower()
-        changes = _git(checkout, "status", "--porcelain")
-    except (OSError, subprocess.SubprocessError) as error:
+        head = _git(checkout, "rev-parse", "HEAD").decode().strip().lower()
+        if head != commit:
+            raise AdapterError(
+                14,
+                f"TripoSG checkout {checkout} is at {head or 'no commit'}, "
+                f"profile code.commit is {commit}",
+            )
+        expected_diff, expected_status = expected_tree(checkout, patches)
+        changes = _git(checkout, "diff", "--binary", "HEAD")
+        untracked = _git(checkout, "status", "--porcelain")
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
         raise AdapterError(
             14, f"cannot verify the TripoSG checkout {checkout}: {error}"
         ) from error
-    if head != commit:
+    if changes != expected_diff:
         raise AdapterError(
             14,
-            f"TripoSG checkout {checkout} is at {head or 'no commit'}, "
-            f"profile code.commit is {commit}",
+            f"TripoSG checkout {checkout} is not the pinned commit plus the "
+            f"{len(patches)} vendored patches; its tracked changes differ",
         )
-    if changes.strip():
+    if untracked != expected_status:
         raise AdapterError(
             14,
-            f"TripoSG checkout {checkout} has uncommitted changes; the fingerprint "
-            "can only cover the pinned source",
+            f"TripoSG checkout {checkout} carries files the vendored patches do "
+            "not add; only the pinned source plus those patches may be imported",
         )
-    return head
+    return f"{head}+patches:{patch_digest(patches)}"
 
 
 def runtime_versions(envelope):
-    """The pinned TripoSG source commit the content fingerprint must cover."""
+    """The verified TripoSG source identity the content fingerprint must cover."""
     commit = ((envelope.profile or {}).get("code") or {}).get("commit")
     digest = commit.strip().lower() if isinstance(commit, str) else ""
     if not SOURCE_COMMIT.match(digest):
@@ -258,7 +322,7 @@ def runtime_versions(envelope):
             "profile code.commit must be the pinned TripoSG source commit sha: "
             f"{commit!r} is not a full 40-hex commit",
         )
-    return {"triposg": verified_head(digest)}
+    return {"triposg": verified_source(digest)}
 
 
 def main():

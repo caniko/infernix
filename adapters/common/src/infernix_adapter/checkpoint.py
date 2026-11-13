@@ -84,17 +84,22 @@ def _refuse_unlisted_weights(root, entries):
 
     Hugging Face caches are symlink farms (`snapshots/<sha>/model.safetensors`
     -> `blobs/<sha>`), so the walk follows links and checks every weight file
-    under the path it is found at. The realpath set keeps a link cycle from
-    looping.
+    under the path it is found at. Cycles are cut by ancestry, not by a global
+    set of visited real directories: `transformer -> a` is a second relative
+    path onto the same directory, and a weight behind it is undeclared even
+    when `a/` was walked first.
     """
     declared = {Path(entry["path"]).as_posix() for entry in entries}
-    visited = set()
     for base, directories, files in os.walk(root, followlinks=True):
-        real = os.path.realpath(base)
-        if real in visited:
+        from_root = Path(os.path.relpath(base, root))
+        ancestors = (
+            {os.path.realpath(root / parent) for parent in from_root.parents}
+            if from_root != Path(".")
+            else set()
+        )
+        if os.path.realpath(base) in ancestors:
             directories[:] = []
             continue
-        visited.add(real)
         directories.sort()
         for name in sorted(files):
             candidate = Path(base) / name

@@ -790,6 +790,50 @@ class CheckpointTests(Harness):
         self.assertIn("unlisted weight file", str(caught.exception))
         self.assertIn("transformer/model.safetensors", str(caught.exception))
 
+    def test_an_unlisted_weight_behind_a_directory_alias_is_rejected(self):
+        # The reviewer's case: `a/` is walked first, so a visited-realpath set
+        # would treat `transformer -> a` as already covered and accept the
+        # undeclared `transformer/model.safetensors`.
+        root = self.directory / "aliased"
+        (root / "a").mkdir(parents=True)
+        payload = b"weights"
+        (root / "a" / "model.safetensors").write_bytes(payload)
+        (root / "transformer").symlink_to(root / "a")
+        with self.assertRaises(AdapterError) as caught:
+            checkpoint.pinned_source(
+                {
+                    "checkpoint": {
+                        "localPath": str(root),
+                        "files": [
+                            {
+                                "path": "a/model.safetensors",
+                                "sha256": hashlib.sha256(payload).hexdigest(),
+                            }
+                        ],
+                    }
+                }
+            )
+        self.assertEqual(caught.exception.code, 14)
+        self.assertIn("unlisted weight file", str(caught.exception))
+        self.assertIn("transformer/model.safetensors", str(caught.exception))
+
+    def test_a_symlink_cycle_terminates(self):
+        root = self.directory / "cycle"
+        root.mkdir()
+        (root / "config.json").write_text("{}")
+        (root / "loop").symlink_to(root)
+        source, _ = checkpoint.pinned_source(
+            {
+                "checkpoint": {
+                    "localPath": str(root),
+                    "files": [
+                        {"path": "config.json", "sha256": hashlib.sha256(b"{}").hexdigest()}
+                    ],
+                }
+            }
+        )
+        self.assertEqual(source, str(root))
+
     def test_a_declared_file_behind_a_huggingface_blob_symlink_is_accepted(self):
         root = self.directory / "hf-cache"
         snapshot = root / "snapshots" / ("a" * 40)

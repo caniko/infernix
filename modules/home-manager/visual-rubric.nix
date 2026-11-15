@@ -151,15 +151,19 @@ let
   visualRubricDefaultPackage = visualRubricPackages.default or null;
   visualRubricCodexAcpPackage = visualRubricPackages."codex-acp" or null;
 
+  # Direct screenshot evaluation exists only in the codex-acp build, whichever
+  # ACP backend then serves it.
+  usesCodexAcpBuild = cfg.mode == "direct" || rubricBackend == "codex-acp";
+
   resolvedPackage =
     if cfg.package != null
     then cfg.package
-    else if rubricBackend == "codex-acp"
+    else if usesCodexAcpBuild
     then visualRubricCodexAcpPackage
     else visualRubricDefaultPackage;
 
   expectedPackageAttr =
-    if rubricBackend == "codex-acp"
+    if usesCodexAcpBuild
     then "codex-acp"
     else "default";
 
@@ -237,9 +241,9 @@ in
       default = null;
       description = ''
         visual-rubric package to install. When null, the module selects the
-        package from infernix's visual-rubric input: codex-acp backends use
-        packages.''${system}.codex-acp, and other backends use
-        packages.''${system}.default.
+        package from infernix's visual-rubric input: direct mode and codex-acp
+        backends use packages.''${system}.codex-acp, and pipeline mode with
+        another backend uses packages.''${system}.default.
       '';
     };
 

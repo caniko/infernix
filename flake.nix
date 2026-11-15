@@ -789,6 +789,25 @@
           }
         ];
       };
+      visualRubricDirectOpencodeSample = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        extraSpecialArgs = {osConfig = null;};
+        modules = [
+          self.homeModules.default
+          {
+            home = {
+              username = "tester";
+              homeDirectory = "/home/tester";
+              stateVersion = "24.11";
+            };
+            services.infernix.visual-rubric = {
+              enable = true;
+              mode = "direct";
+              rubric.backend = "opencode";
+            };
+          }
+        ];
+      };
       visualRubricPipelineSample = home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
         extraSpecialArgs = {osConfig = null;};
@@ -824,6 +843,11 @@
         (package: package == visual-rubric.packages.${system}."codex-acp")
         null
         visualRubricDirectSample.config.home.packages;
+      visualRubricDirectOpencodePackage =
+        pkgs.lib.findFirst
+        (package: package == visual-rubric.packages.${system}."codex-acp")
+        null
+        visualRubricDirectOpencodeSample.config.home.packages;
       visualRubricPipelinePackage =
         pkgs.lib.findFirst
         (package: package == visual-rubric.packages.${system}.default)
@@ -1481,6 +1505,7 @@
         grep -Fq 'effort = "medium"' ${visualRubricDirectConfig}
         ! grep -Fq '[vision]' ${visualRubricDirectConfig}
         test "${visualRubricDirectPackage}" = "${visual-rubric.packages.${system}."codex-acp"}"
+        test "${visualRubricDirectOpencodePackage}" = "${visual-rubric.packages.${system}."codex-acp"}"
 
         grep -Fq 'mode = "pipeline"' ${visualRubricPipelineConfig}
         grep -Fq 'backend = "opencode"' ${visualRubricPipelineConfig}

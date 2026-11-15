@@ -210,10 +210,8 @@ def run(
         watcher = CancelWatcher(envelope.cancel_path).start()
         watcher.check()
         bound_threads(envelope.cpu_threads, torch_module)
-        requires_gpu = (
-            envelope.profile.get("cpuPolicy") != "authoring"
-            and envelope.profile.get("id") != "authoring"
-        )
+        # The profile schema allows only "forbidden" (GPU) and "permitted" (CPU).
+        requires_gpu = envelope.profile.get("cpuPolicy") != "permitted"
         torch = None
         if requires_gpu and torch_guard:
             torch = gpu.assert_gpu(envelope.profile, torch_module)

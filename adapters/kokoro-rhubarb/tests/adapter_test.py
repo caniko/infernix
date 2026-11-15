@@ -82,8 +82,13 @@ class AdapterTests(unittest.TestCase):
         for key in ("root", "joints", "gaze", "contacts"):
             self.assertEqual(json.dumps(motion[key]).encode(), json.dumps(result[key]).encode())
         self.assertEqual(motion["facial"]["brow"], result["facial"]["brow"])
-        self.assertEqual({"times": [0.0, 0.5, 1.0], "values": [1, 0, 0]}, result["facial"]["mouth_A"])
-        self.assertEqual({"times": [0.0, 0.5, 1.0], "values": [0, 1, 0]}, result["facial"]["mouth_B"])
+        for shape in "ABCDEFGHX":
+            track = result["facial"]["mouth_" + shape]
+            self.assertEqual(5, len(track["times"]))
+            self.assertEqual([0.0, 0.5, 1.0], track["times"][::2])
+            self.assertTrue(all(a < b for a, b in zip(track["times"], track["times"][1:])))
+            self.assertEqual([int(shape == "A"), int(shape == "A"), int(shape == "B"),
+                              int(shape == "B"), 0], track["values"])
 
 
 if __name__ == "__main__":

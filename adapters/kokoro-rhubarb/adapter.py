@@ -81,14 +81,22 @@ def produce(context):
     previous_end = 0.0
     for cue in cues:
         start, end, value = cue["start"], cue["end"], cue["value"]
-        if not isinstance(value, str) or len(value) != 1 or value not in "ABCDEFGHX" or not previous_end <= start < end <= duration + 0.01:
+        if not isinstance(value, str) or len(value) != 1 or value not in "ABCDEFGHX" or not previous_end <= start < end <= duration + 0.01 or start >= duration:
             raise AdapterError(14, "invalid Rhubarb cue")
         previous_end = end
         events[min(end, duration)] = None
         events[start] = value
-    times = sorted(events)
+    boundaries = sorted(events)
+    times = [boundaries[0]]
+    values = [events[boundaries[0]]]
+    for previous, boundary in zip(boundaries, boundaries[1:]):
+        before = boundary - min(0.001, (boundary - previous) / 2)
+        if not previous < before < boundary:
+            raise AdapterError(14, "Rhubarb cue boundaries are too close")
+        times.extend((before, boundary))
+        values.extend((events[previous], events[boundary]))
     for shape in "ABCDEFGHX":
-        bundle["facial"]["mouth_" + shape] = {"times": times, "values": [int(events[t] == shape) for t in times]}
+        bundle["facial"]["mouth_" + shape] = {"times": times, "values": [int(value == shape) for value in values]}
     bundle["audio"] = {"sha256": digest, "sampleRate": rate}
     bundle["duration"] = max(bundle["duration"], duration)
     bundle["provenance"]["sourceRefs"].append("Rhubarb face merge; motion is not extrapolated beyond its original samples")

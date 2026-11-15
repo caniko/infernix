@@ -644,6 +644,9 @@ in
         ReadWritePaths = [cfg.stagingRoot cfg.cacheRoot] ++ map toString cfg.modelDirectories;
         Restart = "on-failure";
         RestartSec = 5;
+        KillMode = "mixed";
+        # Coupled to workerd's default cancel_grace_secs (30), plus 30s for lease release.
+        TimeoutStopSec = 60;
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         PrivateTmp = true;

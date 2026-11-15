@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -427,6 +428,40 @@ class RenderTests(unittest.TestCase):
             adapter.render(self.context())
         self.assertEqual(caught.exception.code, 13)
         self.assertIn("hevc_vaapi", str(caught.exception))
+
+    def test_authoring_envelope_and_render_without_frames(self):
+        fake = self.root / "fake-blender"
+        fake.write_text('''#!/usr/bin/env python3
+import json, pathlib, sys
+if "--version" in sys.argv:
+    print("Blender 5.2.3")
+    sys.exit(0)
+assert "--python-expr" not in sys.argv
+request = json.loads(pathlib.Path(sys.argv[sys.argv.index("--in") + 1]).read_text())
+scene = pathlib.Path(request["scene"])
+revision = scene.with_name("scene.r0001.blend")
+revision.write_bytes(b"revision")
+pathlib.Path(sys.argv[sys.argv.index("--out") + 1]).write_text(json.dumps({"ok": True, "outputs": [{"kind": "scene_revision", "path": str(revision)}]}))
+''')
+        fake.chmod(0o755)
+        scene = self.root / "scene.blend"
+        scene.write_bytes(b"scene")
+        staging = self.root / "job"
+        envelope = {"protocolVersion": 2, "workload": "animation", "queue": "shot", "jobId": "job", "leaseToken": "lease", "attempt": 1, "inputFingerprint": "input", "stagingDirectory": str(staging), "outputDirectory": str(staging / "out"), "cancelPath": str(staging / "cancel"), "payload": {"stage": "shot", "operation": "configure_shot", "generationRequestId": "generation", "profile": {"id": "authoring", "backend": "cpu", "device": "cpu:atlas", "cpuPolicy": "permitted"}, "inputs": [], "params": {"blenderScript": str(self.script), "scene": str(scene)}}}
+        env = dict(os.environ, INFERNIX_BLENDER=str(fake), PYTHONPATH=str(Path(adapter.__file__).resolve().parents[1] / "common" / "src"), INFERNIX_ADAPTER_CACHE_DIR=str(self.root / "cache"))
+        done = subprocess.run([sys.executable, adapter.__file__], input=json.dumps(envelope), text=True, capture_output=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        artifacts = json.loads(done.stdout)["artifacts"]
+        self.assertEqual({a["source"] for a in artifacts}, {"scene_revision", "operation_result"})
+        self.assertEqual({a["mime"] for a in artifacts}, {"application/x-blender", "application/json"})
+
+        def no_frames(command, env, log_path, cancel):
+            Path(log_path).write_text(adapter.GUARD_OK + "\n" + adapter.VERIFY_OK + "\n")
+            return 0
+
+        with mock.patch.object(adapter, "_run", no_frames):
+            with self.assertRaisesRegex(AdapterError, "operation wrote no PNG frames"):
+                adapter.render(self.context())
 
 
 if __name__ == "__main__":

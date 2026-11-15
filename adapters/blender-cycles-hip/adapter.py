@@ -293,6 +293,8 @@ def _classify_blender_exit(code, text):
 def render(context):
     profile = context.profile
     params = context.params
+    if profile.get("id") == "authoring":
+        return authoring(context)
     device_type, guard, verify = blender_program(profile)
     script = params.get("blenderScript")
     if not script:
@@ -396,6 +398,65 @@ def render(context):
         context.artifact(params.get("artifactSource", "preview"), output_name, "video/mp4"),
         context.artifact("frames", FRAMES_MANIFEST, "application/json"),
     ]
+
+
+def authoring(context):
+    params = context.params
+    script = params.get("blenderScript")
+    if not script or not Path(script).is_file():
+        raise AdapterError(14, "params.blenderScript must name an existing file")
+    scene = params.get("scene")
+    if not scene:
+        scene = context.input_path("scene")
+    if not Path(scene).is_file():
+        raise AdapterError(14, f"scene not found: {scene}")
+    work = context.staging_directory / "authoring"
+    work.mkdir(parents=True, exist_ok=True)
+    staged_scene = work / Path(scene).name
+    shutil.copyfile(scene, staged_scene)
+    request = work / "request.json"
+    request.write_text(json.dumps({
+        "scene": str(staged_scene), "profile": context.profile["id"], "params": params,
+    }))
+    result_path = context.output_directory / "operation-result.json"
+    logs = context.staging_directory / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    env = dict(
+        os.environ,
+        INFERNIX_BLENDER_ARGS=json.dumps(params, sort_keys=True),
+        INFERNIX_STAGING_DIR=str(context.staging_directory),
+    )
+    command = [
+        BLENDER, "--background", "--factory-startup", "--python-exit-code", "13",
+        "--python", str(script), "--", "--in", str(request), "--out", str(result_path),
+    ]
+    context.check_cancel()
+    code = _run(command, env, logs / "blender.log", context.cancel)
+    failure = _classify_blender_exit(code, _read_log(logs / "blender.log"))
+    if failure is not None:
+        raise failure
+    try:
+        result = json.loads(result_path.read_text())
+        if not result["ok"] or not isinstance(result["outputs"], list):
+            raise ValueError("operation did not succeed")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise AdapterError(14, f"invalid operation result: {error}") from error
+    artifacts = [context.artifact("operation_result", result_path.name, "application/json")]
+    for entry in result["outputs"]:
+        path = entry.get("path")
+        if path is None:
+            continue
+        source = Path(path)
+        if (source.is_symlink() or source.resolve().parent != work.resolve()
+                or not source.is_file()):
+            raise AdapterError(14, f"invalid operation output: {path}")
+        mime = {".blend": "application/x-blender", ".json": "application/json"}.get(source.suffix)
+        if not mime:
+            raise AdapterError(14, f"unsupported operation output: {path}")
+        target = adapter.output_path(context.output_directory, source.name)
+        shutil.copyfile(source, target)
+        artifacts.append(context.artifact(entry["kind"], source.name, mime))
+    return artifacts
 
 
 def available_encoders():

@@ -703,6 +703,19 @@ dtype (the `bf16` in the profile is the text encoder's dtype, as upstream
 defaults it), which is why its allocator peak is only 1.15 GiB; the ~17 GiB the
 README quotes is the 8B text encoder.
 
+**kokoro-rhubarb.** Kip's speech, as two ledger jobs so the Board's audio approval sits
+between them.
+- `tts` runs Kokoro-82M (voice `af_bella`) on the GPU.
+  - Its English G2P (Misaki) tags the text with the spaCy model `en_core_web_sm` 3.8.0 on the CPU.
+  - That is text preprocessing, not synthesis.
+  - The wheel is pinned by URL in `pyproject.toml` and by hash in `uv.lock`.
+  - The adapter refuses to run rather than let Misaki or spaCy download anything.
+- `face` runs Rhubarb (`INFERNIX_RHUBARB`) on the approved WAV.
+  - A sha256 mismatch is refused.
+  - It merges the mouth curves `mouth_A`…`mouth_H` and `mouth_X` into the input motion bundle.
+  - Each cue boundary carries two keys, so linear resampling stays a step.
+  - Rhubarb is the profile schema's second named CPU exception.
+
 **audio2face.** Scaffold only. `README.md` in that directory carries the exact
 SDK build steps (CUDA 12.8–12.9, TensorRT 10.13–<11, python 3.8–3.10 for the
 model scripts) and the retarget blocker. The profile is `blocked`; a dispatch

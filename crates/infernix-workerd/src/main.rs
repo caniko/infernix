@@ -1595,7 +1595,14 @@ async fn finish_pending_deliveries(
     worker: &WorkerId,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<usize> {
-    let pending = client.undelivered_succeeded(worker).await?;
+    // A stalled database must not hold a stopping worker past TimeoutStopSec.
+    if *shutdown.borrow() {
+        return Ok(0);
+    }
+    let pending = tokio::select! {
+        pending = client.undelivered_succeeded(worker) => pending?,
+        _ = shutdown.changed() => return Ok(0),
+    };
     if pending.is_empty() {
         return Ok(0);
     }

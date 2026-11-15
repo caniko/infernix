@@ -432,6 +432,15 @@ def authoring(context):
     ]
     context.check_cancel()
     code = _run(command, env, logs / "blender.log", context.cancel)
+    if code == 14:
+        try:
+            failed_result = json.loads(result_path.read_text())
+            failures = failed_result["failures"]
+            if (failed_result["ok"] is False and failed_result["exitCode"] == code
+                    and isinstance(failures, list) and failures):
+                raise AdapterError(14, json.dumps(failures, sort_keys=True))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     failure = _classify_blender_exit(code, _read_log(logs / "blender.log"))
     if failure is not None:
         raise failure

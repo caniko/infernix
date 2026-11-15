@@ -438,6 +438,9 @@ if "--version" in sys.argv:
     sys.exit(0)
 assert "--python-expr" not in sys.argv
 request = json.loads(pathlib.Path(sys.argv[sys.argv.index("--in") + 1]).read_text())
+if request["params"].get("fail"):
+    pathlib.Path(sys.argv[sys.argv.index("--out") + 1]).write_text(json.dumps({"ok": False, "outputs": [], "failures": [{"code": "invalid_input", "detail": "bad shot"}], "exitCode": 14}))
+    sys.exit(14)
 scene = pathlib.Path(request["scene"])
 revision = scene.with_name("scene.r0001.blend")
 revision.write_bytes(scene.read_bytes())
@@ -462,6 +465,11 @@ pathlib.Path(sys.argv[sys.argv.index("--out") + 1]).write_text(json.dumps({"ok":
         self.assertFalse(result["cacheHit"])
         revision = next(a for a in result["artifacts"] if a["source"] == "scene_revision")
         self.assertEqual((staging / revision["path"]).read_bytes(), b"changed scene")
+
+        envelope["payload"]["params"]["fail"] = True
+        done = subprocess.run([sys.executable, adapter.__file__], input=json.dumps(envelope), text=True, capture_output=True, env=env)
+        self.assertEqual(done.returncode, 14, done.stderr)
+        self.assertIn("bad shot", done.stderr)
 
         def no_frames(command, env, log_path, cancel):
             Path(log_path).write_text(adapter.GUARD_OK + "\n" + adapter.VERIFY_OK + "\n")

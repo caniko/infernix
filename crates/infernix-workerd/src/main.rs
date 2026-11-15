@@ -925,7 +925,7 @@ async fn execute_job(
             &mut run.heartbeat,
         )
         .await?;
-        if run.output.status.code() != Some(0) || *shutdown.borrow() {
+        if run.output.status.code() != Some(0) {
             // The reclaim reuses this attempt's staging directory, so the
             // `CANCEL` written by the preemption must not survive the release.
             clear_cancel(&cancel_path);

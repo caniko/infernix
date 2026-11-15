@@ -895,6 +895,29 @@ async fn a_denied_admission_never_claims() {
 }
 
 #[tokio::test]
+async fn sigterm_keeps_successful_adapter_result() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("sigterm-success", cluster.connection_string(&database));
+    let script = format!("{SUCCESS_ADAPTER}\ntrap 'exit 0' TERM\ntouch \"$INFX_COPIES/started\"\nwhile :; do sleep 0.05; done\n");
+    let adapter = fixture.write_adapter("adapter.sh", &script);
+    let config = fixture.write_config(&adapter);
+    let spec = job("job-sigterm-success");
+    client.enqueue(&spec).await.unwrap();
+    let mut worker = fixture.spawn(&config);
+    timeout(Duration::from_secs(10), async {
+        while !fixture.copies.join("started").exists() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    let child = worker.child.as_mut().unwrap();
+    assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) }, 0);
+    let status = timeout(Duration::from_secs(7), child.wait()).await.unwrap().unwrap();
+    assert!(status.success());
+    assert_eq!(client.status(&spec.id).await.unwrap().unwrap().state, JobState::Succeeded);
+}
+
+#[tokio::test]
 async fn sigterm_returns_running_job_without_spending_an_attempt() {
     let cluster = TestCluster::start();
     let (database, client) = fresh_ledger(&cluster).await.unwrap();

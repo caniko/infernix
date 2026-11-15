@@ -15,6 +15,10 @@ from infernix_adapter import AdapterError, run
 
 
 def synthesize(context, text):
+    import spacy
+
+    if not spacy.util.is_package("en_core_web_sm"):
+        raise AdapterError(14, "en_core_web_sm is not installed; offline download is forbidden")
     from kokoro import KModel, KPipeline
 
     source, _ = adapter.pinned_source(context.profile)

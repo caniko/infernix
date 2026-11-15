@@ -50,6 +50,12 @@ class AdapterTests(unittest.TestCase):
         torch = types.SimpleNamespace(version=types.SimpleNamespace(hip="7.2", cuda=None), cuda=runtime)
         self.assertIs(adapter.adapter.assert_gpu(profile, torch), torch)
 
+    def test_missing_spacy_model_fails_without_downloading(self):
+        spacy = types.SimpleNamespace(util=types.SimpleNamespace(is_package=lambda _: False))
+        with patch.dict(sys.modules, {"spacy": spacy}):
+            with self.assertRaisesRegex(AdapterError, "en_core_web_sm"):
+                adapter.synthesize(None, "hello")
+
     def test_wav_artifact_sha256(self):
         context = Context(self.root, "tts", {"text": "hello"})
         with patch.object(adapter, "synthesize", return_value=[0.0, 0.25, -0.25]):

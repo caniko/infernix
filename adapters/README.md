@@ -707,7 +707,7 @@ README quotes is the 8B text encoder.
 between them.
 - `tts` runs Kokoro-82M (voice `af_bella`) on the GPU.
   - Its English G2P (Misaki) tags the text with the spaCy model `en_core_web_sm` 3.8.0 on the CPU.
-  - That is text preprocessing, not synthesis.
+  - The tagger is learned CPU inference, so the profile declares it as a helper with `onGpu: false`; the profile schema allows that exception for Kokoro alone.
   - The wheel is pinned by URL in `pyproject.toml` and by hash in `uv.lock`.
   - The adapter refuses to run rather than let Misaki or spaCy download anything.
 - `face` runs Rhubarb (`INFERNIX_RHUBARB`) on the approved WAV.

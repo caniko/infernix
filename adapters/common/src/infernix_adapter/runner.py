@@ -203,6 +203,7 @@ def run(
     try:
         reserved = _ReservedStdout()
         envelope = parse(stdin.read())
+        use_cache = use_cache(envelope) if callable(use_cache) else use_cache
         staging = Path(envelope.staging_directory)
         output = Path(envelope.output_directory)
         output.mkdir(parents=True, exist_ok=True)

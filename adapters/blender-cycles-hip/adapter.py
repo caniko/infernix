@@ -507,6 +507,7 @@ def main():
     return run(
         render,
         package="blender-cycles-hip",
+        use_cache=lambda envelope: envelope.profile.get("id") != "authoring",
         torch_guard=False,
         runtime=runtime_versions,
     )

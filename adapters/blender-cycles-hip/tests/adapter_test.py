@@ -440,7 +440,7 @@ assert "--python-expr" not in sys.argv
 request = json.loads(pathlib.Path(sys.argv[sys.argv.index("--in") + 1]).read_text())
 scene = pathlib.Path(request["scene"])
 revision = scene.with_name("scene.r0001.blend")
-revision.write_bytes(b"revision")
+revision.write_bytes(scene.read_bytes())
 pathlib.Path(sys.argv[sys.argv.index("--out") + 1]).write_text(json.dumps({"ok": True, "outputs": [{"kind": "scene_revision", "path": str(revision)}]}))
 ''')
         fake.chmod(0o755)
@@ -454,6 +454,14 @@ pathlib.Path(sys.argv[sys.argv.index("--out") + 1]).write_text(json.dumps({"ok":
         artifacts = json.loads(done.stdout)["artifacts"]
         self.assertEqual({a["source"] for a in artifacts}, {"scene_revision", "operation_result"})
         self.assertEqual({a["mime"] for a in artifacts}, {"application/x-blender", "application/json"})
+
+        scene.write_bytes(b"changed scene")
+        done = subprocess.run([sys.executable, adapter.__file__], input=json.dumps(envelope), text=True, capture_output=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = json.loads(done.stdout)
+        self.assertFalse(result["cacheHit"])
+        revision = next(a for a in result["artifacts"] if a["source"] == "scene_revision")
+        self.assertEqual((staging / revision["path"]).read_bytes(), b"changed scene")
 
         def no_frames(command, env, log_path, cancel):
             Path(log_path).write_text(adapter.GUARD_OK + "\n" + adapter.VERIFY_OK + "\n")

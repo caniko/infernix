@@ -708,6 +708,11 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
             );
         }
 
+        // ponytail: shutdown bounds adapter cancel and hub uploads, but not ledger
+        // calls (claim, renew, release, complete). If the ledger stalls during a
+        // stop, systemd SIGKILLs at TimeoutStopSec and the lease expires, which was
+        // the behaviour before graceful stop. Put a shutdown deadline on each ledger
+        // call if stalled-DB stops are ever seen.
         if once || *shutdown.borrow() {
             while let Some(result) = tasks.join_next().await {
                 match result {

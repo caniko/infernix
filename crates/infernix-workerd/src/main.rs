@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::AsyncWriteExt,
     process::Command,
+    sync::watch,
     task::JoinSet,
     time::{Instant, Interval, interval, sleep, sleep_until, timeout},
 };
@@ -651,6 +652,16 @@ impl AdmissionGate {
 }
 
 async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let (shutdown_tx, mut shutdown) = watch::channel(false);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        let _ = shutdown_tx.send(true);
+    });
     let boot_id = resolve_boot_id(&config.worker)?;
     let worker = worker_profile(&config, &boot_id)?;
     client
@@ -678,7 +689,7 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
         // A denied host yields no claims; delivery recovery and joining
         // finished tasks keep working, and the poll sleep still bounds a deny.
         let admitted = admission.admits(&admission_log).await;
-        while admitted && tasks.len() < config.worker.concurrency {
+        while admitted && !*shutdown.borrow() && tasks.len() < config.worker.concurrency {
             let Some(job) = claim(&client, &config, &worker, &boot_id).await? else {
                 break;
             };
@@ -691,10 +702,13 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
             let client = client.clone();
             let config = config.clone();
             let admission_log = admission_log.clone();
-            tasks.spawn(async move { execute_job(client, config, job, admission_log).await });
+            let shutdown = shutdown.clone();
+            tasks.spawn(
+                async move { execute_job(client, config, job, admission_log, shutdown).await },
+            );
         }
 
-        if once {
+        if once || *shutdown.borrow() {
             while let Some(result) = tasks.join_next().await {
                 match result {
                     Ok(Ok(())) => {}
@@ -706,6 +720,7 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
         }
 
         tokio::select! {
+            _ = shutdown.changed() => {}
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 match result {
                     Ok(Ok(())) => {}
@@ -840,6 +855,7 @@ async fn execute_job(
     config: Config,
     job: ClaimedJob,
     admission_log: AdmissionLog,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let lease = job.lease.clone();
     // The job's `profile:<id>` requirement, not adapter order, selects the
@@ -889,8 +905,8 @@ async fn execute_job(
         &adapter,
         &lease,
         &envelope,
-        &cancel_path,
         &admission_log,
+        shutdown.clone(),
     )
     .await?;
 
@@ -909,7 +925,7 @@ async fn execute_job(
             &mut run.heartbeat,
         )
         .await?;
-        if run.output.status.code() != Some(0) {
+        if run.output.status.code() != Some(0) || *shutdown.borrow() {
             // The reclaim reuses this attempt's staging directory, so the
             // `CANCEL` written by the preemption must not survive the release.
             clear_cancel(&cancel_path);
@@ -994,9 +1010,10 @@ async fn run_adapter(
     adapter: &AdapterConfig,
     lease: &infernix_workload::Lease,
     envelope: &JobEnvelope,
-    cancel_path: &Path,
     admission_log: &AdmissionLog,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<AdapterRun> {
+    let cancel_path = &envelope.cancel_path;
     let mut command = Command::new(&adapter.command);
     command
         .args(&adapter.args)
@@ -1076,6 +1093,19 @@ async fn run_adapter(
     let mut wait = Box::pin(child.wait_with_output());
     let output = loop {
         tokio::select! {
+            _ = async {
+                if !*shutdown.borrow() {
+                    let _ = shutdown.changed().await;
+                }
+            }, if !preempted && !cancel_requested => {
+                info!(job = %lease.job_id.as_str(), "worker stopping; preempting the adapter");
+                if let Err(error) = delivery::request_cancel(cancel_path) {
+                    warn!(%error, "failed to write the adapter cancel file");
+                }
+                signal_group(pid, libc::SIGTERM);
+                cancel_deadline = Some(Instant::now() + grace);
+                preempted = true;
+            }
             output = &mut wait => break output.context("wait for workload adapter")?,
             _ = heartbeat.tick() => {
                 match renew_lease(client, lease, lease_duration, pid).await? {

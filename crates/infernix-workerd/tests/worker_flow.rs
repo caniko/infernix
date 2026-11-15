@@ -895,6 +895,48 @@ async fn a_denied_admission_never_claims() {
 }
 
 #[tokio::test]
+async fn sigterm_returns_running_job_without_spending_an_attempt() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("sigterm", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter(
+        "adapter.sh",
+        "#!/bin/sh\ncat >/dev/null\ntouch \"$INFX_COPIES/started\"\nexec sleep 300\n",
+    );
+    let config = fixture.write_config(&adapter);
+    let spec = job("job-sigterm");
+    client.enqueue(&spec).await.unwrap();
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+    // Wait until the adapter has actually started, not merely until the claim commits.
+    timeout(Duration::from_secs(10), async {
+        while !fixture.copies.join("started").exists() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let child = worker.child.as_mut().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) },
+        0
+    );
+    let status = timeout(Duration::from_secs(7), child.wait())
+        .await
+        .expect("worker exceeded grace + 5s")
+        .unwrap();
+    assert!(
+        status.success(),
+        "worker did not exit successfully: {status}"
+    );
+    let status = client.status(&spec.id).await.unwrap().unwrap();
+    assert_eq!(status.state, JobState::Pending);
+    assert_eq!(status.attempts, 0);
+}
+
+#[tokio::test]
 async fn preemption_returns_the_job_to_pending_without_spending_an_attempt() {
     let cluster = TestCluster::start();
     let (database, client) = fresh_ledger(&cluster).await.unwrap();

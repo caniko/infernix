@@ -39,6 +39,17 @@ class AdapterTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
+    def test_atlas_profile_matches_rocm_architecture(self):
+        default = Path(__file__).resolve().parents[5] / "studio-pipeline/speech-profiles-20261115"
+        studio = Path(os.environ.get("STUDIO_PIPELINE", default))
+        profile = json.loads((studio / "config/model-profiles/kokoro/kokoro-82m-af-bella-rocm.json").read_text())
+        runtime = types.SimpleNamespace(is_available=lambda: True, device_count=lambda: 1,
+            get_device_name=lambda _: "AMD Radeon Graphics",
+            get_device_properties=lambda _: types.SimpleNamespace(gcnArchName="gfx1100"),
+            set_device=lambda _: None)
+        torch = types.SimpleNamespace(version=types.SimpleNamespace(hip="7.2", cuda=None), cuda=runtime)
+        self.assertIs(adapter.adapter.assert_gpu(profile, torch), torch)
+
     def test_wav_artifact_sha256(self):
         context = Context(self.root, "tts", {"text": "hello"})
         with patch.object(adapter, "synthesize", return_value=[0.0, 0.25, -0.25]):

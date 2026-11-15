@@ -554,8 +554,8 @@ a retained sequence is reused only when every frame still matches the recorded
 sha256. A frames root that is inside, equal to, or an ancestor of the attempt
 staging (or of `INFERNIX_STAGING_ROOT`) is `invalid_input` (14) after `realpath`
 comparison. Only the master and the locator are artifacts.
-`profile.id == "authoring"` (`cpuPolicy: authoring`) is the only case that skips
-the GPU guard, per the plan.
+A profile with `cpuPolicy: permitted` (in practice `authoring`) skips
+the GPU guard and runs its operation without frames or an encode.
 
 **triposg.** `triposg`'s packaging is upstream-only (no `pyproject.toml`), so the
 adapter puts `$INFERNIX_TRIPOSG_CODE` on `sys.path`; the pyproject pins the

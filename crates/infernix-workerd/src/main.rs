@@ -673,7 +673,7 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
     // keep retrying retained deliveries while the worker runs.
     let retry = StdDuration::from_secs(config.worker.delivery_retry_secs);
     let mut delivery_backoff = retry;
-    match finish_pending_deliveries(&client, &config, &worker.id).await {
+    match finish_pending_deliveries(&client, &config, &worker.id, shutdown.clone()).await {
         Ok(0) => {}
         Ok(failures) => warn!(failures, "delivery recovery left jobs undelivered"),
         Err(error) => warn!(%error, "delivery recovery pass did not complete"),
@@ -734,7 +734,7 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
             }
             _ = sleep(poll) => {}
             _ = sleep_until(delivery_due) => {
-                let failures = match finish_pending_deliveries(&client, &config, &worker.id).await {
+                let failures = match finish_pending_deliveries(&client, &config, &worker.id, shutdown.clone()).await {
                     Ok(failures) => failures,
                     Err(error) => {
                         warn!(%error, "delivery recovery pass did not complete");
@@ -954,18 +954,7 @@ async fn execute_job(
 
     let code = run.output.status.code();
     match code {
-        Some(0) => {
-            finish_success(
-                &client,
-                &config,
-                &adapter,
-                &lease,
-                &staging,
-                &job.payload,
-                run,
-            )
-            .await
-        }
+        Some(0) => finish_success(&client, &config, &adapter, &staging, &job, run, shutdown).await,
         Some(EXIT_RESOURCE_BUSY) => {
             release_busy(&client, &config, &lease).await?;
             Ok(())
@@ -1427,11 +1416,12 @@ async fn finish_success(
     client: &WorkloadClient,
     config: &Config,
     adapter: &AdapterConfig,
-    lease: &infernix_workload::Lease,
     staging: &Path,
-    payload: &Value,
+    job: &ClaimedJob,
     run: AdapterRun,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let lease = &job.lease;
     let AdapterRun {
         output,
         pid,
@@ -1458,7 +1448,7 @@ async fn finish_success(
 
     let stored = match &validated {
         Some(validated) => {
-            let (hub_url, generation) = delivery_coordinates(config, payload)?;
+            let (hub_url, generation) = delivery_coordinates(config, &job.payload)?;
             validated.clone().with_delivery(&hub_url, &generation).value
         }
         None => {
@@ -1499,16 +1489,21 @@ async fn finish_success(
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        deliver_artifacts(
-            client,
-            config,
-            &job_id,
-            &lease.worker_id,
-            &hub_url,
-            &generation,
-            validated,
-        )
-        .await?;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = deliver_artifacts(
+                client,
+                config,
+                &job_id,
+                &lease.worker_id,
+                &hub_url,
+                &generation,
+                validated,
+            ) => result?,
+            _ = shutdown.changed() => return Ok(()),
+        }
     } else {
         client.mark_delivered(&job_id, &lease.worker_id).await?;
     }
@@ -1598,6 +1593,7 @@ async fn finish_pending_deliveries(
     client: &WorkloadClient,
     config: &Config,
     worker: &WorkerId,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<usize> {
     let pending = client.undelivered_succeeded(worker).await?;
     if pending.is_empty() {
@@ -1607,7 +1603,14 @@ async fn finish_pending_deliveries(
     let http = delivery::http_client()?;
     let mut failures = 0;
     for status in pending {
-        if let Err(error) = finish_one_delivery(client, config, worker, &http, &status).await {
+        if *shutdown.borrow() {
+            break;
+        }
+        let result = tokio::select! {
+            result = finish_one_delivery(client, config, worker, &http, &status) => result,
+            _ = shutdown.changed() => break,
+        };
+        if let Err(error) = result {
             failures += 1;
             warn!(
                 job = %status.job_id.as_str(),

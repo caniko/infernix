@@ -290,7 +290,12 @@ fn default_admission_timeout_secs() -> u64 {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // Without RUST_LOG, EnvFilter keeps only errors, so a service unit
+        // that sets nothing logged no claims, leases or completions at all.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();

@@ -57,6 +57,10 @@ impl StubHub {
     /// The first `fail_first` uploads answer `503`, as a transient hub outage.
     async fn start_with_failures(fail_first: usize, replay_sources: &[&str]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on(listener, fail_first, replay_sources).await
+    }
+
+    async fn start_on(listener: TcpListener, fail_first: usize, replay_sources: &[&str]) -> Self {
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(AtomicUsize::new(fail_first));
@@ -892,6 +896,152 @@ async fn a_denied_admission_never_claims() {
         !fixture.copies.join("ran").exists(),
         "the adapter must not run while admission denies"
     );
+}
+
+#[tokio::test]
+async fn sigterm_interrupts_stalled_delivery() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("sigterm-delivery", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", SUCCESS_ADAPTER);
+    let config = fixture.write_config(&adapter);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut spec = job("job-sigterm-delivery");
+    spec.payload["hubUrl"] = json!(format!("http://{}", listener.local_addr().unwrap()));
+    client.enqueue(&spec).await.unwrap();
+    let mut worker = fixture.spawn(&config);
+    let (_socket, _) = timeout(Duration::from_secs(20), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client.status(&spec.id).await.unwrap().unwrap().state,
+        JobState::Succeeded
+    );
+    let child = worker.child.as_mut().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) },
+        0
+    );
+    let status = timeout(Duration::from_secs(7), child.wait())
+        .await
+        .expect("worker exceeded grace + 5s")
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        fixture
+            .staging_root
+            .join(spec.id.as_str())
+            .join("1/out/line.wav")
+            .exists()
+    );
+
+    // Recovery can itself be blocked by the same hub during startup.
+    let mut recovery = fixture.spawn(&config);
+    let (_recovery_socket, _) = timeout(Duration::from_secs(20), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let child = recovery.child.as_mut().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) },
+        0
+    );
+    let status = timeout(Duration::from_secs(7), child.wait())
+        .await
+        .expect("recovery exceeded grace + 5s")
+        .unwrap();
+    assert!(status.success());
+    assert!(
+        fixture
+            .staging_root
+            .join(spec.id.as_str())
+            .join("1/out/line.wav")
+            .exists()
+    );
+
+    let hub = StubHub::start_on(listener, 0, &[]).await;
+    fixture.run_once(&config).await;
+    hub.wait_for_requests(2).await;
+    assert!(!fixture.staging_root.join(spec.id.as_str()).exists());
+}
+
+#[tokio::test]
+async fn sigterm_keeps_successful_adapter_result() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("sigterm-success", cluster.connection_string(&database));
+    let script = format!(
+        "{SUCCESS_ADAPTER}\ntrap 'exit 0' TERM\ntouch \"$INFX_COPIES/started\"\nwhile :; do sleep 0.05; done\n"
+    );
+    let adapter = fixture.write_adapter("adapter.sh", &script);
+    let config = fixture.write_config(&adapter);
+    let spec = job("job-sigterm-success");
+    client.enqueue(&spec).await.unwrap();
+    let mut worker = fixture.spawn(&config);
+    timeout(Duration::from_secs(10), async {
+        while !fixture.copies.join("started").exists() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let child = worker.child.as_mut().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) },
+        0
+    );
+    let status = timeout(Duration::from_secs(7), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+    assert_eq!(
+        client.status(&spec.id).await.unwrap().unwrap().state,
+        JobState::Succeeded
+    );
+}
+
+#[tokio::test]
+async fn sigterm_returns_running_job_without_spending_an_attempt() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("sigterm", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter(
+        "adapter.sh",
+        "#!/bin/sh\ncat >/dev/null\ntouch \"$INFX_COPIES/started\"\nexec sleep 300\n",
+    );
+    let config = fixture.write_config(&adapter);
+    let spec = job("job-sigterm");
+    client.enqueue(&spec).await.unwrap();
+    let mut worker = fixture.spawn(&config);
+    fixture
+        .wait_for_state(&client, &spec.id, JobState::Leased)
+        .await;
+    // Wait until the adapter has actually started, not merely until the claim commits.
+    timeout(Duration::from_secs(10), async {
+        while !fixture.copies.join("started").exists() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let child = worker.child.as_mut().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) },
+        0
+    );
+    let status = timeout(Duration::from_secs(7), child.wait())
+        .await
+        .expect("worker exceeded grace + 5s")
+        .unwrap();
+    assert!(
+        status.success(),
+        "worker did not exit successfully: {status}"
+    );
+    let status = client.status(&spec.id).await.unwrap().unwrap();
+    assert_eq!(status.state, JobState::Pending);
+    assert_eq!(status.attempts, 0);
 }
 
 #[tokio::test]

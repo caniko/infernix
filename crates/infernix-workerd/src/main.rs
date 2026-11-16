@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::AsyncWriteExt,
     process::Command,
+    sync::watch,
     task::JoinSet,
     time::{Instant, Interval, interval, sleep, sleep_until, timeout},
 };
@@ -651,6 +652,16 @@ impl AdmissionGate {
 }
 
 async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let (shutdown_tx, mut shutdown) = watch::channel(false);
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        let _ = shutdown_tx.send(true);
+    });
     let boot_id = resolve_boot_id(&config.worker)?;
     let worker = worker_profile(&config, &boot_id)?;
     client
@@ -662,7 +673,7 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
     // keep retrying retained deliveries while the worker runs.
     let retry = StdDuration::from_secs(config.worker.delivery_retry_secs);
     let mut delivery_backoff = retry;
-    match finish_pending_deliveries(&client, &config, &worker.id).await {
+    match finish_pending_deliveries(&client, &config, &worker.id, shutdown.clone()).await {
         Ok(0) => {}
         Ok(failures) => warn!(failures, "delivery recovery left jobs undelivered"),
         Err(error) => warn!(%error, "delivery recovery pass did not complete"),
@@ -678,7 +689,7 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
         // A denied host yields no claims; delivery recovery and joining
         // finished tasks keep working, and the poll sleep still bounds a deny.
         let admitted = admission.admits(&admission_log).await;
-        while admitted && tasks.len() < config.worker.concurrency {
+        while admitted && !*shutdown.borrow() && tasks.len() < config.worker.concurrency {
             let Some(job) = claim(&client, &config, &worker, &boot_id).await? else {
                 break;
             };
@@ -691,10 +702,18 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
             let client = client.clone();
             let config = config.clone();
             let admission_log = admission_log.clone();
-            tasks.spawn(async move { execute_job(client, config, job, admission_log).await });
+            let shutdown = shutdown.clone();
+            tasks.spawn(
+                async move { execute_job(client, config, job, admission_log, shutdown).await },
+            );
         }
 
-        if once {
+        // ponytail: shutdown bounds adapter cancel and hub uploads, but not ledger
+        // calls (claim, renew, release, complete). If the ledger stalls during a
+        // stop, systemd SIGKILLs at TimeoutStopSec and the lease expires, which was
+        // the behaviour before graceful stop. Put a shutdown deadline on each ledger
+        // call if stalled-DB stops are ever seen.
+        if once || *shutdown.borrow() {
             while let Some(result) = tasks.join_next().await {
                 match result {
                     Ok(Ok(())) => {}
@@ -706,6 +725,7 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
         }
 
         tokio::select! {
+            _ = shutdown.changed() => {}
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 match result {
                     Ok(Ok(())) => {}
@@ -719,7 +739,7 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
             }
             _ = sleep(poll) => {}
             _ = sleep_until(delivery_due) => {
-                let failures = match finish_pending_deliveries(&client, &config, &worker.id).await {
+                let failures = match finish_pending_deliveries(&client, &config, &worker.id, shutdown.clone()).await {
                     Ok(failures) => failures,
                     Err(error) => {
                         warn!(%error, "delivery recovery pass did not complete");
@@ -840,6 +860,7 @@ async fn execute_job(
     config: Config,
     job: ClaimedJob,
     admission_log: AdmissionLog,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let lease = job.lease.clone();
     // The job's `profile:<id>` requirement, not adapter order, selects the
@@ -889,8 +910,8 @@ async fn execute_job(
         &adapter,
         &lease,
         &envelope,
-        &cancel_path,
         &admission_log,
+        shutdown.clone(),
     )
     .await?;
 
@@ -938,18 +959,7 @@ async fn execute_job(
 
     let code = run.output.status.code();
     match code {
-        Some(0) => {
-            finish_success(
-                &client,
-                &config,
-                &adapter,
-                &lease,
-                &staging,
-                &job.payload,
-                run,
-            )
-            .await
-        }
+        Some(0) => finish_success(&client, &config, &adapter, &staging, &job, run, shutdown).await,
         Some(EXIT_RESOURCE_BUSY) => {
             release_busy(&client, &config, &lease).await?;
             Ok(())
@@ -994,9 +1004,10 @@ async fn run_adapter(
     adapter: &AdapterConfig,
     lease: &infernix_workload::Lease,
     envelope: &JobEnvelope,
-    cancel_path: &Path,
     admission_log: &AdmissionLog,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<AdapterRun> {
+    let cancel_path = &envelope.cancel_path;
     let mut command = Command::new(&adapter.command);
     command
         .args(&adapter.args)
@@ -1076,6 +1087,19 @@ async fn run_adapter(
     let mut wait = Box::pin(child.wait_with_output());
     let output = loop {
         tokio::select! {
+            _ = async {
+                if !*shutdown.borrow() {
+                    let _ = shutdown.changed().await;
+                }
+            }, if !preempted && !cancel_requested => {
+                info!(job = %lease.job_id.as_str(), "worker stopping; preempting the adapter");
+                if let Err(error) = delivery::request_cancel(cancel_path) {
+                    warn!(%error, "failed to write the adapter cancel file");
+                }
+                signal_group(pid, libc::SIGTERM);
+                cancel_deadline = Some(Instant::now() + grace);
+                preempted = true;
+            }
             output = &mut wait => break output.context("wait for workload adapter")?,
             _ = heartbeat.tick() => {
                 match renew_lease(client, lease, lease_duration, pid).await? {
@@ -1397,11 +1421,12 @@ async fn finish_success(
     client: &WorkloadClient,
     config: &Config,
     adapter: &AdapterConfig,
-    lease: &infernix_workload::Lease,
     staging: &Path,
-    payload: &Value,
+    job: &ClaimedJob,
     run: AdapterRun,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let lease = &job.lease;
     let AdapterRun {
         output,
         pid,
@@ -1428,7 +1453,7 @@ async fn finish_success(
 
     let stored = match &validated {
         Some(validated) => {
-            let (hub_url, generation) = delivery_coordinates(config, payload)?;
+            let (hub_url, generation) = delivery_coordinates(config, &job.payload)?;
             validated.clone().with_delivery(&hub_url, &generation).value
         }
         None => {
@@ -1469,16 +1494,21 @@ async fn finish_success(
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        deliver_artifacts(
-            client,
-            config,
-            &job_id,
-            &lease.worker_id,
-            &hub_url,
-            &generation,
-            validated,
-        )
-        .await?;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = deliver_artifacts(
+                client,
+                config,
+                &job_id,
+                &lease.worker_id,
+                &hub_url,
+                &generation,
+                validated,
+            ) => result?,
+            _ = shutdown.changed() => return Ok(()),
+        }
     } else {
         client.mark_delivered(&job_id, &lease.worker_id).await?;
     }
@@ -1568,8 +1598,16 @@ async fn finish_pending_deliveries(
     client: &WorkloadClient,
     config: &Config,
     worker: &WorkerId,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<usize> {
-    let pending = client.undelivered_succeeded(worker).await?;
+    // A stalled database must not hold a stopping worker past TimeoutStopSec.
+    if *shutdown.borrow() {
+        return Ok(0);
+    }
+    let pending = tokio::select! {
+        pending = client.undelivered_succeeded(worker) => pending?,
+        _ = shutdown.changed() => return Ok(0),
+    };
     if pending.is_empty() {
         return Ok(0);
     }
@@ -1577,7 +1615,14 @@ async fn finish_pending_deliveries(
     let http = delivery::http_client()?;
     let mut failures = 0;
     for status in pending {
-        if let Err(error) = finish_one_delivery(client, config, worker, &http, &status).await {
+        if *shutdown.borrow() {
+            break;
+        }
+        let result = tokio::select! {
+            result = finish_one_delivery(client, config, worker, &http, &status) => result,
+            _ = shutdown.changed() => break,
+        };
+        if let Err(error) = result {
             failures += 1;
             warn!(
                 job = %status.job_id.as_str(),

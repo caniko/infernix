@@ -409,6 +409,49 @@ async fn delivery_requires_an_accepted_complete() {
 }
 
 #[tokio::test]
+async fn final_expiry_records_lease_evidence() {
+    let cluster = TestCluster::start();
+    let client = fresh_database(&cluster).await.unwrap();
+    let mut spec = job("expired");
+    spec.max_attempts = 1;
+    client.enqueue(&spec).await.unwrap();
+    let atlas = worker("atlas");
+    client.register_worker(&atlas).await.unwrap();
+    let lease = client
+        .claim(
+            &atlas.id,
+            &atlas.boot_id,
+            &capabilities(),
+            &pairs(),
+            Duration::seconds(-1),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .lease;
+    client
+        .claim(
+            &atlas.id,
+            &atlas.boot_id,
+            &capabilities(),
+            &pairs(),
+            Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+    let status = client.status(&spec.id).await.unwrap().unwrap();
+    assert_eq!(status.state, JobState::Failed);
+    let error = status.error.unwrap();
+    assert!(error.contains("worker atlas"), "{error}");
+    assert!(error.contains("attempt 1/1"), "{error}");
+    assert!(
+        error.contains(&lease.expires_at.format("%Y-%m-%dT%H:%M:%S").to_string()),
+        "{error}"
+    );
+    assert!(error.contains("last heartbeat 20"), "{error}");
+}
+
+#[tokio::test]
 async fn expired_lease_is_recovered_by_another_worker() {
     let cluster = TestCluster::start();
     let client = fresh_database(&cluster).await.unwrap();

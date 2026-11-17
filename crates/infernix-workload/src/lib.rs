@@ -1117,9 +1117,17 @@ UPDATE infernix_workload_workers
     /// resolved to `cancelled` because no adapter remains to confirm it.
     pub const CLAIM: &str = r#"
 WITH exhausted AS (
-    UPDATE infernix_workload_jobs
+    UPDATE infernix_workload_jobs AS job
        SET state = 'failed',
-           error = COALESCE(error, 'lease expired after the final attempt'),
+           error = COALESCE(error || '; ', '') || 'lease expired after the final attempt' ||
+               format(' (worker %s, attempt %s/%s, lease deadline %s, %s)',
+                   COALESCE(lease_owner, 'unknown'), attempts, max_attempts,
+                   to_char(lease_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                   COALESCE((SELECT 'last heartbeat ' ||
+                       to_char(worker.last_heartbeat AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                       FROM infernix_workload_workers AS worker
+                       WHERE worker.id = job.lease_owner AND worker.boot_id = job.lease_boot_id),
+                       'no heartbeat recorded')),
            lease_owner = NULL,
            lease_boot_id = NULL,
            lease_token = NULL,

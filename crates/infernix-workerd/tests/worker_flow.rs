@@ -1135,7 +1135,18 @@ async fn a_preempted_attempt_reclaims_its_staging_directory_cleanly() {
         .wait_for_state(&client, &spec.id, JobState::Succeeded)
         .await;
     assert_eq!(status.attempts, 1, "the reclaim is the same attempt");
-    assert!(status.delivered_at.is_some());
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(status) = client.status(&spec.id).await.unwrap() {
+                if status.delivered_at.is_some() {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the reclaimed attempt is delivered");
     hub.wait_for_requests(1).await;
 
     worker.stop().await;

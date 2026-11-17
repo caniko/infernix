@@ -878,6 +878,68 @@ preempt = true
 }
 
 #[tokio::test]
+async fn admission_waits_for_eligible_work() {
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("idle-admission", cluster.connection_string(&database));
+    let adapter = fixture.write_adapter("adapter.sh", &marker_adapter("ran"));
+    let queried = fixture.directory.join("queried");
+    let admission = format!(
+        r#"
+[worker.admission]
+command = ["sh", "-c", "touch '{}'; exit 1"]
+recheck_secs = 1
+timeout_secs = 5
+"#,
+        queried.display()
+    );
+    let config = fixture.write_config_admission(&[("fixture-rocm", &adapter)], &admission);
+
+    fixture.run_once(&config).await;
+    assert!(!queried.exists(), "an empty queue must not wake the GPU");
+
+    let mut ineligible = job("job-ineligible");
+    ineligible.queue = "another-queue".into();
+    client.enqueue(&ineligible).await.unwrap();
+    fixture.run_once(&config).await;
+    assert!(
+        !queried.exists(),
+        "another worker's queue must not wake the GPU"
+    );
+
+    let mut expired = job("job-expired");
+    expired.max_attempts = 1;
+    client.enqueue(&expired).await.unwrap();
+    client
+        .raw()
+        .batch_execute(
+            "UPDATE infernix_workload_jobs SET state = 'leased', attempts = 1,
+         lease_owner = 'atlas', lease_boot_id = 'boot-test', lease_token = 'expired',
+         lease_expires_at = now() - interval '1 second' WHERE id = 'job-expired'",
+        )
+        .await
+        .unwrap();
+    fixture.run_once(&config).await;
+    assert!(
+        !queried.exists(),
+        "terminal-lease cleanup must not wake the GPU"
+    );
+    assert_eq!(
+        client.status(&expired.id).await.unwrap().unwrap().state,
+        JobState::Failed
+    );
+
+    let eligible = job("job-eligible");
+    client.enqueue(&eligible).await.unwrap();
+    fixture.run_once(&config).await;
+    assert!(queried.exists(), "eligible work must request admission");
+    let status = client.status(&eligible.id).await.unwrap().unwrap();
+    assert_eq!(status.state, JobState::Pending);
+    assert_eq!(status.attempts, 0, "denial must not spend an attempt");
+    assert!(!fixture.copies.join("ran").exists());
+}
+
+#[tokio::test]
 async fn a_denied_admission_never_claims() {
     let cluster = TestCluster::start();
     let (database, client) = fresh_ledger(&cluster).await.unwrap();

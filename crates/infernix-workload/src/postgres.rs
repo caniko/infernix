@@ -17,9 +17,9 @@ use crate::{
     WorkerProfile, WorkloadError,
     sql::{
         CANCEL, CLAIM, COMPLETE, CONFIRM_CANCELLED, ENQUEUE, ENQUEUE_EXISTING, FAIL,
-        FAIL_AFTER_COMPLETION, HEARTBEAT, MARK_DELIVERED, MIGRATIONS, RELEASE_BUSY,
-        RELEASE_PREEMPTED, SCHEMA, STATUS, STATUS_BY_FINGERPRINT, UNDELIVERED_SUCCEEDED,
-        WORKER_DRAIN, WORKER_HEARTBEAT, WORKER_UPSERT,
+        FAIL_AFTER_COMPLETION, HAS_CLAIMABLE, HEARTBEAT, MARK_DELIVERED, MIGRATIONS, REAP_EXPIRED,
+        RELEASE_BUSY, RELEASE_PREEMPTED, SCHEMA, STATUS, STATUS_BY_FINGERPRINT,
+        UNDELIVERED_SUCCEEDED, WORKER_DRAIN, WORKER_HEARTBEAT, WORKER_UPSERT,
     },
 };
 
@@ -160,6 +160,41 @@ impl WorkloadClient {
         } else {
             EnqueueOutcome::Existing(job_id)
         })
+    }
+
+    /// Read-only hint before an admission probe that may wake an idle GPU.
+    /// This reserves nothing; `claim` remains the fenced authority.
+    pub async fn has_claimable(
+        &self,
+        worker: &WorkerId,
+        boot_id: &str,
+        capabilities: &[String],
+        pairs: &[(String, String)],
+    ) -> PgResult<bool> {
+        if pairs.is_empty() {
+            return Ok(false);
+        }
+        let (workloads, queues): (Vec<String>, Vec<String>) = pairs.iter().cloned().unzip();
+        let row = self
+            .client
+            .query_one(
+                HAS_CLAIMABLE,
+                &[
+                    &worker.as_str(),
+                    &boot_id,
+                    &capabilities,
+                    &workloads,
+                    &queues,
+                ],
+            )
+            .await?;
+        Ok(row.get(0))
+    }
+
+    /// Preserve claim's terminal-lease cleanup independently of GPU admission.
+    pub async fn reap_expired(&self) -> PgResult<()> {
+        self.client.batch_execute(REAP_EXPIRED).await?;
+        Ok(())
     }
 
     /// Claim at most one job this worker can run. `pairs` are the worker's

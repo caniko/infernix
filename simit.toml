@@ -10,6 +10,7 @@ nix_builds = [".#headroom", ".#checks.x86_64-linux.headroom", ".#checks.x86_64-l
 # Validate PR heads once (pull_request); push runs cover the default branch
 # and the simit updater's candidate branches.
 push_branches = ["trunk", "simit/update/**"]
+publish_strategy = "members"
 
 [ci.nix_build]
 max_parallel = 2

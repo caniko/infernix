@@ -203,6 +203,7 @@ def run(
     try:
         reserved = _ReservedStdout()
         envelope = parse(stdin.read())
+        use_cache = use_cache(envelope) if callable(use_cache) else use_cache
         staging = Path(envelope.staging_directory)
         output = Path(envelope.output_directory)
         output.mkdir(parents=True, exist_ok=True)
@@ -210,7 +211,8 @@ def run(
         watcher = CancelWatcher(envelope.cancel_path).start()
         watcher.check()
         bound_threads(envelope.cpu_threads, torch_module)
-        requires_gpu = envelope.profile.get("cpuPolicy") != "authoring"
+        # The profile schema allows only "forbidden" (GPU) and "permitted" (CPU).
+        requires_gpu = envelope.profile.get("cpuPolicy") != "permitted"
         torch = None
         if requires_gpu and torch_guard:
             torch = gpu.assert_gpu(envelope.profile, torch_module)

@@ -62,6 +62,111 @@ async fn claim_one(client: &WorkloadClient, worker: &WorkerProfile) -> Lease {
 }
 
 #[tokio::test]
+async fn readiness_is_read_only_and_obeys_claim_eligibility() {
+    let cluster = TestCluster::start();
+    let client = fresh_database(&cluster).await.unwrap();
+    let atlas = worker("atlas");
+    client.register_worker(&atlas).await.unwrap();
+    let ready = || async {
+        client
+            .has_claimable(&atlas.id, &atlas.boot_id, &capabilities(), &pairs())
+            .await
+    };
+    assert!(!ready().await.unwrap());
+    client.enqueue(&job("ready")).await.unwrap();
+    assert!(ready().await.unwrap());
+    assert_eq!(
+        client
+            .status(&JobId::new("ready").unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .attempts,
+        0
+    );
+
+    for change in [
+        "queue = 'other'",
+        "workload = 'other'",
+        "requirements = ARRAY['unsupported']",
+        "not_before = now() + interval '1 hour'",
+        "cancel_requested_at = now()",
+        "attempts = max_attempts",
+        "state = 'succeeded'",
+        "state = 'leased', lease_expires_at = now() + interval '1 hour'",
+    ] {
+        client
+            .raw()
+            .batch_execute(&format!(
+                "UPDATE infernix_workload_jobs SET {change} WHERE id = 'ready'"
+            ))
+            .await
+            .unwrap();
+        assert!(!ready().await.unwrap(), "{change}");
+        client
+            .raw()
+            .batch_execute(
+                "UPDATE infernix_workload_jobs SET queue = 'asset', workload = 'animation',
+             requirements = ARRAY['gpu:atlas-7900xtx'], not_before = NULL,
+             cancel_requested_at = NULL, attempts = 0, state = 'pending', lease_expires_at = NULL
+             WHERE id = 'ready'",
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        !client
+            .has_claimable(&atlas.id, "another-boot", &capabilities(), &pairs())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !client
+            .has_claimable(&atlas.id, &atlas.boot_id, &capabilities(), &[])
+            .await
+            .unwrap()
+    );
+    client
+        .drain_worker(&atlas.id, &atlas.boot_id)
+        .await
+        .unwrap();
+    assert!(!ready().await.unwrap());
+
+    let other = worker("other");
+    client.register_worker(&other).await.unwrap();
+    let lease = client
+        .claim(
+            &other.id,
+            &other.boot_id,
+            &capabilities(),
+            &pairs(),
+            Duration::seconds(-1),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .lease;
+    assert!(
+        client
+            .has_claimable(&other.id, &other.boot_id, &capabilities(), &pairs())
+            .await
+            .unwrap()
+    );
+    client.cancel(&lease.job_id).await.unwrap();
+    assert!(
+        !client
+            .has_claimable(&other.id, &other.boot_id, &capabilities(), &pairs())
+            .await
+            .unwrap()
+    );
+    client.reap_expired().await.unwrap();
+    assert_eq!(
+        client.status(&lease.job_id).await.unwrap().unwrap().state,
+        JobState::Cancelled
+    );
+}
+
+#[tokio::test]
 async fn enqueue_is_idempotent_and_find_adopts_by_fingerprint() {
     let cluster = TestCluster::start();
     let client = fresh_database(&cluster).await.unwrap();

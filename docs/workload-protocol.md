@@ -266,6 +266,12 @@ and a verdict is logged only on an admit↔deny transition (and the first one).
 While the verdict is deny the worker claims nothing: delivery recovery and
 joining finished jobs keep running, and the poll interval still bounds the loop.
 A verdict is cached for `recheck_secs`, so a deny does not re-probe every poll.
+Before requesting admission for new work, the worker checks the ledger for an
+eligible job. Empty queues, another adapter's work, delayed retries, and fenced
+workers do not invoke the probe, so a host may use a probe that wakes its GPU
+only on demand. This readiness check reserves nothing and spends no attempt;
+the fenced claim rechecks eligibility after admission. Expired terminal leases
+are still cleaned up without a GPU measurement.
 
 With `preempt = true` a running adapter is stopped when the verdict flips to
 deny: the attempt's `CANCEL` file is written, the process group gets `SIGTERM`,

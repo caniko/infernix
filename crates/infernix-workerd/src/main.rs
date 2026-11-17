@@ -684,13 +684,52 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
     let poll = StdDuration::from_secs(config.worker.poll_interval_secs);
     let admission_log = AdmissionLog::default();
     let mut admission = AdmissionGate::new(config.worker.admission.clone());
+    // Preserve adapter pairs, not the workload x queue product.
+    let pairs = config
+        .adapters
+        .iter()
+        .flat_map(|adapter| {
+            adapter
+                .queues
+                .iter()
+                .map(|queue| (adapter.workload.clone(), queue.clone()))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let capabilities = worker.capabilities.iter().cloned().collect::<Vec<_>>();
 
     loop {
-        // A denied host yields no claims; delivery recovery and joining
-        // finished tasks keep working, and the poll sleep still bounds a deny.
-        let admitted = admission.admits(&admission_log).await;
-        while admitted && !*shutdown.borrow() && tasks.len() < config.worker.concurrency {
-            let Some(job) = claim(&client, &config, &worker, &boot_id).await? else {
+        while !*shutdown.borrow() && tasks.len() < config.worker.concurrency {
+            if config.worker.admission.is_some() {
+                // Housekeeping must not depend on admitting new GPU work.
+                client
+                    .reap_expired()
+                    .await
+                    .context("retire expired workloads")?;
+                if !client
+                    .has_claimable(&worker.id, &boot_id, &capabilities, &pairs)
+                    .await
+                    .context("check workload readiness")?
+                    || !admission.admits(&admission_log).await
+                {
+                    break;
+                }
+            }
+            if *shutdown.borrow() {
+                break;
+            }
+            let Some(job) = client
+                .claim(
+                    &worker.id,
+                    &boot_id,
+                    &capabilities,
+                    &pairs,
+                    Duration::seconds(config.worker.lease_duration_secs as i64),
+                )
+                .await
+                .context("claim workload")?
+            else {
                 break;
             };
             info!(
@@ -755,39 +794,6 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
             }
         }
     }
-}
-
-async fn claim(
-    client: &WorkloadClient,
-    config: &Config,
-    worker: &WorkerProfile,
-    boot_id: &str,
-) -> Result<Option<ClaimedJob>> {
-    // Claim only pairs an adapter can run, not the workload x queue product.
-    let pairs = config
-        .adapters
-        .iter()
-        .flat_map(|adapter| {
-            adapter
-                .queues
-                .iter()
-                .map(|queue| (adapter.workload.clone(), queue.clone()))
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let capabilities = worker.capabilities.iter().cloned().collect::<Vec<_>>();
-    let claimed = client
-        .claim(
-            &worker.id,
-            boot_id,
-            &capabilities,
-            &pairs,
-            Duration::seconds(config.worker.lease_duration_secs as i64),
-        )
-        .await
-        .context("claim workload")?;
-    Ok(claimed)
 }
 
 /// The single `profile:<id>` requirement a job carries, if any.

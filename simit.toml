@@ -27,6 +27,7 @@ push_branches = ["trunk", "simit/update/**"]
 system_runners = { x86_64-linux = "ubuntu-24.04" }
 nix_builds = [
   ".#packages.x86_64-linux.infernix-lb",
+  ".#packages.x86_64-linux.infernix-workerd",
   ".#packages.x86_64-linux.codex-acp",
   ".#packages.x86_64-linux.headroom",
   ".#packages.x86_64-linux.ponytail",

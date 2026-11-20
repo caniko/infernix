@@ -354,7 +354,7 @@
         inherit pkgs;
         toolchainProfile = "nightly";
       };
-      treefmt = harbor-rs.inputs.treefmt-nix.lib.evalModule pkgs {
+      treefmt = harbor-rs.inputs.harbor-meta.inputs.treefmt-nix.lib.evalModule pkgs {
         imports = [harbor-rs.treefmtModules.rust];
         projectRootFile = "flake.nix";
         programs.rustfmt.package = toolchain.rustToolchain;

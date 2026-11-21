@@ -22,6 +22,10 @@ the profile.
 | `kimodo/` | `motion` | atlas (ROCm) | hardware-tested (encoder fetched from a hash-verified mirror) |
 | `audio2face/` | `face` | nomad (CUDA) | **blocked, not built** |
 
+[`qwen-image-edit-streaming/`](qwen-image-edit-streaming/README.md) is a
+standalone local image runner, not a worker-envelope v2 adapter. It is not
+registered with the workload fabric.
+
 `profile.example.json` in each directory is a section-5 profile. The examples
 carry the pinned checkpoint revision and the measured or expected device. A
 resolved profile must also name the provisioned weights:

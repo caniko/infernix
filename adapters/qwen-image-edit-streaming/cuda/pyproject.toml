@@ -1,0 +1,30 @@
+[project]
+name = "infernix-adapter-qwen-image-edit-streaming-cuda"
+version = "0.1.0"
+description = "Qwen Image Edit 2511 BF16 streaming adapter (CUDA 12.6)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "accelerate==1.15.0",
+  "diffusers==0.43.0",
+  "infernix-adapter",
+  "numpy==2.5.4",
+  "pillow==13.0.0",
+  "safetensors==0.8.0",
+  "torch==2.14.1+cu126",
+  "torchvision==0.29.1+cu126",
+  "transformers==5.22.2",
+]
+
+[tool.uv]
+package = false
+index-strategy = "unsafe-best-match"
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+infernix-adapter = { path = "../../common" }
+torch = { index = "pytorch-cuda" }
+torchvision = { index = "pytorch-cuda" }
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu126"

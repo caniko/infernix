@@ -3,7 +3,7 @@
 One local JSON job on stdin, one verified PNG and one JSON receipt on stdout.
 Launch a **fresh process for each output**; allocator cleanup alone did not
 release all ROCm device memory in the pilot. This is not registered with the
-worker or Hub. CUDA is a candidate for later hardware qualification.
+worker or Hub. CUDA on Nomad is not yet qualified.
 
 ## Provision
 
@@ -25,11 +25,11 @@ provisioning, then publish the directory and Canix-style `ready.json` together.
 The latter contains `schemaVersion: 1`, `repo`, `rev`, `files` (the exact pinned
 `name`, `sizeBytes`, `sha256` inventory), and `totalBytes`. The runtime checks
 the ready records, file sizes and permissions, and hashes non-weight files and
-the separate Lightning file. It trusts the provisioner's verified large-weight
-digests rather than reading 55 GiB before inference. Run as a user that cannot
-write to these directories or files. The official snapshot contains *only*
-the listed loader files and `ready.json`; no symlink farm, duplicate
-transformer, or Comfy encoder/VAE substitutes.
+the separate Lightning file. Large weights are not rehashed before inference:
+their integrity relies on the provisioner's verified `ready.json` and read-only
+storage. Run as a user that cannot write to these directories or files. The
+official snapshot contains *only* the listed loader files and `ready.json`;
+no symlink farm, duplicate transformer, or Comfy encoder/VAE substitutes.
 
 ## Run
 
@@ -37,7 +37,10 @@ The caller provides an isolated, private staging directory and a trusted local
 backend and model configuration. Job paths are single PNG filenames within
 staging. The size is fixed to 1024², and v1 accepts exactly one ordered PNG
 anchor and writes exactly one new PNG. Input PNGs are bounded at 16 MiB and
-4 megapixels. This example uses a synthetic instruction:
+4 megapixels, with an aspect ratio from 1:4 to 4:1. Seeds are integers from
+0 through 2³²−1. Instructions must be valid UTF-8 without reserved Qwen
+`<|...|>` tokens or control characters other than tabs and newlines.
+This example uses a synthetic instruction:
 
 ```json
 {
@@ -60,18 +63,21 @@ anchor and writes exactly one new PNG. Input PNGs are bounded at 16 MiB and
 Invoke only inside a supervised, dedicated cgroup with `MemoryHigh` and
 `MemoryMax` at 24 GiB and `MemorySwapMax=0`. The runner checks those limits,
 live `MemAvailable ≥ 40 GiB`, full memory PSI avg10 `<5%`, native BF16, and
-free VRAM on the selected card: at least 20 GiB for Atlas ROCm, or a provisional
-12 GiB for the unqualified CUDA candidate. The caller owns the device lease,
-independent watchdog, cancellation and process exit verification. For an
-attended Atlas check, `tests/atlas-smoke.sh run LABEL STAGING VENV_PYTHON`
+free VRAM on the selected card: at least 20 GiB for Atlas ROCm (the lower of
+HIP and device-wide amdgpu readings), or a provisional 12 GiB for the
+unqualified CUDA candidate. The standalone CLI does not acquire a device
+lease. The caller owns the lease, independent watchdog, cancellation and
+process exit verification. For an attended Atlas check,
+`tests/atlas-smoke.sh run LABEL STAGING VENV_PYTHON`
 accepts the three model arguments above and reads `STAGING/job.json`. It uses
 the existing shared GPU lock and serial mutex, refuses active ComfyUI or
 another lock holder, stops below 16 GiB of host RAM or at full PSI avg10 ≥10%,
 and stops the worker if the independent systemd watchdog dies. Set
 `LD_LIBRARY_PATH`, `XDG_CACHE_HOME` and `MIOPEN_CUSTOM_CACHE_DIR` for the
 qualification window. Use a new staging directory and label for the second
-process; caches may stay warm. The script leaves `samples.tsv`, worker/guard
-logs, a receipt and, on success, the PNG.
+process; caches may stay warm. The script leaves `samples.tsv` and worker/guard
+logs. Success requires a fresh rendered receipt recording four updates and a
+PNG whose SHA-256 matches the receipt.
 
 The recipe is BF16, CFG 1 without a negative branch, model-only unfused
 Lightning at strength 1, and four flow-matching Euler updates with shift 3 and
@@ -84,6 +90,8 @@ smaller device, without executing any model layers on CPU.
 
 The receipt contains the recipe, model pins, input and output digests, runtime,
 phase/step timings, cgroup and allocator peaks, and cgroup event counters.
+Model `provisioned_sha256` values are assertions from the matching `ready.json`,
+not runtime hashes. A dry run reports `expected_sha256` from the pins only.
 It omits prompt text; PNG metadata is stripped. `--dry-run --staging DIR`
 validates the JSON, input PNG and destination without using a GPU or weights.
 Its receipt does not claim a rendered output. Input/manifest errors use exit

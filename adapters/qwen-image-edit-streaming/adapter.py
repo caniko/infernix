@@ -11,6 +11,7 @@ import re
 import stat
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from time import monotonic
 
@@ -29,6 +30,7 @@ PINS = json.loads(Path(__file__).with_name("models.json").read_text())
 MAX_IMAGE_BYTES = 16 << 20
 PNG_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,123}\.png")
 SHA256 = re.compile(r"[0-9a-f]{64}")
+SPECIAL_TOKEN = re.compile(r"<\|[^|]*\|>")  # The whole <|...|> delimiter form is reserved.
 
 
 def parse_job(job):
@@ -37,10 +39,14 @@ def parse_job(job):
     }:
         raise invalid("expected images, instruction, seed, steps, size, lora and output")
     seed, instruction = job["seed"], job["instruction"]
-    if type(seed) is not int or not 0 <= seed < 2**64:
-        raise invalid("seed must be an unsigned 64-bit integer")
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise invalid("seed must be an unsigned 32-bit integer")
     if not isinstance(instruction, str) or not instruction.strip() or len(instruction) > 4096:
         raise invalid("instruction must be nonempty and at most 4096 characters")
+    if any(c not in "\n\t" and unicodedata.category(c) in ("Cc", "Cs") for c in instruction):
+        raise invalid("instruction contains a control character or invalid Unicode")
+    if SPECIAL_TOKEN.search(instruction):
+        raise invalid("instruction contains a reserved Qwen token")
     if type(job["steps"]) is not int or job["steps"] != 4:
         raise invalid("Lightning requires exactly four steps")
     if job["size"] != list(SIZE) or any(type(n) is not int for n in job["size"]):
@@ -87,6 +93,10 @@ def read_image(directory, anchor):
                 or source.width * source.height > 4 * 1024**2 or source.n_frames != 1
             ):
                 raise invalid("input PNG exceeds the pixel budget or is animated")
+            # At 4:1, the pinned 384² conditioning resize has a 192 px
+            # short side, even after rounding to multiples of 32.
+            if max(source.size) > 4 * min(source.size):
+                raise invalid("input PNG aspect ratio must be between 1:4 and 4:1")
             source.verify()
         with Image.open(io.BytesIO(data), formats=["PNG"]) as source:
             return source.convert("RGB")
@@ -126,6 +136,26 @@ def cgroup():
     return cg
 
 
+def admit_vram(torch, device, backend):
+    free, total = torch.cuda.mem_get_info(device)
+    if not 0 <= free <= total:
+        raise AdapterError(11, "invalid GPU memory telemetry")
+    if backend == "rocm":
+        # HIP can undercount foreign residency. Atlas's 7900 XTX is the
+        # largest amdgpu card; use the device-wide reading as a second bound.
+        # sysfs free is bounded by sysfs's own total, not HIP's allocatable total.
+        physical_free = gpu.vram_free_bytes("rocm")
+        if physical_free is None or physical_free < 0:
+            raise AdapterError(11, "cannot read device-wide ROCm VRAM")
+        free = min(free, physical_free)
+    if free < FREE_VRAM[backend]:
+        raise AdapterError(
+            10, f"{backend} VRAM admission: {free / GIB:.2f} GiB free; "
+            f"need {FREE_VRAM[backend] / GIB:.0f} GiB",
+        )
+    return free
+
+
 def admit_device(backend):
     from importlib.metadata import version
 
@@ -140,12 +170,7 @@ def admit_device(backend):
     device = torch.device(gpu.device_string())
     if not torch.cuda.is_bf16_supported(including_emulation=False):
         raise AdapterError(13, "the selected GPU does not support native BF16")
-    free, _ = torch.cuda.mem_get_info(device)
-    if free < FREE_VRAM[backend]:
-        raise AdapterError(
-            10, f"{backend} VRAM admission: {free / GIB:.2f} GiB free; "
-            f"need {FREE_VRAM[backend] / GIB:.0f} GiB",
-        )
+    free = admit_vram(torch, device, backend)
     runtime.update(
         backend=backend, hip=torch.version.hip, cuda=torch.version.cuda,
         device=torch.cuda.get_device_name(device),
@@ -184,12 +209,21 @@ def execute(job, directory, dry_run, backend, model_paths, started):
     else:
         raise invalid("output already exists")
     image = read_image(directory, job["images"][0])
+    # Rendering matches these pins against ready.json; dry-run never opens it.
+    digest_key = "expected_sha256" if dry_run else "provisioned_sha256"
     report = {
         "schemaVersion": 1,
         "state": "dry-run" if dry_run else "rendered",
         "inputs": [{"sha256": job["images"][0]["sha256"], "size": list(image.size)}],
         "models": {
-            name: {k: pin[k] for k in ("repo", "rev", "files")} for name, pin in PINS.items()
+            name: {
+                "repo": pin["repo"], "rev": pin["rev"],
+                "files": [
+                    {"name": file["name"], "sizeBytes": file["sizeBytes"], digest_key: file["sha256"]}
+                    for file in pin["files"]
+                ],
+            }
+            for name, pin in PINS.items()
         },
         "recipe": {
             "id": "qwen-image-edit-2511-lightning-4-bf16-streaming",

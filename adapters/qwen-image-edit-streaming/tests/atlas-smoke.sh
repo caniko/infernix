@@ -29,11 +29,50 @@ admit() {
     ((a >= 40*g && free >= 20*g)) && below "$p" 5
 }
 idle() {
-    [[ $(systemctl show comfyui.service -p ActiveState --value) == inactive ]] &&
-        ! pgrep -f '(^|/)UnrealEditor(-Linux-Shipping)?( |$)' >/dev/null
+    local state rc=0
+    state=$(systemctl show comfyui.service -p ActiveState --value) || return 1
+    [[ $state == inactive ]] || return 1
+    pgrep -f '(^|/)UnrealEditor(-Linux-Shipping)?( |$)' >/dev/null || rc=$?
+    ((rc == 1))
 }
 holders() {
     lslocks --noheadings --notruncate -o PID,PATH | awk -v path="$lock" '$2==path {print $1}'
+}
+verify_receipt() {
+    "$python" -IB - <<'PY'
+import hashlib
+import json
+import math
+import zlib  # noqa: F401  Python's zlib links libz before Pillow needs it.
+from pathlib import Path
+
+from PIL import Image
+
+try:
+    receipt = json.loads(Path("result.json").read_bytes())
+    steps = receipt["recipe"]["steps"]
+    updates = receipt["timing"]["stepSeconds"]
+    output = receipt["output"]
+    png = Path(output["path"])
+    if (
+        receipt["state"] != "rendered" or type(steps) is not int or steps != 4
+        or not isinstance(updates, list) or len(updates) != 4
+        or not all(type(u) in (int, float) and math.isfinite(u) and u >= 0 for u in updates)
+        or png.name != output["path"] or png.suffix != ".png"
+        or png.name != json.loads(Path("job.json").read_bytes())["output"]
+        or png.is_symlink() or not png.is_file()
+    ):
+        raise ValueError
+    with png.open("rb") as data, Image.open(data, formats=["PNG"]) as image:
+        image.verify()
+        data.seek(0)
+        if hashlib.file_digest(data, "sha256").hexdigest() != output["sha256"]:
+            raise ValueError
+    with Image.open(png, formats=["PNG"]) as image:
+        image.load()  # verify() checks chunks only; decode the pixels too.
+except (OSError, ValueError, TypeError, KeyError, SyntaxError, zlib.error, Image.DecompressionBombError):
+    raise SystemExit(1) from None
+PY
 }
 
 role=${1:?expected run, watch, or worker}
@@ -45,13 +84,30 @@ shift 2
 run=$(realpath "${1:?private staging directory}")
 python=$(realpath -s "${2:?locked venv Python}")
 shift 2
+[[ $# == 6 ]] || exit 2
+declare -A seen=()
+for i in 1 3 5; do
+    flag=${!i}
+    path_index=$((i+1))
+    case "$flag" in
+        --denoiser|--snapshot|--lightning) ;;
+        *) exit 2 ;;
+    esac
+    [[ -z ${seen[$flag]:-} && ${!path_index} == /* ]] || exit 2
+    seen[$flag]=1
+done
 cd "$run"
+if [[ $role == run || $role == watch ]]; then
+    for artifact in samples.tsv result.json ready go ack worker-status; do
+        [[ ! -e $artifact && ! -L $artifact ]] || exit 75
+    done
+    [[ -s job.json ]]
+fi
 export PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
 export ROCR_VISIBLE_DEVICES=0 HSA_OVERRIDE_GFX_VERSION=11.0.0 MIOPEN_FIND_MODE=FAST
 
 case "$role" in
     run)
-        [[ ! -e samples.tsv && ! -e result.json && ! -e ready && -s job.json ]]
         exec systemd-run --user --wait --unit="$watch" \
             -p Type=notify -p NotifyAccess=all -p WatchdogSec=5s \
             -p MemoryMax=256M -p MemorySwapMax=0 -p Restart=no -p RuntimeMaxSec=500s \
@@ -67,15 +123,18 @@ case "$role" in
             $(<"$cg/memory.swap.max") == 0 ]]
         exec 9<>"${XDG_RUNTIME_DIR:?}/vagrant-gpu-atlas-7900xtx.lock"
         flock --exclusive --nonblock 9
-        idle && admit
+        idle && admit || exit 75
         printf '%s\n' "$cg" >ready.tmp
         mv ready.tmp ready
         for ((i=0; i<40; i++)); do
             if [[ -e go ]]; then
-                idle && admit
+                idle && admit || exit 75
                 status=0
-                "$python" -u "$adapter" --staging "$run" --backend rocm "$@" \
-                    <job.json >result.json || status=$?
+                # Refuse to overwrite a receipt: success must come from this worker.
+                (
+                    set -C
+                    exec "$python" -u "$adapter" --staging "$run" --backend rocm "$@" <job.json >result.json
+                ) || status=$?
                 printf '%s\n' "$status" >worker-status.tmp
                 mv worker-status.tmp worker-status
                 for ((j=0; j<30; j++)); do
@@ -89,6 +148,7 @@ case "$role" in
         exit 75
         ;;
     watch)
+        "$python" -IB -c 'import math, zlib; from PIL import Image' || exit 75
         holder=$(holders)
         admit && idle && [[ -z $holder ]] || exit 75
         systemd-notify --ready
@@ -135,6 +195,10 @@ case "$role" in
                 done
                 holder=$(holders)
                 [[ ! -d $cg && -z $holder ]] || exit 75
+                if [[ $status == 0 ]] && ! verify_receipt; then
+                    printf 'TRIP missing or invalid four-step render receipt or PNG\n' >&2
+                    exit 75
+                fi
                 printf 'after_exit_vram_bytes=%s\n' "$(used)"
                 exit "$status"
             fi

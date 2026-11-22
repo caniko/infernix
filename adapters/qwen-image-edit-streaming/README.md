@@ -70,7 +70,7 @@ lease. The caller owns the lease, independent watchdog, cancellation and
 process exit verification. For an attended Atlas check,
 `tests/atlas-smoke.sh run LABEL STAGING VENV_PYTHON`
 accepts the three model arguments above and reads `STAGING/job.json`. It uses
-the existing shared GPU lock and serial mutex, refuses active ComfyUI or
+the existing GPU lock (held exclusively) and serial mutex, refuses active ComfyUI or
 another lock holder, stops below 16 GiB of host RAM or at full PSI avg10 ≥10%,
 and stops the worker if the independent systemd watchdog dies. Set
 `LD_LIBRARY_PATH`, `XDG_CACHE_HOME` and `MIOPEN_CUSTOM_CACHE_DIR` for the

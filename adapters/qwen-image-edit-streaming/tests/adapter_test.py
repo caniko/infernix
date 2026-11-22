@@ -156,6 +156,18 @@ class QwenStreamingTests(unittest.TestCase):
         hip = SimpleNamespace(cuda=SimpleNamespace(mem_get_info=lambda _: (22 << 30, 23 << 30)))
         with patch.object(adapter.gpu, "vram_free_bytes", return_value=24 << 30):
             self.assertEqual(adapter.admit_vram(hip, "cuda:0", "rocm"), 22 << 30)
+        # The ROCm floor is exactly 21 GiB: admit at it, refuse one byte under.
+        floor = adapter.FREE_VRAM["rocm"]
+        self.assertEqual(floor, 21 << 30)
+        exact = SimpleNamespace(cuda=SimpleNamespace(mem_get_info=lambda _: (floor, 24 << 30)))
+        with patch.object(adapter.gpu, "vram_free_bytes", return_value=floor):
+            self.assertEqual(adapter.admit_vram(exact, "cuda:0", "rocm"), floor)
+        with (
+            patch.object(adapter.gpu, "vram_free_bytes", return_value=floor - 1),
+            self.assertRaises(AdapterError) as under,
+        ):
+            adapter.admit_vram(exact, "cuda:0", "rocm")
+        self.assertEqual(under.exception.code, 10)
 
     def test_fake_render_publishes_clean_png_and_receipt(self):
         output = Image.new("RGB", (1024, 1024), (10, 20, 30))

@@ -36,14 +36,15 @@ idle() {
     pgrep -f '(^|/)UnrealEditor(-Linux-Shipping)?( |$)' >/dev/null || rc=$?
     ((rc == 1)) || { printf 'busy: Unreal Editor probe returned %s\n' "$rc" >&2; return 1; }
 }
-# Every live holder of the shared GPU lock must belong to this run's unit.
-# A holder that exits between lslocks and the cgroup read is skipped.
+# The worker holds the GPU lock exclusively, so lock-respecting users cannot share it.
+# This observer is a second check: every visible holder must be in this run's unit.
+# Only a holder whose process is gone is skipped; an unreadable one fails closed.
 owned_lock() {
     local pid found=0
     for pid in $(holders); do
         [[ $pid =~ ^[0-9]+$ ]] || { printf 'lock: bad holder %q\n' "$pid" >&2; return 1; }
-        [[ -r /proc/$pid/cgroup ]] || continue
-        grep -Fq "/$unit" "/proc/$pid/cgroup" || {
+        [[ -d /proc/$pid ]] || continue
+        grep -Fq "/$unit" "/proc/$pid/cgroup" 2>/dev/null || {
             printf 'lock: held outside %s by pid %s\n' "$unit" "$pid" >&2; return 1; }
         found=1
     done
@@ -176,7 +177,7 @@ case "$role" in
             --setenv="XDG_CACHE_HOME=$XDG_CACHE_HOME" \
             --setenv="MIOPEN_CUSTOM_CACHE_DIR=$MIOPEN_CUSTOM_CACHE_DIR" \
             -p "StandardError=append:$run/worker.log" \
-            flock --shared --nonblock "$lock" bash "$script" worker "$label" "$run" "$python" "$@"
+            flock --exclusive --nonblock "$lock" bash "$script" worker "$label" "$run" "$python" "$@"
         for ((i=0; i<40; i++)); do
             [[ ! -s ready ]] || break
             sleep .1

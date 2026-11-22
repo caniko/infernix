@@ -26,7 +26,7 @@ admit() {
     [[ $total =~ ^[0-9]+$ ]] || return 1
     free=$((total - busy))
     printf 'admission: available=%s full_psi=%s vram_free=%s\n' "$a" "$p" "$free" >&2
-    ((a >= 40*g && free >= 20*g)) && below "$p" 5
+    ((a >= 40*g && free >= 21*g)) && below "$p" 5
 }
 idle() {
     local state rc=0

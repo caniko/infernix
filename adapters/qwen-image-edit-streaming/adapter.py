@@ -25,7 +25,8 @@ CAP = 24 * GIB
 LORA = "lightning-4step-bf16"
 STACK = {"diffusers": "0.43.0", "transformers": "5.22.2", "safetensors": "0.8.0"}
 WHEELS = {"rocm": "2.14.1+rocm7.2", "cuda": "2.14.1+cu126"}
-FREE_VRAM = {"rocm": 20 * GIB, "cuda": 12 * GIB}  # CUDA is a qualification candidate.
+# ROCm: the worst Atlas device-wide delta was 20.56 GiB (post-reboot cold run).
+FREE_VRAM = {"rocm": 21 * GIB, "cuda": 12 * GIB}  # CUDA is a qualification candidate.
 PINS = json.loads(Path(__file__).with_name("models.json").read_text())
 MAX_IMAGE_BYTES = 16 << 20
 PNG_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,123}\.png")

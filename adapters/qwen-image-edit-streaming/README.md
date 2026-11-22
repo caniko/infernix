@@ -63,7 +63,7 @@ This example uses a synthetic instruction:
 Invoke only inside a supervised, dedicated cgroup with `MemoryHigh` and
 `MemoryMax` at 24 GiB and `MemorySwapMax=0`. The runner checks those limits,
 live `MemAvailable ≥ 40 GiB`, full memory PSI avg10 `<5%`, native BF16, and
-free VRAM on the selected card: at least 20 GiB for Atlas ROCm (the lower of
+free VRAM on the selected card: at least 21 GiB for Atlas ROCm (the lower of
 HIP and device-wide amdgpu readings), or a provisional 12 GiB for the
 unqualified CUDA candidate. The standalone CLI does not acquire a device
 lease. The caller owns the lease, independent watchdog, cancellation and

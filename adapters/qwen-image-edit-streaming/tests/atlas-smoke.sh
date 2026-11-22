@@ -30,10 +30,25 @@ admit() {
 }
 idle() {
     local state rc=0
-    state=$(systemctl show comfyui.service -p ActiveState --value) || return 1
-    [[ $state == inactive ]] || return 1
+    state=$(systemctl show comfyui.service -p ActiveState --value) || {
+        printf 'busy: cannot read comfyui.service state\n' >&2; return 1; }
+    [[ $state == inactive ]] || { printf 'busy: comfyui.service is %s\n' "$state" >&2; return 1; }
     pgrep -f '(^|/)UnrealEditor(-Linux-Shipping)?( |$)' >/dev/null || rc=$?
-    ((rc == 1))
+    ((rc == 1)) || { printf 'busy: Unreal Editor probe returned %s\n' "$rc" >&2; return 1; }
+}
+# Every live holder of the shared GPU lock must belong to this run's unit.
+# A holder that exits between lslocks and the cgroup read is skipped.
+owned_lock() {
+    local pid found=0
+    for pid in $(holders); do
+        [[ $pid =~ ^[0-9]+$ ]] || { printf 'lock: bad holder %q\n' "$pid" >&2; return 1; }
+        [[ -r /proc/$pid/cgroup ]] || continue
+        grep -Fq "/$unit" "/proc/$pid/cgroup" || {
+            printf 'lock: held outside %s by pid %s\n' "$unit" "$pid" >&2; return 1; }
+        found=1
+    done
+    ((found)) || printf 'lock: no live holder\n' >&2
+    ((found))
 }
 holders() {
     lslocks --noheadings --notruncate -o PID,PATH | awk -v path="$lock" '$2==path {print $1}'
@@ -181,8 +196,7 @@ case "$role" in
                 printf 'TRIP host/cgroup pressure: %s bytes, %s%%, %s\n' "$a" "$p" "$events" >&2
                 exit 75
             fi
-            holder=$(holders)
-            if ! idle || [[ ! $holder =~ ^[0-9]+$ ]] || ! grep -Fq "/$unit" "/proc/$holder/cgroup"; then
+            if ! idle || ! owned_lock; then
                 printf 'TRIP competing GPU user or missing shared lock\n' >&2
                 exit 75
             fi

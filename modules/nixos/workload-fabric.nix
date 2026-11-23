@@ -358,6 +358,8 @@ let
         timeout_secs = cfg.admission.timeoutSecs;
         preempt = cfg.admission.preempt;
       };
+    } // lib.optionalAttrs (cfg.controlSocket != null) {
+      control_socket = cfg.controlSocket;
     };
     adapters = lib.mapAttrsToList
       (name: adapter: {
@@ -560,6 +562,17 @@ in
         jobs; with `preempt` a running adapter is stopped and its job returns
         to `pending`. The probe command is host-specific (for example a Canix
         CLI check); the worker only reads its exit status.
+      '';
+    };
+
+    controlSocket = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Optional local Unix control socket path (`0660`, authorized via
+        SO_PEERCRED to root or the worker user) for host-local lease owners to
+        pause new claims and receive an exact idle acknowledgement before
+        stopping the worker.
       '';
     };
 
@@ -949,7 +962,9 @@ in
         MemorySwapMax = cfg.memorySwapMax;
         CPUQuota = cfg.cpuQuota;
         TasksMax = cfg.tasksMax;
-        ReadWritePaths = [cfg.stagingRoot cfg.cacheRoot] ++ map toString cfg.modelDirectories;
+        ReadWritePaths = [cfg.stagingRoot cfg.cacheRoot]
+          ++ map toString cfg.modelDirectories
+          ++ lib.optional (cfg.controlSocket != null && builtins.dirOf cfg.controlSocket != "/run/infernix-workerd") (builtins.dirOf cfg.controlSocket);
         Restart = "on-failure";
         RestartSec = 5;
         KillMode = "mixed";
@@ -960,6 +975,9 @@ in
         PrivateTmp = true;
       } // lib.optionalAttrs (cfg.memoryHigh != null) {
         MemoryHigh = cfg.memoryHigh;
+      } // lib.optionalAttrs (cfg.controlSocket != null) {
+        RuntimeDirectory = "infernix-workerd";
+        RuntimeDirectoryMode = "0750";
       };
     };
   })

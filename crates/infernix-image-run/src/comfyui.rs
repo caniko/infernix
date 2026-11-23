@@ -26,14 +26,15 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    error::{RunnerError, RunnerResult},
+    error::{EXIT_RESOURCE_BUSY, RunnerError, RunnerResult},
     fs_safe::{
         atomic_replace_in_dir, open_dir_strict, open_read_regular_in_dir, read_bounded_response,
         unlink_safe_relative_file, valid_id_segment,
     },
     guard::{
-        QuarantineState, check_host_admission, check_host_running, check_vram_admission,
-        record_quarantine, run_admission_probe, unload_llama_swap, verify_cgroup_limits,
+        ActiveLease, QuarantineState, check_host_admission, check_host_running,
+        check_vram_admission, record_quarantine, run_admission_probe, unload_llama_swap,
+        verify_cgroup_limits,
     },
     png::{MAX_PNG_BYTES, PngInfo, write_verified_png_checked},
     registry::{UploadedInput, bind_comfy_graph},
@@ -46,6 +47,8 @@ const JOURNAL_FILENAME: &str = "comfy-prompt.json";
 pub struct ComfyConfig {
     pub base_url: String,
     pub unit_name: Option<String>,
+    /// Optional test override for the `systemctl` executable used to query unit properties.
+    pub systemctl_bin: Option<PathBuf>,
     pub cgroup_dir_override: Option<PathBuf>,
     /// Optional test override for the live ComfyUI argv inspected for `--disable-metadata`.
     pub cmdline_override: Option<Vec<String>>,
@@ -71,6 +74,7 @@ impl Default for ComfyConfig {
         Self {
             base_url: "http://127.0.0.1:8188".to_owned(),
             unit_name: None,
+            systemctl_bin: None,
             cgroup_dir_override: None,
             cmdline_override: None,
             require_disable_metadata: true,
@@ -213,10 +217,15 @@ pub fn has_existing_journal(journal_dir: &Path) -> RunnerResult<bool> {
     Ok(existing_journal_state(journal_dir)?.is_some())
 }
 
-pub async fn read_unit_property(unit: &str, prop: &str) -> Option<String> {
+async fn read_unit_property_bin(
+    systemctl_bin: Option<&Path>,
+    unit: &str,
+    prop: &str,
+) -> Option<String> {
+    let prog = systemctl_bin.unwrap_or_else(|| Path::new("systemctl"));
     let out = timeout(
         Duration::from_secs(3),
-        Command::new("systemctl")
+        Command::new(prog)
             .args(["show", unit, "-p", prop, "--value"])
             .stdin(Stdio::null())
             .output(),
@@ -229,6 +238,10 @@ pub async fn read_unit_property(unit: &str, prop: &str) -> Option<String> {
     }
     let val = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (!val.is_empty()).then_some(val)
+}
+
+pub async fn read_unit_property(unit: &str, prop: &str) -> Option<String> {
+    read_unit_property_bin(None, unit, prop).await
 }
 
 async fn verify_comfy_cgroup(comfy: &ComfyConfig, expected_max: Option<u64>) -> RunnerResult<()> {
@@ -302,7 +315,42 @@ async fn verify_comfy_disable_metadata(comfy: &ComfyConfig) -> RunnerResult<()> 
 
 async fn current_invocation_id(comfy: &ComfyConfig) -> Option<String> {
     let unit = comfy.unit_name.as_deref()?;
-    read_unit_property(unit, "InvocationID").await
+    read_unit_property_bin(comfy.systemctl_bin.as_deref(), unit, "InvocationID").await
+}
+
+async fn invocation_is_dead_bin(
+    systemctl_bin: Option<&Path>,
+    unit_name: Option<&str>,
+    submitting_invocation: Option<&str>,
+) -> bool {
+    let Some(unit) = unit_name else {
+        return false;
+    };
+    if let Some(want) = submitting_invocation {
+        if let Some(now_inv) = read_unit_property_bin(systemctl_bin, unit, "InvocationID").await {
+            if now_inv != want {
+                return true;
+            }
+        }
+    }
+    matches!(
+        read_unit_property_bin(systemctl_bin, unit, "ActiveState")
+            .await
+            .as_deref(),
+        Some("inactive" | "failed")
+    )
+}
+
+async fn comfy_invocation_is_dead(
+    comfy: &ComfyConfig,
+    submitting_invocation: Option<&str>,
+) -> bool {
+    invocation_is_dead_bin(
+        comfy.systemctl_bin.as_deref(),
+        comfy.unit_name.as_deref(),
+        submitting_invocation,
+    )
+    .await
 }
 
 /// Returns `true` ONLY when systemd proves the submitting invocation is gone
@@ -311,20 +359,7 @@ pub async fn invocation_is_dead(
     unit_name: Option<&str>,
     submitting_invocation: Option<&str>,
 ) -> bool {
-    let Some(unit) = unit_name else {
-        return false;
-    };
-    if let Some(want) = submitting_invocation {
-        if let Some(now_inv) = read_unit_property(unit, "InvocationID").await {
-            if now_inv != want {
-                return true;
-            }
-        }
-    }
-    matches!(
-        read_unit_property(unit, "ActiveState").await.as_deref(),
-        Some("inactive" | "failed")
-    )
+    invocation_is_dead_bin(None, unit_name, submitting_invocation).await
 }
 
 #[derive(Debug)]
@@ -444,12 +479,19 @@ async fn fetch_strict_queue(client: &reqwest::Client, base: &str) -> RunnerResul
     parse_strict_queue(&val)
 }
 
+enum UploadError {
+    /// Server returned a complete HTTP response (no upload remains in flight).
+    Definite(RunnerError),
+    /// Transport/timeout error where ComfyUI may still be writing the uploaded file.
+    Ambiguous(RunnerError),
+}
+
 async fn upload_png(
     client: &reqwest::Client,
     base_url: &str,
     filename: &str,
     png_bytes: &[u8],
-) -> RunnerResult<UploadedInput> {
+) -> Result<UploadedInput, UploadError> {
     let boundary = format!("----infernix-boundary-{}", Uuid::new_v4().simple());
     let mut body = Vec::with_capacity(png_bytes.len() + 512);
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
@@ -475,22 +517,30 @@ async fn upload_png(
         .body(body)
         .send()
         .await
-        .map_err(|e| RunnerError::gpu_unavailable(format!("ComfyUI upload failed: {e}")))?;
+        .map_err(|e| {
+            UploadError::Ambiguous(RunnerError::gpu_unavailable(format!(
+                "ComfyUI upload failed: {e}"
+            )))
+        })?;
     if !resp.status().is_success() {
-        return Err(RunnerError::gpu_unavailable(format!(
-            "ComfyUI upload returned HTTP {}",
-            resp.status()
+        return Err(UploadError::Definite(RunnerError::gpu_unavailable(
+            format!("ComfyUI upload returned HTTP {}", resp.status()),
         )));
     }
-    let payload: Value = resp
-        .json()
-        .await
-        .map_err(|e| RunnerError::gpu_unavailable(format!("invalid ComfyUI upload JSON: {e}")))?;
+    let payload: Value = resp.json().await.map_err(|e| {
+        UploadError::Ambiguous(RunnerError::gpu_unavailable(format!(
+            "invalid ComfyUI upload JSON: {e}"
+        )))
+    })?;
     let name = payload
         .get("name")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| RunnerError::gpu_unavailable("ComfyUI upload response missing name"))?
+        .ok_or_else(|| {
+            UploadError::Definite(RunnerError::gpu_unavailable(
+                "ComfyUI upload response missing name",
+            ))
+        })?
         .to_owned();
     let subfolder = payload
         .get("subfolder")
@@ -559,7 +609,7 @@ async fn reconcile_by_client_id_bounded(
         {
             return ReconcileOutcome::Found(pid);
         }
-        if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation).await {
+        if comfy_invocation_is_dead(comfy, submitting_invocation).await {
             return ReconcileOutcome::InvocationDead;
         }
         if Instant::now() >= deadline {
@@ -582,7 +632,7 @@ async fn settle_cancel(
     let deadline = Instant::now() + comfy.cancel_settle_timeout;
 
     loop {
-        if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation).await {
+        if comfy_invocation_is_dead(comfy, submitting_invocation).await {
             return Ok(());
         }
         match fetch_strict_queue(client, base).await {
@@ -609,7 +659,7 @@ async fn settle_cancel(
             Err(_) => {
                 // Re-check invocation death on error/refusal; never treat a broken
                 // or malformed `/queue` response as "prompt absent".
-                if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation).await {
+                if comfy_invocation_is_dead(comfy, submitting_invocation).await {
                     return Ok(());
                 }
             }
@@ -662,7 +712,7 @@ async fn cleanup_history_unless_dead(
     match cleanup_owned_history(client, base, prompt_id).await {
         Ok(()) => Ok(()),
         Err(err) => {
-            if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation).await {
+            if comfy_invocation_is_dead(comfy, submitting_invocation).await {
                 Ok(())
             } else {
                 Err(err)
@@ -767,7 +817,7 @@ async fn probe_history_output_rel(
     let resp = match timeout(Duration::from_secs(3), client.get(&url).send()).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation).await {
+            if comfy_invocation_is_dead(comfy, submitting_invocation).await {
                 return Ok(None);
             }
             return Err(RunnerError::internal(format!(
@@ -775,7 +825,7 @@ async fn probe_history_output_rel(
             )));
         }
         Err(_) => {
-            if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation).await {
+            if comfy_invocation_is_dead(comfy, submitting_invocation).await {
                 return Ok(None);
             }
             return Err(RunnerError::internal(format!(
@@ -784,7 +834,7 @@ async fn probe_history_output_rel(
         }
     };
     if !resp.status().is_success() {
-        if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation).await {
+        if comfy_invocation_is_dead(comfy, submitting_invocation).await {
             return Ok(None);
         }
         return Err(RunnerError::internal(format!(
@@ -1039,6 +1089,7 @@ fn record_comfy_quarantine(
     prompt_id: Option<&str>,
     client_id: Option<&str>,
     submitting_invocation: Option<&str>,
+    lease: Option<&ActiveLease>,
     reason: String,
 ) -> RunnerResult<()> {
     quarantined.store(true, Ordering::SeqCst);
@@ -1055,10 +1106,112 @@ fn record_comfy_quarantine(
             qwen_cgroup: None,
             qwen_pgid: None,
             qwen_vram_baseline_mib: None,
+            qwen_stage_dir: None,
             lease_uncertain: false,
+            pending_lease_release: lease.and_then(ActiveLease::pending_release_context),
         },
         None,
     )
+}
+
+/// Persist recoverable upload cleanup state on pre-submit failures after one or
+/// more inputs were uploaded:
+/// - When `upload_in_flight` is false (definite server response), transitions to
+///   `upload_cleanup`, runs file cleanup, and finalizes `rejected` only on success.
+/// - When `upload_in_flight` is true (timeout/transport error where ComfyUI may still
+///   write the file after cleanup runs), binds `service_invocation_id` ONLY if the
+///   exact pre-upload invocation stayed continuously active across the POST; otherwise
+///   leaves it unbound (`None`) so recovery requires `ActiveState` `inactive`/`failed`.
+///   Always verifies death BEFORE running final cleanup so a delayed write landing
+///   after unlink and before unit exit can never be finalized as `rejected`.
+#[allow(clippy::too_many_arguments)]
+async fn rollback_pre_submit_uploads(
+    comfy: &ComfyConfig,
+    journal_dir: &Path,
+    client_id: &str,
+    invocation_id: Option<&str>,
+    uploaded_rel: &[String],
+    upload_in_flight: bool,
+    original_err: RunnerError,
+) -> RunnerError {
+    if uploaded_rel.is_empty() {
+        return original_err;
+    }
+    let bound_invocation: Option<String> = if upload_in_flight {
+        match (invocation_id, current_invocation_id(comfy).await) {
+            (Some(want), Some(now)) if now == want => Some(want.to_owned()),
+            _ => None,
+        }
+    } else {
+        invocation_id.map(str::to_owned)
+    };
+    let pending_state = if upload_in_flight {
+        "uploading"
+    } else {
+        "upload_cleanup"
+    };
+    let journal_res = write_journal(
+        journal_dir,
+        &PromptJournal {
+            client_id: client_id.to_owned(),
+            service_invocation_id: bound_invocation.clone(),
+            prompt_id: None,
+            state: pending_state.to_owned(),
+            uploaded_inputs: uploaded_rel.to_vec(),
+            output_rel: None,
+        },
+    );
+    // Check death BEFORE cleanup so a delayed write landing after unlink and
+    // before unit exit can never be mistaken for post-death cleanup.
+    let can_finalize =
+        !upload_in_flight || comfy_invocation_is_dead(comfy, bound_invocation.as_deref()).await;
+    match cleanup_owned_files(comfy, uploaded_rel, None).await {
+        Ok(()) => {
+            if !can_finalize {
+                return match journal_res {
+                    Ok(()) => RunnerError::internal(format!(
+                        "{}; upload may still write until ComfyUI invocation ends (cleanup kept pending)",
+                        original_err.message
+                    )),
+                    Err(jerr) => RunnerError::internal(format!(
+                        "{}; upload may still write AND journal write failed ({})",
+                        original_err.message, jerr.message
+                    )),
+                };
+            }
+            if original_err.code == EXIT_RESOURCE_BUSY {
+                if let Err(uerr) = unlink_safe_relative_file(journal_dir, JOURNAL_FILENAME) {
+                    return RunnerError::internal(format!(
+                        "{}; pre-submit uploads cleaned up, but clearing journal for retry failed: {uerr}",
+                        original_err.message
+                    ));
+                }
+                return original_err;
+            }
+            let _ = write_journal(
+                journal_dir,
+                &PromptJournal {
+                    client_id: client_id.to_owned(),
+                    service_invocation_id: bound_invocation,
+                    prompt_id: None,
+                    state: "rejected".to_owned(),
+                    uploaded_inputs: uploaded_rel.to_vec(),
+                    output_rel: None,
+                },
+            );
+            original_err
+        }
+        Err(cerr) => match journal_res {
+            Ok(()) => RunnerError::internal(format!(
+                "{}; pre-submit upload cleanup failed (retained in {pending_state} for retry): {}",
+                original_err.message, cerr.message
+            )),
+            Err(jerr) => RunnerError::internal(format!(
+                "{}; pre-submit upload cleanup failed ({}) AND {pending_state} journal write failed ({})",
+                original_err.message, cerr.message, jerr.message
+            )),
+        },
+    }
 }
 
 fn hold_connection_closed(stream: &TcpStream) -> bool {
@@ -1252,6 +1405,44 @@ pub async fn finish_pending_journal_cleanup(
         )));
     }
 
+    if prev.state == "uploading" {
+        validate_cleanup_paths(&prev.uploaded_inputs, prev.output_rel.as_deref())?;
+        // Check death BEFORE cleanup so a delayed write landing after unlink and
+        // before unit exit can never be mistaken for post-death cleanup.
+        let dead = comfy_invocation_is_dead(comfy, prev.service_invocation_id.as_deref()).await;
+        cleanup_owned_files(comfy, &prev.uploaded_inputs, prev.output_rel.as_deref()).await?;
+        if !dead {
+            return Err(RunnerError::internal(
+                "ComfyUI upload cleanup ran, but submitting invocation is not proven dead; keeping cleanup pending",
+            ));
+        }
+        write_journal(
+            journal_dir,
+            &PromptJournal {
+                state: "rejected".to_owned(),
+                ..prev
+            },
+        )?;
+        return Ok(Some(RunnerError::invalid_input(
+            "ComfyUI pre-submit upload failed; finished pending input cleanup",
+        )));
+    }
+
+    if prev.state == "upload_cleanup" {
+        validate_cleanup_paths(&prev.uploaded_inputs, prev.output_rel.as_deref())?;
+        cleanup_owned_files(comfy, &prev.uploaded_inputs, prev.output_rel.as_deref()).await?;
+        write_journal(
+            journal_dir,
+            &PromptJournal {
+                state: "rejected".to_owned(),
+                ..prev
+            },
+        )?;
+        return Ok(Some(RunnerError::invalid_input(
+            "ComfyUI pre-submit upload failed; finished pending input cleanup",
+        )));
+    }
+
     Ok(None)
 }
 
@@ -1295,12 +1486,7 @@ pub async fn settle_or_quarantine_prior_ownership(
                 Err(_) => "ComfyUI connect timed out during lease-denied recovery".to_owned(),
                 Ok(Ok(_)) => unreachable!(),
             };
-            if !invocation_is_dead(
-                comfy.unit_name.as_deref(),
-                prev.service_invocation_id.as_deref(),
-            )
-            .await
-            {
+            if !comfy_invocation_is_dead(comfy, prev.service_invocation_id.as_deref()).await {
                 record_comfy_quarantine(
                     quarantine_path,
                     quarantined,
@@ -1309,6 +1495,7 @@ pub async fn settle_or_quarantine_prior_ownership(
                     prev.prompt_id.as_deref(),
                     Some(&prev.client_id),
                     prev.service_invocation_id.as_deref(),
+                    None,
                     format!("lease denied ({lease_reason}); {err_msg}"),
                 )?;
             }
@@ -1326,12 +1513,7 @@ pub async fn settle_or_quarantine_prior_ownership(
             }
         }
         if Instant::now() >= ready_deadline {
-            if !invocation_is_dead(
-                comfy.unit_name.as_deref(),
-                prev.service_invocation_id.as_deref(),
-            )
-            .await
-            {
+            if !comfy_invocation_is_dead(comfy, prev.service_invocation_id.as_deref()).await {
                 record_comfy_quarantine(
                     quarantine_path,
                     quarantined,
@@ -1340,6 +1522,7 @@ pub async fn settle_or_quarantine_prior_ownership(
                     prev.prompt_id.as_deref(),
                     Some(&prev.client_id),
                     prev.service_invocation_id.as_deref(),
+                    None,
                     format!(
                         "lease denied ({lease_reason}); ComfyUI /system_stats did not respond during recovery"
                     ),
@@ -1401,6 +1584,7 @@ pub async fn settle_or_quarantine_prior_ownership(
                         None,
                         Some(&prev.client_id),
                         saved_inv.as_deref(),
+                        None,
                         msg.clone(),
                     )?;
                     return Ok(RunnerError::gpu_unavailable(msg));
@@ -1419,6 +1603,7 @@ pub async fn settle_or_quarantine_prior_ownership(
             Some(&prompt_id),
             Some(&prev.client_id),
             saved_inv.as_deref(),
+            None,
             msg.clone(),
         )?;
         let _ = write_journal(
@@ -1502,11 +1687,11 @@ pub async fn run_comfyui(
     let existing_journal = read_journal(journal_dir)?;
 
     if existing_journal.is_none() {
+        unload_llama_swap(&client, guard).await;
         check_host_admission(guard)?;
         check_vram_admission(guard)?;
         run_admission_probe(guard).await?;
         lease.recheck().await?;
-        unload_llama_swap(&client, guard).await;
     }
 
     // Dedicated TCP activation/hold connection kept open through completion & drain,
@@ -1521,12 +1706,7 @@ pub async fn run_comfyui(
                 Ok(Ok(_)) => unreachable!(),
             };
             if let Some(prev) = existing_journal.as_ref() {
-                if !invocation_is_dead(
-                    comfy.unit_name.as_deref(),
-                    prev.service_invocation_id.as_deref(),
-                )
-                .await
-                {
+                if !comfy_invocation_is_dead(comfy, prev.service_invocation_id.as_deref()).await {
                     record_comfy_quarantine(
                         quarantine_path,
                         quarantined,
@@ -1535,6 +1715,7 @@ pub async fn run_comfyui(
                         prev.prompt_id.as_deref(),
                         Some(&prev.client_id),
                         prev.service_invocation_id.as_deref(),
+                        Some(lease),
                         format!(
                             "recovery connect failed while invocation not proven dead: {err_msg}"
                         ),
@@ -1560,12 +1741,7 @@ pub async fn run_comfyui(
         }
         if Instant::now() >= ready_deadline {
             if let Some(prev) = existing_journal.as_ref() {
-                if !invocation_is_dead(
-                    comfy.unit_name.as_deref(),
-                    prev.service_invocation_id.as_deref(),
-                )
-                .await
-                {
+                if !comfy_invocation_is_dead(comfy, prev.service_invocation_id.as_deref()).await {
                     record_comfy_quarantine(
                         quarantine_path,
                         quarantined,
@@ -1574,6 +1750,7 @@ pub async fn run_comfyui(
                         prev.prompt_id.as_deref(),
                         Some(&prev.client_id),
                         prev.service_invocation_id.as_deref(),
+                        Some(lease),
                         "ComfyUI /system_stats did not respond during recovery while invocation not proven dead".to_owned(),
                     )?;
                 }
@@ -1628,6 +1805,7 @@ pub async fn run_comfyui(
                                     Some(&pid),
                                     Some(&prev.client_id),
                                     saved_inv.as_deref(),
+                                    Some(lease),
                                     format!("{}; {}", jerr.message, serr.message),
                                 )?;
                             }
@@ -1658,6 +1836,7 @@ pub async fn run_comfyui(
                             None,
                             Some(&prev.client_id),
                             saved_inv.as_deref(),
+                            Some(lease),
                             msg.clone(),
                         )?;
                         return Err(RunnerError::internal(msg));
@@ -1703,6 +1882,10 @@ pub async fn run_comfyui(
             }
 
             // Upload ordered inputs with private job-scoped filenames.
+            // Journal the runner-owned filename BEFORE each POST /upload/image so a
+            // saved upload whose response is lost (or a crash mid-upload) still has a
+            // durable cleanup-only ownership record on disk.
+            let client_id = format!("infernix-{}", Uuid::new_v4().simple());
             let mut uploaded = Vec::with_capacity(verified_inputs.len());
             let mut uploaded_rel = Vec::with_capacity(verified_inputs.len());
             for (idx, bytes) in verified_inputs.iter().enumerate() {
@@ -1712,27 +1895,128 @@ pub async fn run_comfyui(
                     .take(48)
                     .collect();
                 let filename = format!("infernix-{safe_job}-in-{idx}.png");
-                let up = upload_png(&client, base, &filename, bytes).await?;
-                uploaded_rel.push(up.comfy_value());
+                uploaded_rel.push(filename.clone());
+                if let Err(err) = write_journal(
+                    journal_dir,
+                    &PromptJournal {
+                        client_id: client_id.clone(),
+                        // Leave invocation unbound before the POST completes: if ComfyUI
+                        // restarts before accepting /upload/image, a replacement invocation
+                        // could still be writing after a runner crash.
+                        service_invocation_id: None,
+                        prompt_id: None,
+                        state: "uploading".to_owned(),
+                        uploaded_inputs: uploaded_rel.clone(),
+                        output_rel: None,
+                    },
+                ) {
+                    uploaded_rel.pop();
+                    return Err(rollback_pre_submit_uploads(
+                        comfy,
+                        journal_dir,
+                        &client_id,
+                        invocation_id.as_deref(),
+                        &uploaded_rel,
+                        false,
+                        err,
+                    )
+                    .await);
+                }
+                let up = match upload_png(&client, base, &filename, bytes).await {
+                    Ok(u) => u,
+                    Err(UploadError::Definite(err)) => {
+                        return Err(rollback_pre_submit_uploads(
+                            comfy,
+                            journal_dir,
+                            &client_id,
+                            invocation_id.as_deref(),
+                            &uploaded_rel,
+                            false,
+                            err,
+                        )
+                        .await);
+                    }
+                    Err(UploadError::Ambiguous(err)) => {
+                        return Err(rollback_pre_submit_uploads(
+                            comfy,
+                            journal_dir,
+                            &client_id,
+                            invocation_id.as_deref(),
+                            &uploaded_rel,
+                            true,
+                            err,
+                        )
+                        .await);
+                    }
+                };
+                let actual_rel = up.comfy_value();
+                if actual_rel != filename {
+                    if let Some(last) = uploaded_rel.last_mut() {
+                        *last = actual_rel;
+                    }
+                    if let Err(err) = write_journal(
+                        journal_dir,
+                        &PromptJournal {
+                            client_id: client_id.clone(),
+                            service_invocation_id: None,
+                            prompt_id: None,
+                            state: "upload_cleanup".to_owned(),
+                            uploaded_inputs: uploaded_rel.clone(),
+                            output_rel: None,
+                        },
+                    ) {
+                        return Err(rollback_pre_submit_uploads(
+                            comfy,
+                            journal_dir,
+                            &client_id,
+                            invocation_id.as_deref(),
+                            &uploaded_rel,
+                            false,
+                            err,
+                        )
+                        .await);
+                    }
+                }
                 uploaded.push(up);
             }
 
             let safe_prefix = format!("infernix-{}", Uuid::new_v4().simple());
-            let graph = bind_comfy_graph(loaded, &uploaded, params, &safe_prefix)?;
-            let client_id = format!("infernix-{}", Uuid::new_v4().simple());
+            let graph = match bind_comfy_graph(loaded, &uploaded, params, &safe_prefix) {
+                Ok(g) => g,
+                Err(err) => {
+                    return Err(rollback_pre_submit_uploads(
+                        comfy,
+                        journal_dir,
+                        &client_id,
+                        invocation_id.as_deref(),
+                        &uploaded_rel,
+                        false,
+                        err,
+                    )
+                    .await);
+                }
+            };
 
             // Verify invocation did not change between capture and submit.
             if let Some(ref want) = invocation_id {
                 if current_invocation_id(comfy).await.as_deref() != Some(want.as_str()) {
-                    let _ = cleanup_owned_files(comfy, &uploaded_rel, None).await;
-                    return Err(RunnerError::resource_busy(
-                        "ComfyUI invocation changed before /prompt submit",
-                    ));
+                    return Err(rollback_pre_submit_uploads(
+                        comfy,
+                        journal_dir,
+                        &client_id,
+                        invocation_id.as_deref(),
+                        &uploaded_rel,
+                        false,
+                        RunnerError::resource_busy(
+                            "ComfyUI invocation changed before /prompt submit",
+                        ),
+                    )
+                    .await);
                 }
             }
 
             // Journal before POST /prompt so any uncertain outcome can reconcile without blind repost.
-            write_journal(
+            if let Err(err) = write_journal(
                 journal_dir,
                 &PromptJournal {
                     client_id: client_id.clone(),
@@ -1742,7 +2026,18 @@ pub async fn run_comfyui(
                     uploaded_inputs: uploaded_rel.clone(),
                     output_rel: None,
                 },
-            )?;
+            ) {
+                return Err(rollback_pre_submit_uploads(
+                    comfy,
+                    journal_dir,
+                    &client_id,
+                    invocation_id.as_deref(),
+                    &uploaded_rel,
+                    false,
+                    err,
+                )
+                .await);
+            }
 
             let submit_body = json!({
                 "prompt": graph,
@@ -1810,6 +2105,7 @@ pub async fn run_comfyui(
                                 Some(&pid),
                                 Some(&client_id),
                                 invocation_id.as_deref(),
+                                Some(lease),
                                 format!("{}; {}", jerr.message, serr.message),
                             )?;
                         } else {
@@ -1865,6 +2161,7 @@ pub async fn run_comfyui(
                                 None,
                                 Some(&client_id),
                                 invocation_id.as_deref(),
+                                Some(lease),
                                 msg.clone(),
                             )?;
                             return Err(RunnerError::internal(msg));
@@ -1904,6 +2201,7 @@ pub async fn run_comfyui(
                                         Some(&pid),
                                         Some(&client_id),
                                         invocation_id.as_deref(),
+                                        Some(lease),
                                         format!("{}; {}", jerr.message, serr.message),
                                     )?;
                                 }
@@ -1929,6 +2227,7 @@ pub async fn run_comfyui(
                                 None,
                                 Some(&client_id),
                                 invocation_id.as_deref(),
+                                Some(lease),
                                 msg.clone(),
                             )?;
                             return Err(RunnerError::internal(msg));
@@ -1944,9 +2243,7 @@ pub async fn run_comfyui(
     let history_entry = loop {
         // Check hold TCP connection for unexpected closure.
         if hold_connection_closed(&hold_conn) {
-            if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation.as_deref())
-                .await
-            {
+            if comfy_invocation_is_dead(comfy, submitting_invocation.as_deref()).await {
                 let _ =
                     cleanup_owned_files(comfy, &uploaded_rel_paths, existing_output_rel.as_deref())
                         .await;
@@ -1972,6 +2269,7 @@ pub async fn run_comfyui(
                     Some(&prompt_id),
                     Some(&client_id),
                     submitting_invocation.as_deref(),
+                    Some(lease),
                     serr.message.clone(),
                 )?;
                 let _ = write_journal(
@@ -2019,6 +2317,7 @@ pub async fn run_comfyui(
                     Some(&prompt_id),
                     Some(&client_id),
                     submitting_invocation.as_deref(),
+                    Some(lease),
                     format!("{}; {}", err.message, serr.message),
                 )?;
                 return Err(serr);
@@ -2052,6 +2351,7 @@ pub async fn run_comfyui(
                         Some(&prompt_id),
                         Some(&client_id),
                         submitting_invocation.as_deref(),
+                        Some(lease),
                         format!("{}; {}", err.message, serr.message),
                     )?;
                     return Err(serr);
@@ -2074,7 +2374,7 @@ pub async fn run_comfyui(
         }
 
         // Check if submitting invocation died while polling (e.g. OOM killed or restarted).
-        if invocation_is_dead(comfy.unit_name.as_deref(), submitting_invocation.as_deref()).await {
+        if comfy_invocation_is_dead(comfy, submitting_invocation.as_deref()).await {
             let _ = cleanup_owned_files(comfy, &uploaded_rel_paths, existing_output_rel.as_deref())
                 .await;
             return Err(RunnerError::internal(
@@ -2132,6 +2432,7 @@ pub async fn run_comfyui(
                                 Some(&prompt_id),
                                 Some(&client_id),
                                 submitting_invocation.as_deref(),
+                                Some(lease),
                                 msg.clone(),
                             )?;
                             return Err(RunnerError::internal(msg));
@@ -2154,6 +2455,7 @@ pub async fn run_comfyui(
                         Some(&prompt_id),
                         Some(&client_id),
                         submitting_invocation.as_deref(),
+                        Some(lease),
                         msg.clone(),
                     )?;
                     return Err(RunnerError::internal(msg));
@@ -2173,6 +2475,7 @@ pub async fn run_comfyui(
                         Some(&prompt_id),
                         Some(&client_id),
                         submitting_invocation.as_deref(),
+                        Some(lease),
                         msg.clone(),
                     )?;
                     return Err(RunnerError::internal(msg));

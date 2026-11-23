@@ -30,9 +30,9 @@ use crate::{
     },
     fs_safe::{create_new_file_in_dir, open_dir_strict, open_read_regular_in_dir},
     guard::{
-        FileLock, GuardConfig, QuarantineState, check_host_admission, check_host_running,
-        check_vram_admission, read_free_vram_mib, record_quarantine, run_admission_probe,
-        unload_llama_swap, verify_qwen_cgroup_limits,
+        ActiveLease, FileLock, GuardConfig, QuarantineState, check_host_admission,
+        check_host_running, check_vram_admission, read_free_vram_mib, record_quarantine,
+        run_admission_probe, unload_llama_swap, verify_qwen_cgroup_limits,
     },
     png::{MAX_PNG_BYTES, PngInfo, sha256_hex, write_verified_png_checked},
     registry::{ProfileEntry, QwenSpec, validate_parameters},
@@ -337,6 +337,38 @@ async fn wait_for_vram_release(
     }
 }
 
+/// RAII guard that removes the runner-owned `0700` Qwen child staging directory
+/// under the runner identity once execution has settled (so `infernix-workerd`
+/// under a different UID is never left with untraversable private files).
+/// Disarmed when entering quarantine so a surviving child is not disrupted; the
+/// quarantine state records `qwen_stage_dir` for removal after settlement.
+struct ChildStageGuard {
+    dir: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl ChildStageGuard {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            cleanup_on_drop: true,
+        }
+    }
+
+    fn keep_until_quarantine_settles(&mut self) -> PathBuf {
+        self.cleanup_on_drop = false;
+        self.dir.clone()
+    }
+}
+
+impl Drop for ChildStageGuard {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_qwen_quarantine(
     quarantine_path: &Path,
@@ -345,9 +377,12 @@ fn record_qwen_quarantine(
     pid: u32,
     cg: Option<&ChildCgroup>,
     vram_baseline_mib: Option<u64>,
+    stage_guard: &mut ChildStageGuard,
+    lease: &ActiveLease,
     gpu_lock: FileLock,
     reason: String,
 ) -> RunnerResult<()> {
+    let stage_dir = stage_guard.keep_until_quarantine_settles();
     quarantined.store(true, std::sync::atomic::Ordering::SeqCst);
     record_quarantine(
         quarantine_path,
@@ -362,7 +397,9 @@ fn record_qwen_quarantine(
             qwen_cgroup: cg.map(|c| c.dir.clone()),
             qwen_pgid: (pid != 0).then_some(pid),
             qwen_vram_baseline_mib: vram_baseline_mib,
+            qwen_stage_dir: Some(stage_dir),
             lease_uncertain: false,
+            pending_lease_release: lease.pending_release_context(),
         },
         Some(gpu_lock),
     )
@@ -593,6 +630,7 @@ pub async fn run_qwen_streaming(
     ));
     let stage_fd = open_dir_strict(&child_stage, true, 0o700)
         .map_err(|e| RunnerError::internal(format!("create qwen child staging: {e}")))?;
+    let mut stage_guard = ChildStageGuard::new(child_stage.clone());
     {
         let mut f = create_new_file_in_dir(stage_fd.as_raw_fd(), "source.png", 0o600)
             .map_err(|e| RunnerError::internal(format!("stage qwen source.png: {e}")))?;
@@ -718,6 +756,8 @@ pub async fn run_qwen_streaming(
                     pid,
                     child_cg.as_ref(),
                     before_vram,
+                    &mut stage_guard,
+                    lease,
                     gpu_lock,
                     err.message.clone(),
                 )?;
@@ -733,6 +773,8 @@ pub async fn run_qwen_streaming(
                     pid,
                     child_cg.as_ref(),
                     before_vram,
+                    &mut stage_guard,
+                    lease,
                     gpu_lock,
                     err.message.clone(),
                 )?;
@@ -757,6 +799,8 @@ pub async fn run_qwen_streaming(
                     pid,
                     child_cg.as_ref(),
                     before_vram,
+                    &mut stage_guard,
+                    lease,
                     gpu_lock,
                     format!("{}; {}", err.message, drain_err.message),
                 )?;
@@ -772,6 +816,8 @@ pub async fn run_qwen_streaming(
                     pid,
                     child_cg.as_ref(),
                     before_vram,
+                    &mut stage_guard,
+                    lease,
                     gpu_lock,
                     format!("{}; {}", err.message, vram_err.message),
                 )?;
@@ -797,6 +843,8 @@ pub async fn run_qwen_streaming(
                         pid,
                         child_cg.as_ref(),
                         before_vram,
+                        &mut stage_guard,
+                        lease,
                         gpu_lock,
                         format!("{}; {}", err.message, drain_err.message),
                     )?;
@@ -812,6 +860,8 @@ pub async fn run_qwen_streaming(
                         pid,
                         child_cg.as_ref(),
                         before_vram,
+                        &mut stage_guard,
+                        lease,
                         gpu_lock,
                         format!("{}; {}", err.message, vram_err.message),
                     )?;
@@ -844,6 +894,8 @@ pub async fn run_qwen_streaming(
             pid,
             child_cg.as_ref(),
             before_vram,
+            &mut stage_guard,
+            lease,
             gpu_lock,
             msg.clone(),
         )?;
@@ -860,6 +912,8 @@ pub async fn run_qwen_streaming(
             pid,
             child_cg.as_ref(),
             before_vram,
+            &mut stage_guard,
+            lease,
             gpu_lock,
             vram_err.message.clone(),
         )?;

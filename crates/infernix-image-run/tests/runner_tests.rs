@@ -2262,7 +2262,9 @@ async fn r2_05_qwen_vram_baseline_quarantine_requires_vram_recovery() {
             qwen_cgroup: None,
             qwen_pgid: None,
             qwen_vram_baseline_mib: Some(15_000),
+            qwen_stage_dir: None,
             lease_uncertain: false,
+            pending_lease_release: None,
         },
     )
     .unwrap();
@@ -3625,4 +3627,934 @@ async fn r4_ambiguous_lease_preserves_quarantine_cleanup_keeps_exit_11_and_looku
     let cleaned = fs::read_to_string(&cleanup_log).unwrap();
     assert!(cleaned.contains("--input infernix-r4-in.png"));
     assert!(cleaned.contains("--output infernix-r4-out.png"));
+}
+
+#[tokio::test]
+async fn codex_p2_qwen_stage_cleanup_multi_upload_rollback_and_deferred_lease_release() {
+    let dir = temp_dir("codex-p2");
+    let (meminfo, psi) = write_host_fixtures(&dir, 50, 0.1);
+    let (_tx, rx) = watch::channel(false);
+
+    // 1. P2-1 & P2-3: Qwen child staging dir is removed under runner identity on normal settlement,
+    //    kept during quarantine and removed when quarantine settles, AND deferred original lease
+    //    is released via hook after quarantine settles before admitting the next job.
+    let (reg_dir, _, _, qwen_digest) = write_registry(&dir, true, None);
+    let src_png = encode_test_png(1024, 1024, &[]);
+    let src_path = dir.join("src.png");
+    fs::write(&src_path, &src_png).unwrap();
+    let gpu_lock = dir.join("gpu.lock");
+    fs::write(&gpu_lock, b"").unwrap();
+    let out_png = encode_test_png(1024, 1024, &[]);
+    let out_fixture = dir.join("out-fixture.png");
+    fs::write(&out_fixture, &out_png).unwrap();
+
+    let hook_log = dir.join("p2-lease.log");
+    let lease_hook = dir.join("p2-lease.sh");
+    fs::write(
+        &lease_hook,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            hook_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&lease_hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let drm_dir = dir.join("drm");
+    let card_dev = drm_dir.join("card0/device");
+    fs::create_dir_all(&card_dev).unwrap();
+    let vram_total = 24u64 * 1024 * 1024 * 1024;
+    let vram_used_file = card_dev.join("mem_info_vram_used");
+    fs::write(
+        card_dev.join("mem_info_vram_total"),
+        format!("{vram_total}\n"),
+    )
+    .unwrap();
+    // Start with 15 GiB free (9 GiB used).
+    let used_9gib = 9u64 * 1024 * 1024 * 1024;
+    let used_14gib = 14u64 * 1024 * 1024 * 1024;
+    fs::write(&vram_used_file, format!("{used_9gib}\n")).unwrap();
+
+    let mode_file = dir.join("qwen-mode");
+    fs::write(&mode_file, "ok").unwrap();
+    let adapter = dir.join("p2_qwen_adapter.py");
+    fs::write(
+        &adapter,
+        format!(
+            r#"import hashlib, json, sys
+from pathlib import Path
+if Path({mode_file:?}).read_text().strip() == "leak":
+    Path({vram_used_file:?}).write_text("{used_14gib}\n")
+    sys.exit(1)
+args = sys.argv[1:]
+staging = Path(args[args.index("--staging") + 1])
+job = json.loads(sys.stdin.read())
+data = Path({out_fixture:?}).read_bytes()
+(staging / job["output"]).write_bytes(data)
+sha = hashlib.sha256(data).hexdigest()
+print(json.dumps({{"state": "rendered", "recipe": {{"id": "qwen-image-edit-2511-lightning-4-bf16-streaming", "steps": 4, "size": [1024, 1024], "seed": job["seed"], "lora": job["lora"]}}, "models": {{}}, "output": {{"path": job["output"], "sha256": sha}}}}))
+"#,
+            mode_file = mode_file.to_string_lossy(),
+            vram_used_file = vram_used_file.to_string_lossy(),
+            used_14gib = used_14gib,
+            out_fixture = out_fixture.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    let qwen_cfg = QwenConfig {
+        python: PathBuf::from("python3"),
+        adapter_script: adapter,
+        backend: "rocm".to_owned(),
+        denoiser_dir: dir.clone(),
+        snapshot_dir: dir.clone(),
+        lightning_dir: dir.clone(),
+        gpu_lock_path: gpu_lock,
+        gpu_lock_wait: Duration::from_secs(1),
+        cancel_grace: Duration::from_millis(200),
+        kill_drain_wait: Duration::from_secs(1),
+        vram_release_wait: Duration::from_millis(200),
+        cgroup_parent: None,
+        require_cgroup_containment: false,
+        extra_env: vec![],
+    };
+
+    let runner_lock = dir.join("p2-qwen.lock");
+    let cfg_qwen = RunnerConfig {
+        registry_dir: reg_dir.clone(),
+        runner_lock_path: runner_lock.clone(),
+        runner_lock_wait: Duration::from_secs(2),
+        guard: GuardConfig {
+            meminfo_path: meminfo.clone(),
+            memory_psi_path: psi.clone(),
+            drm_root: drm_dir,
+            backend: Some("rocm".to_owned()),
+            lease_required: true,
+            lease_hook: vec![lease_hook.to_string_lossy().into_owned()],
+            ..GuardConfig::default()
+        },
+        comfy: None,
+        qwen: Some(qwen_cfg),
+    };
+
+    // Normal Qwen run: private `qwen-child-*` dir MUST be removed before returning.
+    let j_ok = dir.join("j-qwen-ok");
+    let req_ok = RunRequest {
+        schema_version: 1,
+        job_id: "p2-qwen-ok".to_owned(),
+        profile_id: "vagrant.qwen-image-edit-2511-lightning-4".to_owned(),
+        revision: "v1".to_owned(),
+        manifest_digest: qwen_digest.clone(),
+        inputs: vec![LocalInput {
+            path: src_path.clone(),
+            sha256: sha256_hex(&src_png),
+        }],
+        parameters: ImageParameters {
+            prompt: "warm light".to_owned(),
+            seed: 4101,
+            steps: Some(4),
+            denoise: None,
+        },
+        output_path: dir.join("p2-out-ok.png"),
+        cancel_path: dir.join("CANCEL-unused"),
+        journal_dir: j_ok.clone(),
+        lease_id: Some("lease-ok".to_owned()),
+        lease_generation: Some(1),
+    };
+    execute_request(&cfg_qwen, &req_ok, rx.clone())
+        .await
+        .expect("normal Qwen run succeeds");
+    let leftover_ok: Vec<_> = fs::read_dir(&j_ok)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("qwen-child-"))
+        .collect();
+    assert!(
+        leftover_ok.is_empty(),
+        "private qwen-child-* staging dir must be removed under runner identity: {leftover_ok:?}"
+    );
+
+    // Real P2-3 & P2-1 transition: trigger live `qwen_drain` quarantine via VRAM depletion.
+    // The single atomic quarantine write MUST include BOTH `pendingLeaseRelease` and `qwenStageDir`,
+    // and MUST NOT call `release` while quarantined.
+    fs::write(&mode_file, "leak").unwrap();
+    fs::write(&hook_log, b"").unwrap();
+    let j_leak = dir.join("j-qwen-leak");
+    let req_leak = RunRequest {
+        job_id: "p2-qwen-quarantine".to_owned(),
+        output_path: dir.join("p2-out-leak.png"),
+        journal_dir: j_leak.clone(),
+        lease_id: Some("lease-prior-q".to_owned()),
+        lease_generation: Some(7),
+        ..req_ok.clone()
+    };
+    assert!(
+        execute_request(&cfg_qwen, &req_leak, rx.clone())
+            .await
+            .is_err()
+    );
+    let q_path = quarantine_path_for_lock(&runner_lock);
+    let q_doc: Value = serde_json::from_slice(&fs::read(&q_path).unwrap()).unwrap();
+    assert_eq!(q_doc["kind"], "qwen_drain");
+    assert_eq!(q_doc["pendingLeaseRelease"]["jobId"], "p2-qwen-quarantine");
+    assert_eq!(q_doc["pendingLeaseRelease"]["leaseId"], "lease-prior-q");
+    let prior_stage = PathBuf::from(q_doc["qwenStageDir"].as_str().unwrap());
+    assert!(prior_stage.exists());
+    let leak_hooks = fs::read_to_string(&hook_log).unwrap();
+    assert!(leak_hooks.lines().any(|l| l.starts_with("acquire ")));
+    assert!(
+        !leak_hooks.lines().any(|l| l.starts_with("release ")),
+        "quarantined job must not release lease immediately: {leak_hooks}"
+    );
+
+    // Restore VRAM, switch adapter to ok, but make `j_leak` read-only (0o500) so removing
+    // `prior_stage` fails -> quarantine MUST stay intact and refuse admission!
+    fs::write(&vram_used_file, format!("{used_9gib}\n")).unwrap();
+    fs::write(&mode_file, "ok").unwrap();
+    fs::set_permissions(&j_leak, fs::Permissions::from_mode(0o500)).unwrap();
+    let req_after_q = RunRequest {
+        job_id: "p2-qwen-after-q".to_owned(),
+        output_path: dir.join("p2-out-after-q.png"),
+        journal_dir: dir.join("j-after-q"),
+        lease_id: Some("lease-next-q".to_owned()),
+        lease_generation: Some(8),
+        ..req_ok
+    };
+    let err_rm = execute_request(&cfg_qwen, &req_after_q, rx.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(err_rm.code, EXIT_GPU_UNAVAILABLE);
+    assert!(
+        q_path.exists(),
+        "failed removal of quarantined Qwen staging dir must retain quarantine marker"
+    );
+
+    // Restore permissions on `j_leak` -> settlement removes `prior_stage`, calls deferred
+    // `release` for `p2-qwen-quarantine`, clears quarantine, and runs `p2-qwen-after-q`.
+    fs::set_permissions(&j_leak, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&hook_log, b"").unwrap();
+    execute_request(&cfg_qwen, &req_after_q, rx.clone())
+        .await
+        .expect(
+            "settling quarantine removes staging dir, releases original lease, and admits next job",
+        );
+    assert!(
+        !prior_stage.exists(),
+        "quarantined qwen stage dir must be removed on settlement"
+    );
+    assert!(!q_path.exists());
+    let hook_lines: Vec<String> = fs::read_to_string(&hook_log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        hook_lines.len() >= 3
+            && hook_lines[0].starts_with("release ")
+            && hook_lines[0].contains("--job-id p2-qwen-quarantine")
+            && hook_lines[0].contains("--lease-id lease-prior-q")
+            && hook_lines[1].starts_with("acquire ")
+            && hook_lines[1].contains("--job-id p2-qwen-after-q"),
+        "expected deferred release of p2-qwen-quarantine before acquire of p2-qwen-after-q, got {hook_lines:?}"
+    );
+
+    // 2. P2-2: Multi-input ComfyUI profile where upload #0 succeeds and upload #1 fails
+    //    MUST clean up upload #0 via the configured cleanup hook before returning Err.
+    let reg2 = dir.join("reg-multi");
+    fs::create_dir_all(&reg2).unwrap();
+    let multi_graph = json!({
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "placeholder"}},
+        "9": {"class_type": "RandomNoise", "inputs": {"noise_seed": 0}},
+        "10": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+        "11": {"class_type": "LoadImage", "inputs": {"image": "b.png"}},
+        "16": {"class_type": "SaveImage", "inputs": {"images": ["15", 0], "filename_prefix": "out"}}
+    });
+    let multi_bytes = serde_json::to_vec(&multi_graph).unwrap();
+    fs::write(reg2.join("multi.json"), &multi_bytes).unwrap();
+    let mut multi_entry = ProfileEntry {
+        id: "vagrant.multi-in".to_owned(),
+        revision: "v1".to_owned(),
+        engine: EngineKind::Comfyui,
+        manifest_digest: String::new(),
+        input_count: 2,
+        lease_required: false,
+        bounds: ParameterBounds {
+            max_prompt_chars: 1024,
+            reject_qwen_tokens: false,
+            width: 1024,
+            height: 1024,
+            steps_min: None,
+            steps_max: None,
+            default_steps: None,
+            denoise_min: None,
+            denoise_max: None,
+            default_denoise: None,
+        },
+        comfy: Some(ComfySpec {
+            graph_file: "multi.json".to_owned(),
+            graph_sha256: sha256_hex(&multi_bytes),
+            prompt_binding: NodeInputRef {
+                node: "5".to_owned(),
+                input: "text".to_owned(),
+            },
+            seed_binding: NodeInputRef {
+                node: "9".to_owned(),
+                input: "noise_seed".to_owned(),
+            },
+            steps_binding: None,
+            denoise_binding: None,
+            input_bindings: vec![
+                NodeInputRef {
+                    node: "10".to_owned(),
+                    input: "image".to_owned(),
+                },
+                NodeInputRef {
+                    node: "11".to_owned(),
+                    input: "image".to_owned(),
+                },
+            ],
+            save_node: "16".to_owned(),
+            expected_cgroup_memory_max_bytes: None,
+        }),
+        qwen: None,
+        models: Default::default(),
+    };
+    let multi_digest = compute_manifest_digest(&multi_entry, Some(&multi_bytes)).unwrap();
+    multi_entry.manifest_digest = multi_digest.clone();
+    fs::write(
+        reg2.join("registry.json"),
+        serde_json::to_vec_pretty(&RegistryDocument {
+            schema_version: 1,
+            profiles: vec![multi_entry],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let uploads = Arc::new(AtomicUsize::new(0));
+    let uploads_srv = uploads.clone();
+    let app = Router::new()
+        .route(
+            "/system_stats",
+            get(|| async { Json(json!({"system": {}})) }),
+        )
+        .route(
+            "/queue",
+            get(|| async { Json(json!({"queue_running": [], "queue_pending": []})) }),
+        )
+        .route(
+            "/upload/image",
+            post(move |_body: Bytes| {
+                let u = uploads_srv.clone();
+                async move {
+                    let n = u.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "name": "infernix-multi-fail-in-0.png",
+                                "subfolder": "",
+                                "type": "input"
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": "boom"})),
+                        )
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let cleanup_flag = dir.join("p2-upload-clean-fail");
+    fs::write(&cleanup_flag, b"fail").unwrap();
+    let cleanup_log = dir.join("p2-upload-clean.log");
+    let cleanup_script = dir.join("p2-upload-clean.sh");
+    fs::write(
+        &cleanup_script,
+        format!(
+            "#!/bin/sh\nif [ -f '{}' ]; then exit 1; fi\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            cleanup_flag.display(),
+            cleanup_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&cleanup_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cfg_multi = RunnerConfig {
+        registry_dir: reg2,
+        runner_lock_path: dir.join("p2-multi.lock"),
+        runner_lock_wait: Duration::from_secs(2),
+        guard: GuardConfig {
+            meminfo_path: meminfo,
+            memory_psi_path: psi,
+            ..GuardConfig::default()
+        },
+        comfy: Some(ComfyConfig {
+            cleanup_command: vec![cleanup_script.to_string_lossy().into_owned()],
+            require_cleanup: true,
+            ..mock_comfy_cfg(format!("http://{addr}"))
+        }),
+        qwen: None,
+    };
+    let j_multi = dir.join("j-multi");
+    let req_multi = RunRequest {
+        schema_version: 1,
+        job_id: "multi-fail".to_owned(),
+        profile_id: "vagrant.multi-in".to_owned(),
+        revision: "v1".to_owned(),
+        manifest_digest: multi_digest,
+        inputs: vec![
+            LocalInput {
+                path: src_path.clone(),
+                sha256: sha256_hex(&src_png),
+            },
+            LocalInput {
+                path: src_path,
+                sha256: sha256_hex(&src_png),
+            },
+        ],
+        parameters: ImageParameters {
+            prompt: "a dual cube".to_owned(),
+            seed: 4101,
+            steps: None,
+            denoise: None,
+        },
+        output_path: dir.join("multi-out.png"),
+        cancel_path: dir.join("CANCEL-unused"),
+        journal_dir: j_multi.clone(),
+        lease_id: None,
+        lease_generation: None,
+    };
+    // Run 1: upload #0 succeeds, upload #1 saves on ComfyUI but response fails (HTTP 500),
+    // AND cleanup helper fails -> journal MUST retain BOTH input #0 and input #1 in `upload_cleanup`.
+    assert!(
+        execute_request(&cfg_multi, &req_multi, rx.clone())
+            .await
+            .is_err()
+    );
+    let j_multi_mid: Value =
+        serde_json::from_slice(&fs::read(j_multi.join("comfy-prompt.json")).unwrap()).unwrap();
+    assert_eq!(j_multi_mid["state"], "upload_cleanup");
+    assert_eq!(
+        j_multi_mid["uploadedInputs"],
+        json!([
+            "infernix-multi-fail-in-0.png",
+            "infernix-multi-fail-in-1.png"
+        ])
+    );
+
+    // Run 2: once cleanup helper recovers, retry deletes BOTH uploaded inputs (including the
+    // saved upload whose response was lost) and marks `rejected`.
+    fs::remove_file(&cleanup_flag).unwrap();
+    let err_retry = execute_request(&cfg_multi, &req_multi, rx.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(err_retry.code, EXIT_INVALID_INPUT);
+    let cleaned_up = fs::read_to_string(&cleanup_log).unwrap();
+    assert!(
+        cleaned_up.contains("--input infernix-multi-fail-in-0.png")
+            && cleaned_up.contains("--input infernix-multi-fail-in-1.png"),
+        "both earlier and response-lost uploads must be cleaned up on retry: {cleaned_up}"
+    );
+    let j_multi_after: Value =
+        serde_json::from_slice(&fs::read(j_multi.join("comfy-prompt.json")).unwrap()).unwrap();
+    assert_eq!(j_multi_after["state"], "rejected");
+
+    // 3a. Delayed write + death-before-cleanup ordering + terminal transition:
+    //     POST /upload/image times out while ComfyUI invocation `inv-1` is active;
+    //     Run 1 keeps `uploading` bound to `inv-1`.
+    //     Run 2 simulates the Finding-1 race: during cleanup (after unlink), ComfyUI
+    //     writes a delayed file and immediately exits (`inactive`). Because death is
+    //     checked BEFORE cleanup, Run 2 MUST keep `uploading` pending.
+    //     Run 3 observes `inactive` BEFORE cleanup, deletes the delayed file via the
+    //     cleanup socket, and only then transitions the journal to terminal `rejected`.
+    let fake_systemctl = dir.join("fake-systemctl.sh");
+    let unit_state_file = dir.join("unit-state.env");
+    fs::write(&unit_state_file, "INV=inv-1\nSTATE=active\n").unwrap();
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\n. {}\nif [ \"$3\" = \"-p\" ]; then\n  case \"$4\" in\n    InvocationID) printf '%s\\n' \"$INV\" ;;\n    ActiveState) printf '%s\\n' \"$STATE\" ;;\n  esac\nfi\n",
+            unit_state_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let delayed_in_dir = dir.join("delayed-comfy-in");
+    let delayed_out_dir = dir.join("delayed-comfy-out");
+    fs::create_dir_all(&delayed_in_dir).unwrap();
+    fs::create_dir_all(&delayed_out_dir).unwrap();
+    let delayed_sock = dir.join("delayed-clean.sock");
+    let (dstop_tx, dstop_rx) = watch::channel(false);
+    let dsock_c = delayed_sock.clone();
+    let din_c = delayed_in_dir.clone();
+    let dout_c = delayed_out_dir.clone();
+    let dserver = tokio::spawn(async move {
+        let _ = serve_comfy_cleanup_socket(&dsock_c, &din_c, &dout_c, dstop_rx).await;
+    });
+    for _ in 0..40 {
+        if delayed_sock.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let slow_app = Router::new()
+        .route(
+            "/system_stats",
+            get(|| async { Json(json!({"system": {}})) }),
+        )
+        .route(
+            "/queue",
+            get(|| async { Json(json!({"queue_running": [], "queue_pending": []})) }),
+        )
+        .route(
+            "/upload/image",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                StatusCode::OK
+            }),
+        );
+    let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow_addr = slow_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(slow_listener, slow_app).await;
+    });
+
+    let cfg_delayed = RunnerConfig {
+        comfy: Some(ComfyConfig {
+            unit_name: Some("comfyui-test.service".to_owned()),
+            systemctl_bin: Some(fake_systemctl.clone()),
+            submit_timeout: Duration::from_millis(150),
+            cleanup_socket: Some(delayed_sock.clone()),
+            cleanup_command: vec![],
+            require_cleanup: true,
+            ..mock_comfy_cfg(format!("http://{slow_addr}"))
+        }),
+        ..cfg_multi.clone()
+    };
+    let j_delayed = dir.join("j-delayed");
+    let req_delayed = RunRequest {
+        job_id: "delayed-up".to_owned(),
+        output_path: dir.join("delayed-out.png"),
+        journal_dir: j_delayed.clone(),
+        ..req_multi.clone()
+    };
+
+    // Run 1: upload #0 times out on `inv-1`; journal stays `uploading` bound to `inv-1`.
+    assert!(
+        execute_request(&cfg_delayed, &req_delayed, rx.clone())
+            .await
+            .is_err()
+    );
+    let j_del_1: Value =
+        serde_json::from_slice(&fs::read(j_delayed.join("comfy-prompt.json")).unwrap()).unwrap();
+    assert_eq!(j_del_1["state"], "uploading");
+    assert_eq!(j_del_1["serviceInvocationId"], "inv-1");
+    assert_eq!(
+        j_del_1["uploadedInputs"],
+        json!(["infernix-delayed-up-in-0.png"])
+    );
+
+    // Run 2 (race): cleanup hook runs while `inv-1` was active before cleanup, then a
+    // delayed write lands AFTER the unlink AND `inv-1` exits before the call returns.
+    // Because death is checked BEFORE cleanup, journal MUST stay `uploading` (NOT `rejected`).
+    let delayed_file = delayed_in_dir.join("infernix-delayed-up-in-0.png");
+    let race_cleanup = dir.join("race-cleanup.sh");
+    fs::write(
+        &race_cleanup,
+        format!(
+            "#!/bin/sh\nrm -f {}\nprintf 'late-after-unlink' > {}\nprintf 'INV=inv-1\\nSTATE=inactive\\n' > {}\nexit 0\n",
+            delayed_file.display(),
+            delayed_file.display(),
+            unit_state_file.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&race_cleanup, fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg_delayed_race = RunnerConfig {
+        comfy: Some(ComfyConfig {
+            cleanup_socket: None,
+            cleanup_command: vec![race_cleanup.to_string_lossy().into_owned()],
+            ..cfg_delayed.comfy.clone().unwrap()
+        }),
+        ..cfg_delayed.clone()
+    };
+    assert!(
+        execute_request(&cfg_delayed_race, &req_delayed, rx.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        delayed_file.exists(),
+        "simulated late write after unlink must still be on disk for post-death retry"
+    );
+    let j_del_2: Value =
+        serde_json::from_slice(&fs::read(j_delayed.join("comfy-prompt.json")).unwrap()).unwrap();
+    assert_eq!(
+        j_del_2["state"], "uploading",
+        "must not mark rejected when unit died only after cleanup started"
+    );
+
+    // Run 3 (post-death): `inv-1` is now observed `inactive` BEFORE cleanup runs; the
+    // cleanup socket deletes the late file and ONLY THEN marks the journal `rejected`.
+    let err_del_3 = execute_request(&cfg_delayed, &req_delayed, rx.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(err_del_3.code, EXIT_INVALID_INPUT);
+    assert!(
+        !delayed_file.exists(),
+        "post-death cleanup retry must delete the delayed file before marking rejected"
+    );
+    let j_del_3: Value =
+        serde_json::from_slice(&fs::read(j_delayed.join("comfy-prompt.json")).unwrap()).unwrap();
+    assert_eq!(j_del_3["state"], "rejected");
+
+    // 3b. ComfyUI restarts to a replacement invocation before/during POST /upload/image:
+    //     `inv-old` was captured before `/queue`, then ComfyUI restarts to `inv-replacement`
+    //     which accepts the upload and times out. Because the receiving invocation cannot be
+    //     established as `inv-old`, rollback MUST leave `serviceInvocationId` unset and keep
+    //     `uploading` pending while `inv-replacement` is active, finalizing `rejected` only
+    //     after the unit is confirmed `inactive` and post-death cleanup deletes the file.
+    let restart_state_file = dir.join("restart-unit-state.env");
+    fs::write(&restart_state_file, "INV=inv-old\nSTATE=active\n").unwrap();
+    let restart_systemctl = dir.join("restart-systemctl.sh");
+    fs::write(
+        &restart_systemctl,
+        format!(
+            "#!/bin/sh\n. {}\nif [ \"$3\" = \"-p\" ]; then\n  case \"$4\" in\n    InvocationID) printf '%s\\n' \"$INV\" ;;\n    ActiveState) printf '%s\\n' \"$STATE\" ;;\n  esac\nfi\n",
+            restart_state_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&restart_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let restart_state_c = restart_state_file.clone();
+    let restart_app = Router::new()
+        .route(
+            "/system_stats",
+            get(|| async { Json(json!({"system": {}})) }),
+        )
+        .route(
+            "/queue",
+            get(|| async { Json(json!({"queue_running": [], "queue_pending": []})) }),
+        )
+        .route(
+            "/upload/image",
+            post(move || {
+                let st = restart_state_c.clone();
+                async move {
+                    let _ = fs::write(&st, "INV=inv-replacement\nSTATE=active\n");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    StatusCode::OK
+                }
+            }),
+        );
+    let restart_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let restart_addr = restart_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(restart_listener, restart_app).await;
+    });
+
+    let cfg_restart = RunnerConfig {
+        comfy: Some(ComfyConfig {
+            unit_name: Some("comfyui-restart.service".to_owned()),
+            systemctl_bin: Some(restart_systemctl),
+            submit_timeout: Duration::from_millis(150),
+            cleanup_socket: Some(delayed_sock),
+            cleanup_command: vec![],
+            require_cleanup: true,
+            ..mock_comfy_cfg(format!("http://{restart_addr}"))
+        }),
+        ..cfg_multi
+    };
+    let j_restart = dir.join("j-restart");
+    let req_restart = RunRequest {
+        job_id: "restart-up".to_owned(),
+        output_path: dir.join("restart-out.png"),
+        journal_dir: j_restart.clone(),
+        ..req_multi
+    };
+
+    // Run 1: replacement invocation accepts upload and times out -> MUST NOT mark rejected
+    // even though `inv-old` is gone; `serviceInvocationId` stays null in `uploading`.
+    assert!(
+        execute_request(&cfg_restart, &req_restart, rx.clone())
+            .await
+            .is_err()
+    );
+    let j_res_1: Value =
+        serde_json::from_slice(&fs::read(j_restart.join("comfy-prompt.json")).unwrap()).unwrap();
+    assert_eq!(j_res_1["state"], "uploading");
+    assert!(
+        j_res_1["serviceInvocationId"].is_null(),
+        "restart before/during upload must leave serviceInvocationId unbound: {j_res_1}"
+    );
+
+    // Replacement writes the delayed file while still active; Run 2 cleans it up and
+    // keeps `uploading` pending because `inv-replacement` is still active.
+    let restart_file = delayed_in_dir.join("infernix-restart-up-in-0.png");
+    fs::write(&restart_file, b"replacement-late-input").unwrap();
+    assert!(
+        execute_request(&cfg_restart, &req_restart, rx.clone())
+            .await
+            .is_err()
+    );
+    assert!(!restart_file.exists());
+    let j_res_2: Value =
+        serde_json::from_slice(&fs::read(j_restart.join("comfy-prompt.json")).unwrap()).unwrap();
+    assert_eq!(j_res_2["state"], "uploading");
+
+    // Replacement writes again and then stops (`inactive`); Run 3 confirms death first,
+    // deletes the file, and transitions to terminal `rejected`.
+    fs::write(&restart_file, b"replacement-final-input").unwrap();
+    fs::write(&restart_state_file, "INV=inv-replacement\nSTATE=inactive\n").unwrap();
+    let err_res_3 = execute_request(&cfg_restart, &req_restart, rx)
+        .await
+        .unwrap_err();
+    assert_eq!(err_res_3.code, EXIT_INVALID_INPUT);
+    assert!(!restart_file.exists());
+    let j_res_3: Value =
+        serde_json::from_slice(&fs::read(j_restart.join("comfy-prompt.json")).unwrap()).unwrap();
+    assert_eq!(j_res_3["state"], "rejected");
+
+    let _ = dstop_tx.send(true);
+    let _ = dserver.await;
+}
+
+#[tokio::test]
+async fn codex_p2_pr39_comfy_unloads_before_vram_check_and_preserves_invocation_change_retry() {
+    let dir = temp_dir("codex-p2-pr39");
+    let (meminfo, psi) = write_host_fixtures(&dir, 50, 0.1);
+    let (reg_dir, _, vary_digest, _) = write_registry(&dir, false, None);
+    let (_tx, rx) = watch::channel(false);
+
+    // Mock ROCm VRAM starting at 4 GiB free (below 18 GiB floor); mock llama-swap /unload
+    // lowers used VRAM to 2 GiB (22 GiB free), proving unload runs BEFORE VRAM admission.
+    let drm_dir = dir.join("drm");
+    let card_dev = drm_dir.join("card0/device");
+    fs::create_dir_all(&card_dev).unwrap();
+    let vram_total = 24u64 * 1024 * 1024 * 1024;
+    let vram_used_high = 20u64 * 1024 * 1024 * 1024;
+    let vram_used_low = 2u64 * 1024 * 1024 * 1024;
+    let vram_used_file = card_dev.join("mem_info_vram_used");
+    fs::write(
+        card_dev.join("mem_info_vram_total"),
+        format!("{vram_total}\n"),
+    )
+    .unwrap();
+    fs::write(&vram_used_file, format!("{vram_used_high}\n")).unwrap();
+
+    let unload_calls = Arc::new(AtomicUsize::new(0));
+    let unload_calls_c = unload_calls.clone();
+    let vram_used_c = vram_used_file.clone();
+    let llama_app = Router::new().route(
+        "/unload",
+        post(move || {
+            let calls = unload_calls_c.clone();
+            let used = vram_used_c.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let _ = fs::write(&used, format!("{vram_used_low}\n"));
+                StatusCode::OK
+            }
+        }),
+    );
+    let llama_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let llama_addr = llama_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(llama_listener, llama_app).await;
+    });
+
+    // Fake systemctl starting at inv-1; first /upload/image flips to inv-2 before /prompt.
+    let unit_state = dir.join("unit.env");
+    fs::write(&unit_state, "INV=inv-1\nSTATE=active\n").unwrap();
+    let fake_systemctl = dir.join("fake-systemctl.sh");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\n. {}\nif [ \"$3\" = \"-p\" ]; then\n  case \"$4\" in\n    InvocationID) printf '%s\\n' \"$INV\" ;;\n    ActiveState) printf '%s\\n' \"$STATE\" ;;\n  esac\nfi\n",
+            unit_state.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let comfy_in_dir = dir.join("comfy-in");
+    let comfy_out_dir = dir.join("comfy-out");
+    fs::create_dir_all(&comfy_in_dir).unwrap();
+    fs::create_dir_all(&comfy_out_dir).unwrap();
+    let clean_sock = dir.join("clean.sock");
+    let (cstop_tx, cstop_rx) = watch::channel(false);
+    let csock_c = clean_sock.clone();
+    let cin_c = comfy_in_dir.clone();
+    let cout_c = comfy_out_dir.clone();
+    let cserver = tokio::spawn(async move {
+        let _ = serve_comfy_cleanup_socket(&csock_c, &cin_c, &cout_c, cstop_rx).await;
+    });
+    for _ in 0..40 {
+        if clean_sock.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let out_png = encode_test_png(1024, 1024, &[]);
+    let out_png_c = out_png.clone();
+    let upload_calls = Arc::new(AtomicUsize::new(0));
+    let upload_calls_c = upload_calls.clone();
+    let unit_state_c = unit_state.clone();
+    let comfy_in_c = comfy_in_dir.clone();
+    let prompt_calls = Arc::new(AtomicUsize::new(0));
+    let prompt_calls_c = prompt_calls.clone();
+    let comfy_app = Router::new()
+        .route(
+            "/system_stats",
+            get(|| async { Json(json!({"system": {}})) }),
+        )
+        .route(
+            "/queue",
+            get(|| async { Json(json!({"queue_running": [], "queue_pending": []})) }),
+        )
+        .route(
+            "/upload/image",
+            post(move || {
+                let n = upload_calls_c.fetch_add(1, Ordering::SeqCst);
+                let st = unit_state_c.clone();
+                let in_dir = comfy_in_c.clone();
+                async move {
+                    let fname = "infernix-pr39-retry-in-0.png";
+                    let _ = fs::write(in_dir.join(fname), b"uploaded-input");
+                    if n == 0 {
+                        // Simulate ComfyUI invocation restart after upload and before /prompt.
+                        let _ = fs::write(&st, "INV=inv-2\nSTATE=active\n");
+                    }
+                    Json(json!({"name": fname, "subfolder": ""}))
+                }
+            }),
+        )
+        .route(
+            "/prompt",
+            post(move || {
+                prompt_calls_c.fetch_add(1, Ordering::SeqCst);
+                async { Json(json!({"prompt_id": "pid-pr39-retry"})) }
+            }),
+        )
+        .route(
+            "/history/pid-pr39-retry",
+            get(|| async {
+                Json(json!({
+                    "pid-pr39-retry": {
+                        "status": {"completed": true},
+                        "outputs": {
+                            "16": {"images": [{"filename": "infernix-pr39-out.png", "subfolder": "", "type": "output"}]}
+                        }
+                    }
+                }))
+            }),
+        )
+        .route("/history", post(|| async { StatusCode::OK }))
+        .route(
+            "/view",
+            get(move || {
+                let bytes = out_png_c.clone();
+                async move { bytes }
+            }),
+        );
+    let comfy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let comfy_addr = comfy_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(comfy_listener, comfy_app).await;
+    });
+
+    let cfg = RunnerConfig {
+        registry_dir: reg_dir,
+        runner_lock_path: dir.join("runner.lock"),
+        guard: GuardConfig {
+            meminfo_path: meminfo,
+            memory_psi_path: psi,
+            drm_root: drm_dir,
+            backend: Some("rocm".to_owned()),
+            vram_floor_mib: Some(18 * 1024),
+            vram_override_mib: None,
+            llama_swap_url: Some(format!("http://{llama_addr}")),
+            ..GuardConfig::default()
+        },
+        comfy: Some(ComfyConfig {
+            unit_name: Some("comfyui-pr39.service".to_owned()),
+            systemctl_bin: Some(fake_systemctl),
+            cleanup_socket: Some(clean_sock),
+            cleanup_command: vec![],
+            require_cleanup: true,
+            ..mock_comfy_cfg(format!("http://{comfy_addr}"))
+        }),
+        qwen: None,
+        runner_lock_wait: Duration::from_secs(2),
+    };
+
+    let inp_bytes = encode_test_png(64, 64, &[]);
+    let inp_sha = sha256_hex(&inp_bytes);
+    let inp_path = dir.join("inp.png");
+    fs::write(&inp_path, &inp_bytes).unwrap();
+    let journal_dir = dir.join("j-pr39");
+    let out_path = dir.join("pr39-out.png");
+    let req = RunRequest {
+        schema_version: 1,
+        job_id: "pr39-retry".to_owned(),
+        profile_id: "vagrant.z-image-turbo-vary".to_owned(),
+        revision: "v1".to_owned(),
+        manifest_digest: vary_digest,
+        inputs: vec![LocalInput {
+            path: inp_path,
+            sha256: inp_sha,
+        }],
+        parameters: ImageParameters {
+            prompt: "synthetic studio test".to_owned(),
+            seed: 42,
+            steps: None,
+            denoise: Some(0.55),
+        },
+        output_path: out_path.clone(),
+        cancel_path: dir.join("cancel"),
+        journal_dir: journal_dir.clone(),
+        lease_id: None,
+        lease_generation: None,
+    };
+
+    // Attempt 1: /unload frees VRAM before check_vram_admission, upload #0 succeeds, then
+    // invocation flips inv-1 -> inv-2 before /prompt -> returns EXIT_RESOURCE_BUSY (10),
+    // cleans up uploaded file, and removes comfy-prompt.json so retry stays runnable.
+    let err1 = execute_request(&cfg, &req, rx.clone()).await.unwrap_err();
+    assert_eq!(err1.code, EXIT_RESOURCE_BUSY);
+    assert_eq!(
+        unload_calls.load(Ordering::SeqCst),
+        1,
+        "ComfyUI must unload llama-swap before checking free VRAM"
+    );
+    assert_eq!(prompt_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !comfy_in_dir.join("infernix-pr39-retry-in-0.png").exists(),
+        "uploaded input must be cleaned up on pre-submit invocation change"
+    );
+    assert!(
+        !journal_dir.join("comfy-prompt.json").exists(),
+        "pre-submit invocation-change rollback must clear journal instead of marking rejected"
+    );
+
+    // Attempt 2 on the SAME journal_dir (workerd busy-release retry): succeeds end-to-end!
+    let receipt = execute_request(&cfg, &req, rx).await.unwrap();
+    assert_eq!(receipt.engine, EngineKind::Comfyui);
+    assert_eq!(prompt_calls.load(Ordering::SeqCst), 1);
+    assert!(out_path.exists());
+
+    let _ = cstop_tx.send(true);
+    let _ = cserver.await;
 }

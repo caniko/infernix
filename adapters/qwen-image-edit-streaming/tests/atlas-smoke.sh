@@ -198,7 +198,7 @@ case "$role" in
                 exit 75
             fi
             if ! idle || ! owned_lock; then
-                printf 'TRIP competing GPU user or missing shared lock\n' >&2
+                printf 'TRIP competing GPU user or missing exclusive lock\n' >&2
                 exit 75
             fi
             if [[ -s worker-status ]]; then

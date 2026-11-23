@@ -60,6 +60,18 @@ pub struct ValidatedResult {
     pub artifacts: Vec<ValidatedArtifact>,
 }
 
+/// Metadata recorded on a completed pack-output job for restart delivery recovery.
+///
+/// Never stores `hubUrl` or `tokenFileEnv`: restart recovery resolves both from
+/// the worker's current trusted configuration so DB state cannot override policy.
+pub struct PackDeliveryMeta<'a> {
+    pub pack: &'a str,
+    pub pack_job_id: &'a str,
+    pub lease_token: &'a str,
+    pub worker_id: &'a str,
+    pub attempt: u32,
+}
+
 impl ValidatedResult {
     /// Attach the hub coordinates the restart delivery pass needs.
     pub fn with_delivery(mut self, hub_url: &str, generation_request_id: &str) -> Self {
@@ -67,8 +79,27 @@ impl ValidatedResult {
             object.insert(
                 "delivery".to_owned(),
                 serde_json::json!({
+                    "mode": "generations",
                     "hubUrl": hub_url,
                     "generationRequestId": generation_request_id,
+                }),
+            );
+        }
+        self
+    }
+
+    /// Attach pack-scoped output delivery coordinates (no secrets or URLs stored).
+    pub fn with_pack_delivery(mut self, meta: PackDeliveryMeta<'_>) -> Self {
+        if let Some(object) = self.value.as_object_mut() {
+            object.insert(
+                "delivery".to_owned(),
+                serde_json::json!({
+                    "mode": "pack_output",
+                    "pack": meta.pack,
+                    "packJobId": meta.pack_job_id,
+                    "leaseToken": meta.lease_token,
+                    "workerId": meta.worker_id,
+                    "attempt": meta.attempt,
                 }),
             );
         }

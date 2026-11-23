@@ -7,9 +7,12 @@
 let
   inherit (lib) mkEnableOption mkIf mkOption types;
   cfg = config.services.infernix.workloadFabric;
+  imageRunnerCfg = config.services.infernix.imageRunner;
   gpuGateCfg = config.services.infernix.gpuGate;
   gpuGate = import ../../lib/gpu-gate.nix {inherit lib pkgs;};
   workerUser = "infernix-worker";
+  imageRunnerUser = "infernix-image-runner";
+  handoffGroup = "infernix-image-handoff";
 
   adapterSubmodule = types.submodule {
     options = {
@@ -39,6 +42,42 @@ let
         description = ''
           Validate the adapter's result manifest and deliver its artifacts.
           Set for adapters that print envelope-v2 artifacts.
+        '';
+      };
+
+      deliveryMode = mkOption {
+        type = types.enum [ "generations" "pack_output" ];
+        default = "generations";
+        description = ''
+          Artifact delivery route: generic `/v1/generations/{id}/artifacts`
+          (`generations`) or pack-scoped `PUT /v1/p/{pack}/worker/jobs/{id}/output`
+          (`pack_output`).
+        '';
+      };
+
+      deliveryPack = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Pack name when deliveryMode is `pack_output` (e.g. `vagrant`).";
+      };
+
+      tokenFile = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        description = ''
+          Separate worker credential file loaded as a dedicated systemd
+          credential for this adapter (required when deliveryMode is
+          `pack_output` so pack tokens never mix with the generic procedure token).
+        '';
+      };
+
+      preemptRequeue = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Whether admission preemption returns a running job to `pending`
+          without spending an attempt. Set `false` for non-idempotent
+          post-submit adapters (`max_attempts = 1`).
         '';
       };
 
@@ -283,6 +322,18 @@ let
     };
   };
 
+  adapterTokenEnv = name:
+    "INFERNIX_ADAPTER_TOKEN_FILE_${lib.toUpper (lib.replaceStrings [ "-" "." ] [ "_" "_" ] name)}";
+
+  adapterTokenCredential = name: "infernix-adapter-token-${name}";
+
+  adaptersWithToken = lib.filterAttrs (_: adapter: adapter.tokenFile != null) cfg.adapters;
+
+  validAdapterName = name: builtins.match "^[a-z0-9][a-z0-9_-]*$" name != null;
+
+  generatedTokenEnvs = map adapterTokenEnv (builtins.attrNames adaptersWithToken);
+  generatedTokenCredentials = map adapterTokenCredential (builtins.attrNames adaptersWithToken);
+
   configFile = (pkgs.formats.toml { }).generate "infernix-workerd.toml" ({
     database_url_env = cfg.databaseUrlEnv;
     profiles = lib.mapAttrsToList renderProfile cfg.profiles;
@@ -296,6 +347,8 @@ let
       staging_root = toString cfg.stagingRoot;
     } // lib.optionalAttrs (cfg.bootId != null) {
       boot_id = cfg.bootId;
+    } // lib.optionalAttrs (cfg.hubUrl != null) {
+      hub_url = cfg.hubUrl;
     } // lib.optionalAttrs (cfg.gpuDevice != null) {
       gpu_device = cfg.gpuDevice;
     } // lib.optionalAttrs (cfg.admission != null) {
@@ -307,7 +360,7 @@ let
       };
     };
     adapters = lib.mapAttrsToList
-      (_name: adapter: {
+      (name: adapter: {
         workload = adapter.workload;
         queues = adapter.queues;
         profiles = adapter.profiles;
@@ -317,6 +370,14 @@ let
         environment = adapter.environment;
       } // lib.optionalAttrs (adapter.workingDirectory != null) {
         working_directory = toString adapter.workingDirectory;
+      } // lib.optionalAttrs (adapter.deliveryMode != "generations") {
+        delivery_mode = adapter.deliveryMode;
+      } // lib.optionalAttrs (adapter.deliveryPack != null) {
+        delivery_pack = adapter.deliveryPack;
+      } // lib.optionalAttrs (adapter.tokenFile != null) {
+        hub_token_file_env = adapterTokenEnv name;
+      } // lib.optionalAttrs (!adapter.preemptRequeue) {
+        preempt_requeue = false;
       })
       cfg.adapters;
   });
@@ -430,10 +491,22 @@ in
       '';
     };
 
+    memoryHigh = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Optional MemoryHigh for the worker unit.";
+    };
+
     memoryMax = mkOption {
       type = types.str;
       default = "24G";
       description = "MemoryMax for the worker unit: the adapter process tree is killed at this ceiling, not the host.";
+    };
+
+    memorySwapMax = mkOption {
+      type = types.str;
+      default = "0";
+      description = "MemorySwapMax for the worker unit (defaults to 0 so adapters never thrash swap).";
     };
 
     cpuQuota = mkOption {
@@ -446,6 +519,17 @@ in
       type = types.ints.positive;
       default = 8192;
       description = "TasksMax for the worker unit.";
+    };
+
+    hubUrl = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Trusted Hub base origin (`http(s)://host[:port]`) used for pack-scoped
+        input downloads and output uploads. Required when any adapter uses
+        `deliveryMode = "pack_output"` so job payloads can never redirect
+        worker credentials or private pixels to attacker-controlled origins.
+      '';
     };
 
     hubTokenFile = mkOption {
@@ -513,7 +597,192 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
+  options.services.infernix.imageRunner = {
+    enable = mkEnableOption "the isolated, credential-free Infernix host-local image runner service";
+
+    package = mkOption {
+      type = types.package;
+      default = infernixSelf.packages.${pkgs.stdenv.hostPlatform.system}.infernix-image-run;
+      defaultText = lib.literalExpression "inputs.infernix.packages.<system>.infernix-image-run";
+      description = "Package providing the credential-free `infernix-image-run` binary.";
+    };
+
+    socketPath = mkOption {
+      type = types.str;
+      default = "/run/infernix-image-runner/runner.sock";
+      description = "Unix socket where the isolated image runner accepts local requests.";
+    };
+
+    lockPath = mkOption {
+      type = types.str;
+      default = "/run/infernix-image-runner/image-runner.lock";
+      description = "Host-local serial runner mutex lock path.";
+    };
+
+    registryDir = mkOption {
+      type = types.path;
+      description = "Immutable directory containing `registry.json` and registered graph templates.";
+    };
+
+    stagingRoot = mkOption {
+      type = types.path;
+      default = cfg.stagingRoot;
+      defaultText = lib.literalExpression "config.services.infernix.workloadFabric.stagingRoot";
+      description = "Shared staging root accessible via the dedicated handoff group.";
+    };
+
+    modelDirectories = mkOption {
+      type = types.listOf types.path;
+      default = [ ];
+      description = "Read-only provisioned model directories accessible to the image runner.";
+    };
+
+    comfyUrl = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Loopback ComfyUI base URL.";
+    };
+
+    comfyUnit = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Systemd unit name for ComfyUI cgroup/invocation/--disable-metadata checks.";
+    };
+
+    comfyCleanupSocket = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Authorized ComfyUI-identity cleanup Unix socket path.";
+    };
+
+    comfyCleanupCommand = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = "Optional ownership-scoped cleanup command for ComfyUI input/output files.";
+    };
+
+    comfyRequireCleanup = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Require an authorized ComfyUI file cleanup route when ComfyUI is configured.";
+    };
+
+    llamaSwapUrl = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Optional llama-swap loopback URL for best-effort unload before GPU use.";
+    };
+
+    gpuLockPath = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = "Exclusive per-device GPU lock path used by Qwen streaming.";
+    };
+
+    backend = mkOption {
+      type = types.nullOr (types.enum [ "rocm" "cuda" ]);
+      default = null;
+      description = "GPU backend (`rocm` or `cuda`) for VRAM checks and Qwen execution.";
+    };
+
+    vramFloorMib = mkOption {
+      type = types.nullOr types.ints.positive;
+      default = null;
+      description = "Free VRAM admission floor in MiB.";
+    };
+
+    memAdmitGib = mkOption {
+      type = types.ints.positive;
+      default = 40;
+      description = "Minimum host MemAvailable (GiB) to admit a job.";
+    };
+
+    memTripGib = mkOption {
+      type = types.ints.positive;
+      default = 16;
+      description = "Minimum host MemAvailable (GiB) while running before watchdog trips.";
+    };
+
+    psiAdmitAvg10 = mkOption {
+      type = types.float;
+      default = 5.0;
+      description = "Maximum full memory PSI avg10 (%) to admit a job.";
+    };
+
+    psiTripAvg10 = mkOption {
+      type = types.float;
+      default = 10.0;
+      description = "Maximum full memory PSI avg10 (%) while running before watchdog trips.";
+    };
+
+    admissionCommand = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = "Optional host admission probe command.";
+    };
+
+    leaseHook = mkOption {
+      type = types.listOf types.str;
+      default = [ ];
+      description = "Optional local acquire/recheck/release lease hook command.";
+    };
+
+    leaseRequired = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Fail closed unless a local lease hook is configured and admits the job.";
+    };
+
+    qwen = mkOption {
+      type = types.nullOr (types.submodule {
+        options = {
+          python = mkOption {
+            type = types.path;
+            description = "Packaged Qwen adapter Python executable.";
+          };
+          adapterScript = mkOption {
+            type = types.path;
+            description = "Packaged Qwen adapter.py path.";
+          };
+          denoiserDir = mkOption {
+            type = types.path;
+            description = "Provisioned Qwen denoiser directory.";
+          };
+          snapshotDir = mkOption {
+            type = types.path;
+            description = "Provisioned Qwen snapshot directory.";
+          };
+          lightningDir = mkOption {
+            type = types.path;
+            description = "Provisioned Qwen Lightning LoRA directory.";
+          };
+        };
+      });
+      default = null;
+      description = "Optional Qwen Image Edit 2511 streaming adapter configuration.";
+    };
+
+    memoryHigh = mkOption {
+      type = types.str;
+      default = "25G";
+      description = "MemoryHigh for the runner unit (Qwen children get per-profile 24G sibling cgroups).";
+    };
+
+    memoryMax = mkOption {
+      type = types.str;
+      default = "26G";
+      description = "MemoryMax for the runner unit (Qwen children get per-profile 24G sibling cgroups).";
+    };
+
+    memorySwapMax = mkOption {
+      type = types.str;
+      default = "0";
+      description = "MemorySwapMax for the runner unit.";
+    };
+  };
+
+  config = lib.mkMerge [
+  (mkIf cfg.enable {
     assertions = [
       {
         assertion = cfg.databaseUrlFile != null || cfg.databaseUrl != null;
@@ -533,7 +802,21 @@ in
           || cfg.heartbeatIntervalSecs + cfg.admission.timeoutSecs < cfg.leaseDurationSecs;
         message = "services.infernix.workloadFabric.heartbeatIntervalSecs + admission.timeoutSecs must be less than leaseDurationSecs: the probe runs beside the heartbeat, so one probe must fit inside the lease.";
       }
+      {
+        assertion = lib.length (lib.unique generatedTokenEnvs) == lib.length generatedTokenEnvs;
+        message = "services.infernix.workloadFabric.adapters: generated adapter token environment variable names collide (e.g. hyphen vs underscore).";
+      }
+      {
+        assertion = lib.length (lib.unique generatedTokenCredentials) == lib.length generatedTokenCredentials;
+        message = "services.infernix.workloadFabric.adapters: generated systemd credential names collide.";
+      }
     ]
+    ++ lib.mapAttrsToList
+      (name: _: {
+        assertion = validAdapterName name;
+        message = "services.infernix.workloadFabric.adapters.${name}: adapter name must match ^[a-z0-9][a-z0-9_-]*$.";
+      })
+      cfg.adapters
     ++ lib.mapAttrsToList
       (name: adapter: {
         assertion = adapter.queues != [ ];
@@ -544,6 +827,18 @@ in
       (name: adapter: {
         assertion = adapter.profiles != [ ];
         message = "services.infernix.workloadFabric.adapters.${name}.profiles must not be empty: a job's profile:<id> requirement selects the adapter.";
+      })
+      cfg.adapters
+    ++ lib.mapAttrsToList
+      (name: adapter: {
+        assertion = adapter.deliveryMode != "pack_output" || (adapter.artifacts && adapter.deliveryPack != null && adapter.tokenFile != null && cfg.hubUrl != null);
+        message = "services.infernix.workloadFabric.adapters.${name}: deliveryMode = pack_output requires artifacts = true, deliveryPack, a separate tokenFile, and services.infernix.workloadFabric.hubUrl.";
+      })
+      cfg.adapters
+    ++ lib.mapAttrsToList
+      (name: adapter: {
+        assertion = adapter.deliveryMode != "pack_output" || (cfg.hubTokenFile == null || toString adapter.tokenFile != toString cfg.hubTokenFile);
+        message = "services.infernix.workloadFabric.adapters.${name}: pack_output tokenFile must be distinct from services.infernix.workloadFabric.hubTokenFile.";
       })
       cfg.adapters
     ++ lib.concatLists (lib.mapAttrsToList
@@ -580,19 +875,22 @@ in
       cfg.profiles);
 
     users.groups.${workerUser} = { };
+    users.groups.${handoffGroup} = lib.mkIf imageRunnerCfg.enable { };
 
     users.users.${workerUser} = {
       isSystemUser = true;
       group = workerUser;
       # The render group owns the DRM nodes; video owns the encoder devices.
-      extraGroups = [ "render" "video" ];
+      extraGroups = [ "render" "video" ] ++ lib.optional imageRunnerCfg.enable handoffGroup;
       home = "/var/lib/infernix-workload";
       description = "Infernix workload adapter user";
     };
 
     systemd.tmpfiles.rules = lib.unique (
       [
-        "d ${toString cfg.stagingRoot} 0750 ${workerUser} ${workerUser} -"
+        (if imageRunnerCfg.enable
+          then "d ${toString cfg.stagingRoot} 2770 ${workerUser} ${handoffGroup} -"
+          else "d ${toString cfg.stagingRoot} 0750 ${workerUser} ${workerUser} -")
         "d ${toString cfg.cacheRoot} 0750 ${workerUser} ${workerUser} -"
       ]
       ++ lib.optional gpuGateCfg.enable (gpuGate.tmpfilesRule gpuGateCfg.device)
@@ -620,8 +918,10 @@ in
     systemd.services.infernix-workerd = {
       description = "Infernix durable workload worker";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" "infernix-workload-migrate.service" ];
-      wants = [ "network-online.target" ];
+      after = [ "network-online.target" "infernix-workload-migrate.service" ]
+        ++ lib.optional imageRunnerCfg.enable "infernix-image-runner.service";
+      wants = [ "network-online.target" ]
+        ++ lib.optional imageRunnerCfg.enable "infernix-image-runner.service";
       requires = [ "infernix-workload-migrate.service" ];
       serviceConfig = {
         ExecStart = "${workerExec} --config ${configFile} worker";
@@ -631,14 +931,22 @@ in
         Environment = databaseEnvironment
           ++ lib.optional (cfg.hubTokenFile != null)
             "INFERNIX_HUB_TOKEN_FILE=/run/credentials/infernix-workerd.service/infernix-hub-token"
+          ++ lib.mapAttrsToList
+            (name: _: "${adapterTokenEnv name}=/run/credentials/infernix-workerd.service/${adapterTokenCredential name}")
+            adaptersWithToken
+          ++ lib.optional imageRunnerCfg.enable "INFERNIX_IMAGE_RUNNER_SOCKET=${imageRunnerCfg.socketPath}"
           ++ lib.optional (cfg.gpuDevice != null) "INFERNIX_GPU_DEVICE=${cfg.gpuDevice}"
           ++ [ "INFERNIX_ADAPTER_CACHE_DIR=${toString cfg.cacheRoot}" ];
         LoadCredential =
-          lib.optional (cfg.hubTokenFile != null) "infernix-hub-token:${cfg.hubTokenFile}";
+          lib.optional (cfg.hubTokenFile != null) "infernix-hub-token:${cfg.hubTokenFile}"
+          ++ lib.mapAttrsToList
+            (name: adapter: "${adapterTokenCredential name}:${adapter.tokenFile}")
+            adaptersWithToken;
         StateDirectory = "infernix-workload";
         # Containment: adapter processes are killed at the unit's ceiling, not
         # the host's.
         MemoryMax = cfg.memoryMax;
+        MemorySwapMax = cfg.memorySwapMax;
         CPUQuota = cfg.cpuQuota;
         TasksMax = cfg.tasksMax;
         ReadWritePaths = [cfg.stagingRoot cfg.cacheRoot] ++ map toString cfg.modelDirectories;
@@ -650,7 +958,109 @@ in
         NoNewPrivileges = true;
         ProtectSystem = "strict";
         PrivateTmp = true;
+      } // lib.optionalAttrs (cfg.memoryHigh != null) {
+        MemoryHigh = cfg.memoryHigh;
       };
     };
-  };
+  })
+
+  (mkIf imageRunnerCfg.enable (
+    let
+      runnerArgs = [
+        "--serve-socket" imageRunnerCfg.socketPath
+        "--registry" (toString imageRunnerCfg.registryDir)
+        "--runner-lock" imageRunnerCfg.lockPath
+        "--mem-admit-gib" (toString imageRunnerCfg.memAdmitGib)
+        "--mem-trip-gib" (toString imageRunnerCfg.memTripGib)
+        "--psi-admit-avg10" (toString imageRunnerCfg.psiAdmitAvg10)
+        "--psi-trip-avg10" (toString imageRunnerCfg.psiTripAvg10)
+      ]
+      ++ lib.optionals (imageRunnerCfg.comfyUrl != null) [ "--comfy-url" imageRunnerCfg.comfyUrl ]
+      ++ lib.optionals (imageRunnerCfg.comfyUnit != null) [ "--comfy-unit" imageRunnerCfg.comfyUnit ]
+      ++ lib.optionals (imageRunnerCfg.comfyCleanupSocket != null) [ "--comfy-cleanup-socket" imageRunnerCfg.comfyCleanupSocket ]
+      ++ lib.concatMap (a: [ "--comfy-cleanup-cmd" a ]) imageRunnerCfg.comfyCleanupCommand
+      ++ lib.optional (imageRunnerCfg.comfyUrl != null && imageRunnerCfg.comfyRequireCleanup) "--comfy-require-cleanup"
+      ++ lib.optionals (imageRunnerCfg.llamaSwapUrl != null) [ "--llama-swap-url" imageRunnerCfg.llamaSwapUrl ]
+      ++ lib.optionals (imageRunnerCfg.gpuLockPath != null) [ "--gpu-lock" (toString imageRunnerCfg.gpuLockPath) ]
+      ++ lib.optionals (imageRunnerCfg.backend != null) [ "--backend" imageRunnerCfg.backend ]
+      ++ lib.optionals (imageRunnerCfg.vramFloorMib != null) [ "--vram-floor-mib" (toString imageRunnerCfg.vramFloorMib) ]
+      ++ lib.concatMap (a: [ "--admission-cmd" a ]) imageRunnerCfg.admissionCommand
+      ++ lib.concatMap (a: [ "--lease-hook" a ]) imageRunnerCfg.leaseHook
+      ++ lib.optional imageRunnerCfg.leaseRequired "--lease-required"
+      ++ lib.optionals (imageRunnerCfg.qwen != null) ([
+        "--qwen-python" (toString imageRunnerCfg.qwen.python)
+        "--qwen-adapter" (toString imageRunnerCfg.qwen.adapterScript)
+        "--qwen-denoiser" (toString imageRunnerCfg.qwen.denoiserDir)
+        "--qwen-snapshot" (toString imageRunnerCfg.qwen.snapshotDir)
+        "--qwen-lightning" (toString imageRunnerCfg.qwen.lightningDir)
+      ] ++ lib.optionals (imageRunnerCfg.backend != null) [ "--qwen-backend" imageRunnerCfg.backend ]);
+      socketDir = builtins.dirOf imageRunnerCfg.socketPath;
+    in {
+      assertions = [
+        {
+          assertion = imageRunnerCfg.comfyUrl == null || imageRunnerCfg.comfyUnit != null;
+          message = "services.infernix.imageRunner: comfyUrl requires comfyUnit so cgroup limits, InvocationID, and --disable-metadata can be verified.";
+        }
+        {
+          assertion =
+            imageRunnerCfg.comfyUrl == null
+            || !imageRunnerCfg.comfyRequireCleanup
+            || imageRunnerCfg.comfyCleanupSocket != null
+            || imageRunnerCfg.comfyCleanupCommand != [ ];
+          message = "services.infernix.imageRunner: comfyUrl with comfyRequireCleanup requires comfyCleanupSocket or comfyCleanupCommand.";
+        }
+      ];
+
+      users.groups.${imageRunnerUser} = { };
+      users.groups.${handoffGroup} = { };
+
+      users.users.${imageRunnerUser} = {
+        isSystemUser = true;
+        group = imageRunnerUser;
+        extraGroups = [ "render" "video" handoffGroup ];
+        home = "/var/empty";
+        description = "Infernix isolated credential-free image execution runner";
+      };
+
+      systemd.tmpfiles.rules = [
+        "d ${socketDir} 2750 ${imageRunnerUser} ${handoffGroup} -"
+      ];
+
+      # Isolated, credential-free execution core: separate UID, separate mount
+      # namespace (no access to /run/credentials/infernix-workerd.service), and
+      # delegated cgroup v2 subtree so each Qwen child runs in its own sibling
+      # cgroup with MemoryHigh/MemoryMax/MemorySwapMax=0/OOMPolicy=kill.
+      systemd.services.infernix-image-runner = {
+        description = "Infernix isolated host-local image runner";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "local-fs.target" "systemd-tmpfiles-setup.service" ]
+          ++ lib.optional (imageRunnerCfg.comfyCleanupSocket != null) "infernix-comfyui-cleanup.service";
+        serviceConfig = {
+          ExecStart = "${imageRunnerCfg.package}/bin/infernix-image-run ${lib.escapeShellArgs runnerArgs}";
+          User = imageRunnerUser;
+          Group = imageRunnerUser;
+          SupplementaryGroups = [ "render" "video" handoffGroup ];
+          UMask = "0007";
+          Delegate = "memory pids";
+          DelegateSubgroup = "runner";
+          MemoryHigh = imageRunnerCfg.memoryHigh;
+          MemoryMax = imageRunnerCfg.memoryMax;
+          MemorySwapMax = imageRunnerCfg.memorySwapMax;
+          ReadWritePaths = [ imageRunnerCfg.stagingRoot socketDir ]
+            ++ lib.optional (imageRunnerCfg.gpuLockPath != null) (builtins.dirOf (toString imageRunnerCfg.gpuLockPath))
+            ++ lib.optional (imageRunnerCfg.comfyCleanupSocket != null) (builtins.dirOf imageRunnerCfg.comfyCleanupSocket);
+          ReadOnlyPaths = [ imageRunnerCfg.registryDir ] ++ map toString imageRunnerCfg.modelDirectories;
+          Restart = "on-failure";
+          RestartSec = 5;
+          KillMode = "control-group";
+          TimeoutStopSec = 60;
+          NoNewPrivileges = true;
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          PrivateTmp = true;
+        };
+      };
+    }
+  ))
+  ];
 }

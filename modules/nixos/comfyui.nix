@@ -1,5 +1,6 @@
 {
   config,
+  infernixSelf,
   lib,
   pkgs,
   ...
@@ -97,6 +98,38 @@ in {
       description = "Environment variables for the ComfyUI service.";
     };
 
+    disableMetadata = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Pass `--disable-metadata` to ComfyUI so `SaveImage` never persists
+        private prompts or workflow graphs into PNG text chunks on disk.
+      '';
+    };
+
+    cleanupSocket = {
+      enable = mkEnableOption "the authorized ComfyUI-identity Unix socket for ownership-scoped `infernix-*` file cleanup";
+
+      package = mkOption {
+        type = types.package;
+        default = infernixSelf.packages.${pkgs.stdenv.hostPlatform.system}.infernix-image-run;
+        defaultText = lib.literalExpression "inputs.infernix.packages.<system>.infernix-image-run";
+        description = "Package providing `infernix-image-run --serve-comfy-cleanup`.";
+      };
+
+      socketPath = mkOption {
+        type = types.str;
+        default = "/run/infernix-comfyui-cleanup/cleanup.sock";
+        description = "Unix socket path where the ComfyUI-identity cleanup daemon listens.";
+      };
+
+      allowedGroup = mkOption {
+        type = types.str;
+        default = "infernix-image-handoff";
+        description = "Unix group permitted to connect to the ComfyUI cleanup socket.";
+      };
+    };
+
     proxy = {
       listenStreams = mkOption {
         type = types.listOf types.str;
@@ -169,29 +202,65 @@ in {
       home = cfg.stateDir;
     };
 
-    systemd.tmpfiles.rules = [
-      "d ${cfg.stateDir} 0750 comfyui comfyui -"
-      "d ${cfg.stateDir}/custom_nodes 0750 comfyui comfyui -"
-      "d ${cfg.stateDir}/input 0750 comfyui comfyui -"
-      "d ${cfg.stateDir}/output 0750 comfyui comfyui -"
-      "d ${cfg.stateDir}/temp 0750 comfyui comfyui -"
-      "d ${cfg.stateDir}/user 0750 comfyui comfyui -"
-      "d ${cfg.modelsDir} 0775 comfyui users -"
-      "d ${cfg.modelsDir}/audio_encoders 0775 comfyui users -"
-      "d ${cfg.modelsDir}/checkpoints 0775 comfyui users -"
-      "d ${cfg.modelsDir}/clip 0775 comfyui users -"
-      "d ${cfg.modelsDir}/clip_vision 0775 comfyui users -"
-      "d ${cfg.modelsDir}/configs 0775 comfyui users -"
-      "d ${cfg.modelsDir}/controlnet 0775 comfyui users -"
-      "d ${cfg.modelsDir}/diffusion_models 0775 comfyui users -"
-      "d ${cfg.modelsDir}/embeddings 0775 comfyui users -"
-      "d ${cfg.modelsDir}/loras 0775 comfyui users -"
-      "d ${cfg.modelsDir}/model_patches 0775 comfyui users -"
-      "d ${cfg.modelsDir}/text_encoders 0775 comfyui users -"
-      "d ${cfg.modelsDir}/unet 0775 comfyui users -"
-      "d ${cfg.modelsDir}/upscale_models 0775 comfyui users -"
-      "d ${cfg.modelsDir}/vae 0775 comfyui users -"
-    ];
+    systemd.tmpfiles.rules =
+      [
+        "d ${cfg.stateDir} 0750 comfyui comfyui -"
+        "d ${cfg.stateDir}/custom_nodes 0750 comfyui comfyui -"
+        "d ${cfg.stateDir}/input 0750 comfyui comfyui -"
+        "d ${cfg.stateDir}/output 0750 comfyui comfyui -"
+        "d ${cfg.stateDir}/temp 0750 comfyui comfyui -"
+        "d ${cfg.stateDir}/user 0750 comfyui comfyui -"
+        "d ${cfg.modelsDir} 0775 comfyui users -"
+        "d ${cfg.modelsDir}/audio_encoders 0775 comfyui users -"
+        "d ${cfg.modelsDir}/checkpoints 0775 comfyui users -"
+        "d ${cfg.modelsDir}/clip 0775 comfyui users -"
+        "d ${cfg.modelsDir}/clip_vision 0775 comfyui users -"
+        "d ${cfg.modelsDir}/configs 0775 comfyui users -"
+        "d ${cfg.modelsDir}/controlnet 0775 comfyui users -"
+        "d ${cfg.modelsDir}/diffusion_models 0775 comfyui users -"
+        "d ${cfg.modelsDir}/embeddings 0775 comfyui users -"
+        "d ${cfg.modelsDir}/loras 0775 comfyui users -"
+        "d ${cfg.modelsDir}/model_patches 0775 comfyui users -"
+        "d ${cfg.modelsDir}/text_encoders 0775 comfyui users -"
+        "d ${cfg.modelsDir}/unet 0775 comfyui users -"
+        "d ${cfg.modelsDir}/upscale_models 0775 comfyui users -"
+        "d ${cfg.modelsDir}/vae 0775 comfyui users -"
+      ]
+      ++ lib.optional cfg.cleanupSocket.enable
+        "d ${builtins.dirOf cfg.cleanupSocket.socketPath} 2750 comfyui ${cfg.cleanupSocket.allowedGroup} -";
+
+    systemd.services.infernix-comfyui-cleanup = mkIf cfg.cleanupSocket.enable {
+      description = "Authorized ComfyUI-identity cleanup daemon for infernix-owned input/output PNGs";
+      wantedBy = ["multi-user.target"];
+      after = ["local-fs.target" "systemd-tmpfiles-setup.service"];
+      serviceConfig = {
+        ExecStart = lib.escapeShellArgs [
+          "${cfg.cleanupSocket.package}/bin/infernix-image-run"
+          "--serve-comfy-cleanup"
+          "--serve-socket"
+          cfg.cleanupSocket.socketPath
+          "--comfy-input-dir"
+          "${cfg.stateDir}/input"
+          "--comfy-output-dir"
+          "${cfg.stateDir}/output"
+        ];
+        User = "comfyui";
+        Group = "comfyui";
+        SupplementaryGroups = [cfg.cleanupSocket.allowedGroup];
+        UMask = "0007";
+        ReadWritePaths = [
+          "${cfg.stateDir}/input"
+          "${cfg.stateDir}/output"
+          (builtins.dirOf cfg.cleanupSocket.socketPath)
+        ];
+        Restart = "on-failure";
+        RestartSec = 5;
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+      };
+    };
 
     systemd.services.comfyui = {
       description = "ComfyUI diffusion model interface";
@@ -218,6 +287,7 @@ in {
                 --output-directory ${cfg.stateDir}/output \
                 --temp-directory ${cfg.stateDir}/temp \
                 --extra-model-paths-config ${extraModelPaths} \
+                ${lib.optionalString cfg.disableMetadata "--disable-metadata \\"}
                 --disable-auto-launch \
                 --log-stdout
             '';

@@ -1750,3 +1750,670 @@ async fn the_termination_handoff_renews_before_any_wait() {
     assert_eq!(status.attempts, 1, "the job was never re-claimed");
     worker.stop().await;
 }
+
+#[tokio::test]
+async fn pack_output_preempt_requeue_false_enforces_single_attempt_and_isolates_env() {
+    if !python_or_skip("pack_output_preempt_requeue_false_enforces_single_attempt_and_isolates_env")
+    {
+        return;
+    }
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("pack-preempt", cluster.connection_string(&database));
+    let hub = StubHub::start(&[]).await;
+
+    let pack_token_file = fixture.directory.join("pack-token");
+    std::fs::write(&pack_token_file, "distinct-pack-token\n").unwrap();
+    let env_log = fixture.directory.join("adapter-env.json");
+    let allow_file = fixture.directory.join("admit");
+    std::fs::write(&allow_file, b"ok").unwrap();
+
+    let probe = fixture.write_adapter(
+        "probe.sh",
+        &format!("#!/bin/sh\ntest -f '{}'\n", allow_file.display()),
+    );
+    let adapter = fixture.write_adapter(
+        "pack-preempt-adapter.py",
+        &format!(
+            r#"#!/usr/bin/env python3
+import json, os, signal, sys, time
+from pathlib import Path
+
+env = json.loads(sys.stdin.read())
+Path({env_log:?}).write_text(json.dumps({{
+    "has_db": "INFERNIX_WORKLOAD_DATABASE_URL" in os.environ,
+    "has_generic": "INFERNIX_HUB_TOKEN_FILE" in os.environ,
+    "pack_env": os.environ.get("INFERNIX_PACK_WORKER_TOKEN_FILE_ENV"),
+    "pack_hub": os.environ.get("INFERNIX_PACK_HUB_URL"),
+}}))
+Path(env["stagingDirectory"]).joinpath("ready").write_text("1")
+
+def on_term(_sig, _frame):
+    sys.exit(15)
+
+signal.signal(signal.SIGTERM, on_term)
+for _ in range(200):
+    if Path(env["cancelPath"]).exists():
+        sys.exit(15)
+    time.sleep(0.05)
+sys.exit(1)
+"#,
+            env_log = env_log.to_string_lossy()
+        ),
+    );
+
+    let config_path = fixture.directory.join("worker.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[worker]
+id = "worker-pack"
+boot_id = "boot-pack"
+capabilities = ["gpu:test", "profile:vagrant.image"]
+concurrency = 1
+lease_duration_secs = 60
+heartbeat_interval_secs = 1
+poll_interval_secs = 1
+cancel_grace_secs = 5
+staging_root = {staging:?}
+hub_url = {hub_url:?}
+
+[worker.admission]
+command = [{probe:?}]
+recheck_secs = 1
+timeout_secs = 2
+preempt = true
+
+[[adapters]]
+workload = "vagrant"
+queues = ["image"]
+profiles = ["vagrant.image"]
+command = {adapter:?}
+artifacts = true
+delivery_mode = "pack_output"
+delivery_pack = "vagrant"
+hub_token_file_env = "INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT"
+preempt_requeue = false
+"#,
+            staging = fixture.staging_root.to_string_lossy(),
+            hub_url = hub.base_url(),
+            probe = probe.to_string_lossy(),
+            adapter = adapter.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    // 1. max_attempts > 1 must fail terminally BEFORE spawning the adapter.
+    let bad_spec = JobSpec {
+        id: JobId::new("pack-multi-attempt").unwrap(),
+        workload: "vagrant".into(),
+        queue: "image".into(),
+        input_fingerprint: InputFingerprint::new("sha256:pack-multi").unwrap(),
+        payload: json!({}),
+        priority: 10,
+        requirements: ["gpu:test".into(), "profile:vagrant.image".into()]
+            .into_iter()
+            .collect(),
+        max_attempts: 3,
+    };
+    client.enqueue(&bad_spec).await.unwrap();
+
+    // 2. max_attempts == 1 starts, gets preempted -> terminal Failed("interrupted"), never pending.
+    let good_spec = JobSpec {
+        id: JobId::new("pack-preempt-1").unwrap(),
+        workload: "vagrant".into(),
+        queue: "image".into(),
+        input_fingerprint: InputFingerprint::new("sha256:pack-preempt-1").unwrap(),
+        payload: json!({}),
+        priority: 1,
+        requirements: ["gpu:test".into(), "profile:vagrant.image".into()]
+            .into_iter()
+            .collect(),
+        max_attempts: 1,
+    };
+    client.enqueue(&good_spec).await.unwrap();
+
+    let mut worker = Command::new(WORKERD)
+        .args(["--config", config_path.to_str().unwrap(), "worker"])
+        .env("INFERNIX_WORKLOAD_DATABASE_URL", &fixture.database_url)
+        .env(
+            "INFERNIX_HUB_TOKEN_FILE",
+            fixture.directory.join("hub-token"),
+        )
+        .env("INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT", &pack_token_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let bad_status = fixture
+        .wait_for_state(&client, &bad_spec.id, JobState::Failed)
+        .await;
+    assert_eq!(
+        bad_status.error.as_deref(),
+        Some("invalid_input:max_attempts_must_be_1")
+    );
+
+    let staging = fixture.staging_root.join("pack-preempt-1/1");
+    wait_for_file(&staging.join("ready")).await;
+    std::fs::remove_file(&allow_file).unwrap();
+
+    let good_status = fixture
+        .wait_for_state(&client, &good_spec.id, JobState::Failed)
+        .await;
+    assert_eq!(good_status.error.as_deref(), Some("interrupted"));
+    assert_eq!(good_status.attempts, 1);
+
+    let seen_env: Value =
+        serde_json::from_str(&std::fs::read_to_string(&env_log).unwrap()).unwrap();
+    assert_eq!(seen_env["has_db"], false);
+    assert_eq!(seen_env["has_generic"], false);
+    assert_eq!(seen_env["pack_env"], "INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT");
+    assert_eq!(seen_env["pack_hub"], hub.base_url());
+
+    let _ = worker.kill().await;
+}
+
+#[tokio::test]
+async fn pack_output_cancel_unsettled_fails_and_exit_zero_wins_cancel_race() {
+    if !python_or_skip("pack_output_cancel_unsettled_fails_and_exit_zero_wins_cancel_race") {
+        return;
+    }
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("pack-cancel", cluster.connection_string(&database));
+    let hub = StubHub::start(&[]).await;
+
+    let pack_token_file = fixture.directory.join("pack-token");
+    std::fs::write(&pack_token_file, "pack-race-secret\n").unwrap();
+
+    // Adapter mode driven by payload.mode:
+    //  - "unsettled": waits for cancel, then exits 1 (NOT 15) -> must become Failed("cancel_unsettled")
+    //  - "win_race": waits for cancel, writes valid artifact, exits 0 -> must succeed & PUT output!
+    let adapter = fixture.write_adapter(
+        "pack-cancel-adapter.py",
+        r#"#!/usr/bin/env python3
+import hashlib, json, signal, sys, time
+from pathlib import Path
+
+env = json.loads(sys.stdin.read())
+mode = env["payload"]["mode"]
+Path(env["stagingDirectory"]).joinpath("ready").write_text("1")
+
+got_term = False
+def on_term(_sig, _frame):
+    global got_term
+    got_term = True
+
+signal.signal(signal.SIGTERM, on_term)
+for _ in range(200):
+    if got_term or Path(env["cancelPath"]).exists():
+        break
+    time.sleep(0.05)
+
+if mode == "unsettled":
+    sys.exit(1)
+
+data = b"fake-png-bytes"
+out = Path(env["outputDirectory"]) / "image.png"
+out.write_bytes(data)
+sha = hashlib.sha256(data).hexdigest()
+print(json.dumps({
+    "artifacts": [{
+        "source": "image",
+        "path": "out/image.png",
+        "sha256": sha,
+        "mime": "image/png",
+        "size": len(data),
+    }],
+    "contentFingerprint": sha,
+    "cacheHit": False,
+    "telemetry": {
+        "peakVramBytes": 0,
+        "gpuSeconds": 0.1,
+        "cpuSeconds": 0.1,
+        "peakRssBytes": 0,
+        "maxTempC": None,
+        "maxPowerW": None,
+        "device": "gpu:test",
+        "backend": "rocm",
+    },
+    "validation": {"state": "ok", "findings": []},
+}))
+"#,
+    );
+
+    let config_path = fixture.directory.join("worker.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[worker]
+id = "worker-race"
+boot_id = "boot-race"
+capabilities = ["gpu:test", "profile:vagrant.image"]
+concurrency = 1
+lease_duration_secs = 60
+heartbeat_interval_secs = 1
+poll_interval_secs = 1
+cancel_grace_secs = 5
+staging_root = {staging:?}
+hub_url = {hub_url:?}
+
+[[adapters]]
+workload = "vagrant"
+queues = ["image"]
+profiles = ["vagrant.image"]
+command = {adapter:?}
+artifacts = true
+delivery_mode = "pack_output"
+delivery_pack = "vagrant"
+hub_token_file_env = "INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT"
+preempt_requeue = false
+"#,
+            staging = fixture.staging_root.to_string_lossy(),
+            hub_url = hub.base_url(),
+            adapter = adapter.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    let mut worker = Command::new(WORKERD)
+        .args(["--config", config_path.to_str().unwrap(), "worker"])
+        .env("INFERNIX_WORKLOAD_DATABASE_URL", &fixture.database_url)
+        .env(
+            "INFERNIX_HUB_TOKEN_FILE",
+            fixture.directory.join("hub-token"),
+        )
+        .env("INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT", &pack_token_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Case 1: unsettled cancellation exits 1 -> Failed("cancel_unsettled"), NOT Cancelled!
+    let spec_unsettled = JobSpec {
+        id: JobId::new("pack-unsettled").unwrap(),
+        workload: "vagrant".into(),
+        queue: "image".into(),
+        input_fingerprint: InputFingerprint::new("sha256:pack-unsettled").unwrap(),
+        payload: json!({"mode": "unsettled"}),
+        priority: 1,
+        requirements: ["gpu:test".into(), "profile:vagrant.image".into()]
+            .into_iter()
+            .collect(),
+        max_attempts: 1,
+    };
+    client.enqueue(&spec_unsettled).await.unwrap();
+    wait_for_file(&fixture.staging_root.join("pack-unsettled/1/ready")).await;
+    client.cancel(&spec_unsettled.id).await.unwrap();
+    let st_unsettled = fixture
+        .wait_for_state(&client, &spec_unsettled.id, JobState::Failed)
+        .await;
+    assert_eq!(st_unsettled.error.as_deref(), Some("cancel_unsettled"));
+
+    // Case 2: adapter completes and exits 0 after cancel observed -> wins race & delivers to configured Hub!
+    let spec_race = JobSpec {
+        id: JobId::new("pack-win-race").unwrap(),
+        workload: "vagrant".into(),
+        queue: "image".into(),
+        input_fingerprint: InputFingerprint::new("sha256:pack-win-race").unwrap(),
+        payload: json!({
+            "mode": "win_race",
+            "packJobId": "slot-race-1",
+            "hubUrl": "http://127.0.0.1:1"
+        }),
+        priority: 1,
+        requirements: ["gpu:test".into(), "profile:vagrant.image".into()]
+            .into_iter()
+            .collect(),
+        max_attempts: 1,
+    };
+    client.enqueue(&spec_race).await.unwrap();
+    wait_for_file(&fixture.staging_root.join("pack-win-race/1/ready")).await;
+    client.cancel(&spec_race.id).await.unwrap();
+    let st_race = fixture
+        .wait_for_state(&client, &spec_race.id, JobState::Succeeded)
+        .await;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if client
+                .status(&spec_race.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivered_at
+                .is_some()
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("winning pack output was delivered");
+    assert_eq!(st_race.state, JobState::Succeeded);
+
+    let reqs = hub.requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].path, "/v1/p/vagrant/worker/jobs/slot-race-1/output");
+    assert_eq!(
+        reqs[0].headers.get("authorization").map(String::as_str),
+        Some("Bearer pack-race-secret")
+    );
+
+    let _ = worker.kill().await;
+}
+
+#[tokio::test]
+async fn r2_03_04_08_pack_output_tampered_delivery_dir_perms_and_unsettled_cancel_reap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !python_or_skip(
+        "r2_03_04_08_pack_output_tampered_delivery_dir_perms_and_unsettled_cancel_reap",
+    ) {
+        return;
+    }
+    let cluster = TestCluster::start();
+    let (database, client) = fresh_ledger(&cluster).await.unwrap();
+    let fixture = Fixture::new("r2-pack", cluster.connection_string(&database));
+    let hub = StubHub::start(&[]).await;
+
+    let pack_token_file = fixture.directory.join("pack-token");
+    std::fs::write(&pack_token_file, "r2-pack-secret\n").unwrap();
+
+    let adapter = fixture.write_adapter(
+        "r2-sleep-adapter.py",
+        r#"#!/usr/bin/env python3
+import json, sys, time
+from pathlib import Path
+env = json.loads(sys.stdin.read())
+Path(env["stagingDirectory"]).joinpath("ready").write_text("1")
+time.sleep(60)
+"#,
+    );
+
+    let config_path = fixture.directory.join("worker.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[worker]
+id = "worker-r2"
+boot_id = "boot-r2"
+capabilities = ["gpu:test", "profile:vagrant.image"]
+concurrency = 1
+lease_duration_secs = 60
+heartbeat_interval_secs = 1
+poll_interval_secs = 1
+cancel_grace_secs = 5
+staging_root = {staging:?}
+hub_url = {hub_url:?}
+
+[[adapters]]
+workload = "vagrant"
+queues = ["image"]
+profiles = ["vagrant.image"]
+command = {adapter:?}
+artifacts = true
+delivery_mode = "pack_output"
+delivery_pack = "vagrant"
+hub_token_file_env = "INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT"
+preempt_requeue = false
+"#,
+            staging = fixture.staging_root.to_string_lossy(),
+            hub_url = hub.base_url(),
+            adapter = adapter.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    // Part A (R2-04 & R2-08): spawn worker on a pack_output (preempt_requeue = false) job,
+    // verify cross-UID 0o2770 staging permissions, then crash worker after cancel + lease expiry
+    // and verify reap_expired transitions to Failed("cancel_unsettled_lease_expired"), NEVER Cancelled.
+    let spec_unsettled = JobSpec {
+        id: JobId::new("r2-unsettled-reap").unwrap(),
+        workload: "vagrant".into(),
+        queue: "image".into(),
+        input_fingerprint: InputFingerprint::new("sha256:r2-unsettled-reap").unwrap(),
+        payload: json!({}),
+        priority: 1,
+        requirements: ["gpu:test".into(), "profile:vagrant.image".into()]
+            .into_iter()
+            .collect(),
+        max_attempts: 1,
+    };
+    client.enqueue(&spec_unsettled).await.unwrap();
+
+    let mut worker = Command::new(WORKERD)
+        .args(["--config", config_path.to_str().unwrap(), "worker"])
+        .env("INFERNIX_WORKLOAD_DATABASE_URL", &fixture.database_url)
+        .env(
+            "INFERNIX_HUB_TOKEN_FILE",
+            fixture.directory.join("hub-token"),
+        )
+        .env("INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT", &pack_token_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let job_dir = fixture.staging_root.join("r2-unsettled-reap");
+    let attempt_dir = job_dir.join("1");
+    let out_dir = attempt_dir.join("out");
+    wait_for_file(&attempt_dir.join("ready")).await;
+
+    // R2-04: staging hierarchy must be group-writable + setgid (0o2770) regardless of umask.
+    for path in [&job_dir, &attempt_dir, &out_dir] {
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode,
+            0o2770,
+            "staging dir {} expected mode 0o2770, got 0o{mode:o}",
+            path.display()
+        );
+    }
+
+    // R2-08: require_settlement must be TRUE in Postgres before crash + expiry reap.
+    let req_settle: bool = client
+        .raw()
+        .query_one(
+            "SELECT require_settlement FROM infernix_workload_jobs WHERE id = 'r2-unsettled-reap'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        req_settle,
+        "preempt_requeue=false must mark require_settlement=true"
+    );
+
+    // Simulate worker crash after cancel request and lease expiry.
+    let _ = worker.kill().await;
+    let _ = worker.wait().await;
+    client.cancel(&spec_unsettled.id).await.unwrap();
+    client
+        .raw()
+        .batch_execute(
+            "UPDATE infernix_workload_jobs \
+             SET lease_expires_at = now() - interval '1 second' \
+             WHERE id = 'r2-unsettled-reap'",
+        )
+        .await
+        .unwrap();
+    client.reap_expired().await.unwrap();
+    let st = client.status(&spec_unsettled.id).await.unwrap().unwrap();
+    assert_eq!(st.state, JobState::Failed);
+    assert_eq!(st.error.as_deref(), Some("cancel_unsettled_lease_expired"));
+
+    // Part B (R2-03 / R3-06): restart delivery recovery with valid artifacts & complete metadata
+    // must reach the adapter-policy guard, reject tampered mode/pack WITHOUT marking `staging_lost`,
+    // and deliver a valid control job normally.
+    let artifact_bytes = b"tamper-bytes";
+    let artifact_sha = {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(artifact_bytes);
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    for (id, delivery_json) in [
+        (
+            "r2-tamper-mode",
+            json!({
+                "mode": "generations",
+                "hubUrl": hub.base_url(),
+                "generationRequestId": "11111111-1111-4111-8111-111111111111"
+            }),
+        ),
+        (
+            "r2-tamper-pack",
+            json!({
+                "mode": "pack_output",
+                "hubUrl": hub.base_url(),
+                "pack": "other-pack",
+                "packJobId": "tampered-slot-1",
+                "leaseToken": "lease-tamper-1",
+                "workerId": "worker-r2",
+                "attempt": 1
+            }),
+        ),
+        (
+            "r2-valid-control",
+            json!({
+                "mode": "pack_output",
+                "hubUrl": hub.base_url(),
+                "pack": "vagrant",
+                "packJobId": "valid-control-slot-1",
+                "leaseToken": "lease-valid-1",
+                "workerId": "worker-r2",
+                "attempt": 1
+            }),
+        ),
+    ] {
+        let spec = JobSpec {
+            id: JobId::new(id).unwrap(),
+            workload: "vagrant".into(),
+            queue: "image".into(),
+            input_fingerprint: InputFingerprint::new(format!("sha256:{id}")).unwrap(),
+            payload: json!({}),
+            priority: 1,
+            requirements: ["gpu:test".into(), "profile:vagrant.image".into()]
+                .into_iter()
+                .collect(),
+            max_attempts: 1,
+        };
+        client.enqueue(&spec).await.unwrap();
+        let art_dir = fixture.staging_root.join(id).join("1/out");
+        std::fs::create_dir_all(&art_dir).unwrap();
+        std::fs::write(art_dir.join("image.png"), artifact_bytes).unwrap();
+        let stored_result = json!({
+            "delivery": delivery_json,
+            "artifacts": [{
+                "source": "image",
+                "path": "out/image.png",
+                "sha256": artifact_sha,
+                "mime": "image/png",
+                "size": artifact_bytes.len()
+            }],
+            "contentFingerprint": artifact_sha,
+            "cacheHit": false,
+            "telemetry": {
+                "peakVramBytes": 0,
+                "gpuSeconds": 0.1,
+                "cpuSeconds": 0.1,
+                "peakRssBytes": 0,
+                "maxTempC": null,
+                "maxPowerW": null,
+                "device": "gpu:test",
+                "backend": "rocm"
+            },
+            "validation": {"state": "ok", "findings": []}
+        });
+        client
+            .raw()
+            .execute(
+                "UPDATE infernix_workload_jobs \
+                 SET state = 'succeeded', attempts = 1, lease_owner = 'worker-r2', \
+                     result = $2, updated_at = now(), delivered_at = NULL \
+                 WHERE id = $1",
+                &[&id, &stored_result],
+            )
+            .await
+            .unwrap();
+    }
+
+    let out = Command::new(WORKERD)
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "worker",
+            "--once",
+        ])
+        .env("INFERNIX_WORKLOAD_DATABASE_URL", &fixture.database_url)
+        .env(
+            "INFERNIX_HUB_TOKEN_FILE",
+            fixture.directory.join("hub-token"),
+        )
+        .env("INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT", &pack_token_file)
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let logs = format!("{stdout}\n{stderr}");
+    assert!(out.status.success(), "worker --once failed: {logs}");
+
+    // Control job MUST deliver cleanly to the configured pack route.
+    let reqs = hub.requests();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "only valid control job should reach Hub; got {reqs:?}"
+    );
+    assert_eq!(
+        reqs[0].path,
+        "/v1/p/vagrant/worker/jobs/valid-control-slot-1/output"
+    );
+    assert_eq!(
+        reqs[0].headers.get("authorization").map(String::as_str),
+        Some("Bearer r2-pack-secret")
+    );
+    let ctrl = client
+        .status(&JobId::new("r2-valid-control").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ctrl.delivered_at.is_some());
+
+    // Tampered jobs MUST hit the policy guard (remaining Succeeded with error=None, NOT staging_lost).
+    assert!(
+        logs.contains("contradicts configured pack_output adapter"),
+        "expected mode-contradiction policy rejection in logs: {logs}"
+    );
+    assert!(
+        logs.contains("contradicts configured adapter pack"),
+        "expected pack-contradiction policy rejection in logs: {logs}"
+    );
+    for id in ["r2-tamper-mode", "r2-tamper-pack"] {
+        let st = client
+            .status(&JobId::new(id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            st.state,
+            JobState::Succeeded,
+            "tampered delivery {id} must be rejected by policy guard, not failed as staging_lost (error={:?})",
+            st.error
+        );
+        assert!(st.error.is_none());
+        assert!(
+            st.delivered_at.is_none(),
+            "tampered delivery for {id} must stay undelivered"
+        );
+    }
+}

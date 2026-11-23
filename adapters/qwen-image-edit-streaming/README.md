@@ -3,7 +3,10 @@
 One local JSON job on stdin, one verified PNG and one JSON receipt on stdout.
 Launch a **fresh process for each output**; allocator cleanup alone did not
 release all ROCm device memory in the pilot. This is not registered with the
-worker or Hub. CUDA on Nomad is not yet qualified.
+worker or Hub. Nomad CUDA (RTX 4090 Laptop, 16 GiB) passed attended 6-slot
+qualification (5,986 MiB peak VRAM, 19.7 GiB peak cgroup / 1.63 GiB anon,
+calibrated 12 GiB free-VRAM floor); the uninterrupted 20-slot production-lease
+gate remains required before advertising CUDA.
 
 ## Provision
 
@@ -64,8 +67,8 @@ Invoke only inside a supervised, dedicated cgroup with `MemoryHigh` and
 `MemoryMax` at 24 GiB and `MemorySwapMax=0`. The runner checks those limits,
 live `MemAvailable ≥ 40 GiB`, full memory PSI avg10 `<5%`, native BF16, and
 free VRAM on the selected card: at least 21 GiB for Atlas ROCm (the lower of
-HIP and device-wide amdgpu readings), or a provisional 12 GiB for the
-unqualified CUDA candidate. The standalone CLI does not acquire a device
+HIP and device-wide amdgpu readings), or 12 GiB for Nomad CUDA (calibrated from
+5,986 MiB peak VRAM and 15,945 MiB idle free across six attended runs). The standalone CLI does not acquire a device
 lease. The caller owns the lease, independent watchdog, cancellation and
 process exit verification. For an attended Atlas check,
 `tests/atlas-smoke.sh run LABEL STAGING VENV_PYTHON`

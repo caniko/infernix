@@ -410,6 +410,7 @@ impl JobRecord {
             workload: self.spec.workload.clone(),
             queue: self.spec.queue.clone(),
             input_fingerprint: self.spec.input_fingerprint.as_str().to_owned(),
+            requirements: self.spec.requirements.clone(),
             state: self.state,
             attempts: self.attempts,
             result: self.result.clone(),
@@ -428,6 +429,8 @@ pub struct JobStatus {
     pub workload: String,
     pub queue: String,
     pub input_fingerprint: String,
+    #[serde(default)]
+    pub requirements: BTreeSet<String>,
     pub state: JobState,
     pub attempts: u32,
     pub result: Option<Value>,
@@ -488,6 +491,10 @@ pub struct Lease {
     pub expires_at: DateTime<Utc>,
 }
 
+fn default_max_attempts_one() -> u32 {
+    1
+}
+
 /// One claimed job: the lease plus the immutable spec fields the worker needs
 /// to build an adapter envelope.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -501,6 +508,8 @@ pub struct ClaimedJob {
     #[serde(default)]
     pub requirements: BTreeSet<String>,
     pub payload: Value,
+    #[serde(default = "default_max_attempts_one")]
+    pub max_attempts: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -714,6 +723,27 @@ impl InMemoryQueue {
         record.not_before = None;
         record.attempts = record.attempts.max(1);
         Ok(CompletionOutcome::Accepted)
+    }
+
+    /// Fenced terminal failure: transitions directly to `failed` regardless of
+    /// remaining `max_attempts` or `cancel_requested_at` (used for non-retryable
+    /// post-start interruptions and unsettled cancellations).
+    pub fn fail_terminal(
+        &self,
+        lease: &Lease,
+        error: impl Into<String>,
+    ) -> Result<(), WorkloadError> {
+        let mut state = self.lock_state();
+        let record = state
+            .jobs
+            .get_mut(&lease.job_id)
+            .ok_or_else(|| WorkloadError::UnknownJob(lease.job_id.as_str().to_owned()))?;
+        ensure_current_lease(record, lease)?;
+        record.error = Some(error.into());
+        record.lease = None;
+        record.not_before = None;
+        record.state = JobState::Failed;
+        Ok(())
     }
 
     pub fn fail(&self, lease: &Lease, error: impl Into<String>) -> Result<(), WorkloadError> {
@@ -1052,6 +1082,7 @@ CREATE TABLE IF NOT EXISTS infernix_workload_jobs (
     delivered_at TIMESTAMPTZ,
     not_before TIMESTAMPTZ,
     busy_releases INTEGER NOT NULL DEFAULT 0 CHECK (busy_releases >= 0),
+    require_settlement BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (workload, queue, input_fingerprint)
@@ -1082,6 +1113,8 @@ ALTER TABLE infernix_workload_jobs
     ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ;
 ALTER TABLE infernix_workload_jobs
     ADD COLUMN IF NOT EXISTS busy_releases INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE infernix_workload_jobs
+    ADD COLUMN IF NOT EXISTS require_settlement BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS infernix_workload_jobs_delivery_idx
     ON infernix_workload_jobs (lease_owner)
     WHERE state = 'succeeded' AND delivered_at IS NULL;
@@ -1131,7 +1164,8 @@ WITH exhausted AS (
        AND attempts >= max_attempts
 )
     UPDATE infernix_workload_jobs
-       SET state = 'cancelled',
+       SET state = CASE WHEN require_settlement THEN 'failed' ELSE 'cancelled' END,
+           error = CASE WHEN require_settlement THEN 'cancel_unsettled_lease_expired' ELSE error END,
            not_before = NULL,
            lease_owner = NULL,
            lease_boot_id = NULL,
@@ -1189,7 +1223,8 @@ WITH exhausted AS (
 ),
 cancel_expired AS (
     UPDATE infernix_workload_jobs
-       SET state = 'cancelled',
+       SET state = CASE WHEN require_settlement THEN 'failed' ELSE 'cancelled' END,
+           error = CASE WHEN require_settlement THEN 'cancel_unsettled_lease_expired' ELSE error END,
            not_before = NULL,
            lease_owner = NULL,
            lease_boot_id = NULL,
@@ -1282,6 +1317,25 @@ UPDATE infernix_workload_jobs
    AND lease_boot_id = $3
    AND lease_token = $4
    AND cancel_requested_at IS NULL
+   AND lease_expires_at > now();
+"#;
+
+    /// Fenced completion for pack-scoped jobs whose verified exit-0 output may
+    /// win a concurrent cancellation race while the lease is still valid.
+    pub const COMPLETE_ALLOW_CANCEL_RACE: &str = r#"
+UPDATE infernix_workload_jobs
+   SET state = 'succeeded',
+       result = $5,
+       lease_token = NULL,
+       lease_expires_at = NULL,
+       not_before = NULL,
+       error = NULL,
+       updated_at = now()
+ WHERE id = $1
+   AND state = 'leased'
+   AND lease_owner = $2
+   AND lease_boot_id = $3
+   AND lease_token = $4
    AND lease_expires_at > now();
 "#;
 
@@ -1419,7 +1473,7 @@ UPDATE infernix_workload_jobs
 
     /// `STATUS` by job id.
     pub const STATUS: &str = r#"
-SELECT id, workload, queue, input_fingerprint, state, attempts, result, error,
+SELECT id, workload, queue, input_fingerprint, requirements, state, attempts, result, error,
        cancel_requested_at, delivered_at
   FROM infernix_workload_jobs
  WHERE id = $1;
@@ -1427,7 +1481,7 @@ SELECT id, workload, queue, input_fingerprint, state, attempts, result, error,
 
     /// `STATUS` by generation identity, used for adoption.
     pub const STATUS_BY_FINGERPRINT: &str = r#"
-SELECT id, workload, queue, input_fingerprint, state, attempts, result, error,
+SELECT id, workload, queue, input_fingerprint, requirements, state, attempts, result, error,
        cancel_requested_at, delivered_at
   FROM infernix_workload_jobs
  WHERE workload = $1 AND queue = $2 AND input_fingerprint = $3;
@@ -1435,13 +1489,27 @@ SELECT id, workload, queue, input_fingerprint, state, attempts, result, error,
 
     /// `succeeded` jobs this worker must still deliver, oldest first.
     pub const UNDELIVERED_SUCCEEDED: &str = r#"
-SELECT id, workload, queue, input_fingerprint, state, attempts, result, error,
+SELECT id, workload, queue, input_fingerprint, requirements, state, attempts, result, error,
        cancel_requested_at, delivered_at
   FROM infernix_workload_jobs
  WHERE state = 'succeeded'
    AND delivered_at IS NULL
    AND lease_owner = $1
  ORDER BY updated_at ASC, id ASC;
+"#;
+
+    /// Persist `require_settlement = TRUE` on the currently leased job so a
+    /// subsequent lease expiry with `cancel_requested_at IS NOT NULL` transitions
+    /// to `failed` (`cancel_unsettled_lease_expired`) rather than manufacturing `cancelled`.
+    pub const MARK_REQUIRE_SETTLEMENT: &str = r#"
+UPDATE infernix_workload_jobs
+   SET require_settlement = TRUE,
+       updated_at = now()
+ WHERE id = $1
+   AND state = 'leased'
+   AND lease_owner = $2
+   AND lease_boot_id = $3
+   AND lease_token = $4;
 "#;
 
     /// A normal adapter failure: retry while attempts remain.
@@ -1452,6 +1520,26 @@ UPDATE infernix_workload_jobs
                    WHEN attempts < max_attempts THEN 'pending'
                    ELSE 'failed'
                END,
+       error = $5,
+       not_before = NULL,
+       lease_owner = NULL,
+       lease_boot_id = NULL,
+       lease_token = NULL,
+       lease_expires_at = NULL,
+       updated_at = now()
+ WHERE id = $1
+   AND state = 'leased'
+   AND lease_owner = $2
+   AND lease_boot_id = $3
+   AND lease_token = $4
+RETURNING state;
+"#;
+
+    /// A terminal non-retryable failure: never returns to `pending` and never
+    /// falsely confirms `cancelled` when engine cancellation was unsettled.
+    pub const FAIL_TERMINAL: &str = r#"
+UPDATE infernix_workload_jobs
+   SET state = 'failed',
        error = $5,
        not_before = NULL,
        lease_owner = NULL,
@@ -2067,6 +2155,10 @@ mod tests {
         assert!(sql::CLAIM.contains("SET state = 'failed'"));
         assert!(sql::CLAIM.contains("unnest($6::text[], $7::text[])"));
         assert!(!sql::CLAIM.contains("ANY($6"));
+        assert!(sql::CLAIM.contains("require_settlement"));
+        assert!(sql::CLAIM.contains("cancel_unsettled_lease_expired"));
+        assert!(sql::REAP_EXPIRED.contains("require_settlement"));
+        assert!(sql::REAP_EXPIRED.contains("cancel_unsettled_lease_expired"));
     }
 
     fn profile() -> WorkloadProfile {

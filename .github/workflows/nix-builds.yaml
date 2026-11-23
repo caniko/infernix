@@ -27,6 +27,8 @@ jobs:
       matrix:
         installable:
           - ".#headroom"
+          - ".#packages.x86_64-linux.infernix-image-run"
+          - ".#checks.x86_64-linux.workload-fabric"
           - ".#checks.x86_64-linux.headroom"
           - ".#checks.x86_64-linux.headroom-runtime"
           - ".#checks.x86_64-linux.model-fetch"

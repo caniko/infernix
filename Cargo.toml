@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/infernix-image-run",
   "crates/infernix-lb",
   "crates/infernix-workload",
   "crates/infernix-workload-testing",

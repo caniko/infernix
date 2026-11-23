@@ -98,6 +98,7 @@
     mkCargoPackageWithCrane = {
       pkgs,
       packageName,
+      extraCheckInputs ? [],
     }: let
       toolchain = harbor-rs.lib.mkToolchain {
         inherit pkgs;
@@ -115,7 +116,7 @@
         cargoExtraArgs = "-p ${packageName}";
         # The ledger integration tests start a throwaway cluster with
         # initdb/pg_ctl, so the check phase needs the server binaries.
-        nativeCheckInputs = [pkgs.postgresql];
+        nativeCheckInputs = [pkgs.postgresql] ++ extraCheckInputs;
       };
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
     in
@@ -136,6 +137,13 @@
         packageName = "infernix-workerd";
       };
 
+    mkImageRunPackageWithCrane = pkgs:
+      mkCargoPackageWithCrane {
+        inherit pkgs;
+        packageName = "infernix-image-run";
+        extraCheckInputs = [pkgs.python3];
+      };
+
     mkLbPackage = system:
       mkLbPackageWithCrane (import nixpkgs {
         inherit system;
@@ -144,6 +152,12 @@
 
     mkWorkerdPackage = system:
       mkWorkerdPackageWithCrane (import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      });
+
+    mkImageRunPackage = system:
+      mkImageRunPackageWithCrane (import nixpkgs {
         inherit system;
         overlays = [rust-overlay.overlays.default];
       });
@@ -254,6 +268,7 @@
       pkgs = nixpkgs.legacyPackages.${system};
       infernix-lb = mkLbPackage system;
       infernix-workerd = mkWorkerdPackage system;
+      infernix-image-run = mkImageRunPackage system;
       visualRubricPackage =
         if
           builtins.hasAttr "packages" visual-rubric
@@ -273,7 +288,7 @@
         else null;
     in
       {
-        inherit infernix-lb infernix-workerd;
+        inherit infernix-image-run infernix-lb infernix-workerd;
         # TODO(animation G2): package the Python adapters while G2 owns
         # `adapters/**`. Each adapter becomes one package here and one entry in
         # the workload-fabric `adapters` option; do not guess their layout.
@@ -330,6 +345,8 @@
         flake = ".";
         paths = with self.packages.${system}; [
           infernix-lb
+          infernix-workerd
+          infernix-image-run
           codex-acp
           headroom
           ponytail
@@ -430,6 +447,8 @@
               enable = true;
               databaseUrl = "postgres:///canix?host=/run/postgresql";
               workerId = "atlas";
+              hubUrl = "http://127.0.0.1:8014";
+              hubTokenFile = "/run/keys/generic-hub-token";
               capabilities = ["cpu" "semantic"];
               admission = {
                 command = ["/bin/canix" "host" "gpu-admission" "check" "--device" "murph-a770"];
@@ -444,6 +463,18 @@
                 artifacts = true;
                 command = "/bin/canix";
                 args = ["fixture" "run-job"];
+              };
+              adapters.vagrant-image = {
+                workload = "vagrant";
+                queues = ["image"];
+                profiles = ["vagrant.z-image-turbo-text"];
+                artifacts = true;
+                deliveryMode = "pack_output";
+                deliveryPack = "vagrant";
+                tokenFile = "/run/keys/vagrant-worker-token";
+                preemptRequeue = false;
+                command = "/bin/infernix-image-adapter";
+                args = ["--pack" "vagrant"];
               };
               profiles.semantic = {
                 routing = {
@@ -475,6 +506,16 @@
                   maxAttempts = 3;
                 };
               };
+            };
+
+            services.infernix.imageRunner = {
+              enable = true;
+              registryDir = "/etc/infernix/image-registry";
+              comfyUrl = "http://127.0.0.1:8188";
+              comfyUnit = "comfyui.service";
+              comfyCleanupSocket = "/run/infernix-comfyui-cleanup/cleanup.sock";
+              backend = "rocm";
+              vramFloorMib = 20480;
             };
           }
         ];
@@ -1696,6 +1737,32 @@
         grep -Fq 'recheck_secs = 20' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         grep -Fq 'timeout_secs = 3' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         grep -Fq 'preempt = true' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'hub_url = "http://127.0.0.1:8014"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'delivery_mode = "pack_output"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'delivery_pack = "vagrant"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'preempt_requeue = false' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        grep -Fq 'hub_token_file_env = "INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT_IMAGE"' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
+        sample_worker='${builtins.toJSON workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig}'
+        printf '%s' "$sample_worker" | ${pkgs.jq}/bin/jq -e '
+          .LoadCredential | index("infernix-adapter-token-vagrant-image:/run/keys/vagrant-worker-token")
+        '
+        printf '%s' "$sample_worker" | ${pkgs.jq}/bin/jq -e '
+          .Environment | index("INFERNIX_ADAPTER_TOKEN_FILE_VAGRANT_IMAGE=/run/credentials/infernix-workerd.service/infernix-adapter-token-vagrant-image")
+        '
+        printf '%s' "$sample_worker" | ${pkgs.jq}/bin/jq -e '
+          .Environment | index("INFERNIX_IMAGE_RUNNER_SOCKET=/run/infernix-image-runner/runner.sock")
+        '
+        printf '%s' "$sample_worker" | ${pkgs.jq}/bin/jq -e '.MemorySwapMax == "0"'
+        sample_runner='${builtins.toJSON workloadFabricSample.config.systemd.services.infernix-image-runner.serviceConfig}'
+        printf '%s' "$sample_runner" | ${pkgs.jq}/bin/jq -e '
+          .User == "infernix-image-runner"
+          and .UMask == "0007"
+          and .Delegate == "memory pids"
+          and .DelegateSubgroup == "runner"
+          and .MemorySwapMax == "0"
+          and (.LoadCredential // [] | length == 0)
+          and (.EnvironmentFile // [] | length == 0)
+        '
         ! grep -Eiq 'opaque-fixture-reference|prompt|source' "${workloadFabricSample.config.services.infernix.workloadFabric.configFile}"
         touch "$out"
       '';

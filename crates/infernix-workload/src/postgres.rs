@@ -16,10 +16,11 @@ use crate::{
     InputFingerprint, JobId, JobSpec, JobState, JobStatus, Lease, LeaseToken, WorkerId,
     WorkerProfile, WorkloadError,
     sql::{
-        CANCEL, CLAIM, COMPLETE, CONFIRM_CANCELLED, ENQUEUE, ENQUEUE_EXISTING, FAIL,
-        FAIL_AFTER_COMPLETION, HAS_CLAIMABLE, HEARTBEAT, MARK_DELIVERED, MIGRATIONS, REAP_EXPIRED,
-        RELEASE_BUSY, RELEASE_PREEMPTED, SCHEMA, STATUS, STATUS_BY_FINGERPRINT,
-        UNDELIVERED_SUCCEEDED, WORKER_DRAIN, WORKER_HEARTBEAT, WORKER_UPSERT,
+        CANCEL, CLAIM, COMPLETE, COMPLETE_ALLOW_CANCEL_RACE, CONFIRM_CANCELLED, ENQUEUE,
+        ENQUEUE_EXISTING, FAIL, FAIL_AFTER_COMPLETION, FAIL_TERMINAL, HAS_CLAIMABLE, HEARTBEAT,
+        MARK_DELIVERED, MARK_REQUIRE_SETTLEMENT, MIGRATIONS, REAP_EXPIRED, RELEASE_BUSY,
+        RELEASE_PREEMPTED, SCHEMA, STATUS, STATUS_BY_FINGERPRINT, UNDELIVERED_SUCCEEDED,
+        WORKER_DRAIN, WORKER_HEARTBEAT, WORKER_UPSERT,
     },
 };
 
@@ -249,6 +250,7 @@ impl WorkloadClient {
                 .into_iter()
                 .collect(),
             payload: row.get("payload"),
+            max_attempts: row.get::<_, i32>("max_attempts").max(1) as u32,
         }))
     }
 
@@ -296,12 +298,56 @@ impl WorkloadClient {
         Ok(changed == 1)
     }
 
+    /// Fenced completion allowing a verified exit-0 output to win a concurrent
+    /// cancellation race while the lease is still valid.
+    pub async fn complete_allow_cancel_race(
+        &self,
+        lease: &Lease,
+        result: &Value,
+    ) -> PgResult<bool> {
+        let changed = self
+            .client
+            .execute(
+                COMPLETE_ALLOW_CANCEL_RACE,
+                &[
+                    &lease.job_id.as_str(),
+                    &lease.worker_id.as_str(),
+                    &lease.boot_id,
+                    &lease.token.as_str(),
+                    result,
+                ],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
     /// Fenced failure; retries while attempts remain. Returns the new state.
     pub async fn fail(&self, lease: &Lease, error: &str) -> PgResult<Option<JobState>> {
         let row = self
             .client
             .query_opt(
                 FAIL,
+                &[
+                    &lease.job_id.as_str(),
+                    &lease.worker_id.as_str(),
+                    &lease.boot_id,
+                    &lease.token.as_str(),
+                    &error,
+                ],
+            )
+            .await?;
+        match row {
+            Some(row) => Ok(Some(parse_state(row.get::<_, String>("state").as_str())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fenced terminal failure; never returns to `pending` and never confirms `cancelled`.
+    pub async fn fail_terminal(&self, lease: &Lease, error: &str) -> PgResult<Option<JobState>> {
+        let row = self
+            .client
+            .query_opt(
+                FAIL_TERMINAL,
                 &[
                     &lease.job_id.as_str(),
                     &lease.worker_id.as_str(),
@@ -427,6 +473,24 @@ impl WorkloadClient {
         }))
     }
 
+    /// Persist `require_settlement = TRUE` on a leased job before launching a
+    /// non-requeueing external-engine adapter so lease expiry never manufactures `cancelled`.
+    pub async fn mark_require_settlement(&self, lease: &Lease) -> PgResult<bool> {
+        let changed = self
+            .client
+            .execute(
+                MARK_REQUIRE_SETTLEMENT,
+                &[
+                    &lease.job_id.as_str(),
+                    &lease.worker_id.as_str(),
+                    &lease.boot_id,
+                    &lease.token.as_str(),
+                ],
+            )
+            .await?;
+        Ok(changed == 1)
+    }
+
     /// `MARK_DELIVERED`. `true` when this call set `delivered_at`.
     pub async fn mark_delivered(&self, job_id: &JobId, worker: &WorkerId) -> PgResult<bool> {
         let changed = self
@@ -501,6 +565,10 @@ fn row_to_status(row: &Row) -> PgResult<JobStatus> {
         workload: row.get("workload"),
         queue: row.get("queue"),
         input_fingerprint: row.get("input_fingerprint"),
+        requirements: row
+            .get::<_, Vec<String>>("requirements")
+            .into_iter()
+            .collect(),
         state: parse_state(row.get::<_, String>("state").as_str())?,
         attempts: row.get::<_, i32>("attempts").max(0) as u32,
         result: row.get("result"),

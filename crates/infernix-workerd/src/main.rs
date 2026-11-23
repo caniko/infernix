@@ -41,8 +41,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    delivery::HubDelivery,
-    result::{ValidatedResult, validate_result},
+    delivery::{HubDelivery, PackOutputDelivery},
+    result::validate_result,
 };
 
 /// Envelope protocol version (spec section 2).
@@ -200,6 +200,18 @@ struct AdmissionConfig {
     preempt: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum DeliveryMode {
+    #[default]
+    Generations,
+    PackOutput,
+}
+
+fn default_preempt_requeue() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct AdapterConfig {
     workload: String,
@@ -217,6 +229,21 @@ struct AdapterConfig {
     /// Validate a result manifest and deliver its artifacts.
     #[serde(default)]
     artifacts: bool,
+    /// Where validated artifacts are uploaded (`generations` default, or `pack_output`).
+    #[serde(default)]
+    delivery_mode: DeliveryMode,
+    /// Pack identifier for `delivery_mode = "pack_output"` (e.g. `"vagrant"`).
+    #[serde(default)]
+    delivery_pack: Option<String>,
+    /// Separate token file env var for `delivery_mode = "pack_output"` so pack
+    /// jobs never reuse the generic `procedure` token.
+    #[serde(default)]
+    hub_token_file_env: Option<String>,
+    /// Whether admission preemption returns a running job to `pending` without
+    /// spending its attempt. Set `false` for non-idempotent post-submit jobs
+    /// (`max_attempts = 1`), which must settle or report `interrupted`.
+    #[serde(default = "default_preempt_requeue")]
+    preempt_requeue: bool,
 }
 
 /// Envelope v2: one JSON object on the adapter's stdin.
@@ -378,7 +405,52 @@ fn validate_config(config: &Config) -> Result<()> {
     // Selection is by (workload, queue, profile); a duplicate would silently
     // fall back to configuration order.
     let mut served = BTreeSet::new();
+    let mut pack_token_envs: BTreeMap<String, String> = BTreeMap::new();
     for adapter in &config.adapters {
+        if adapter.delivery_mode == DeliveryMode::PackOutput {
+            if !adapter.artifacts {
+                bail!(
+                    "adapter {} with delivery_mode = pack_output must set artifacts = true",
+                    adapter.workload
+                )
+            }
+            let Some(hub_url) = config.worker.hub_url.as_deref() else {
+                bail!(
+                    "adapter {} with delivery_mode = pack_output requires worker.hub_url to be configured",
+                    adapter.workload
+                )
+            };
+            delivery::validate_hub_origin(hub_url).with_context(|| {
+                format!(
+                    "worker.hub_url for pack_output adapter {} is invalid",
+                    adapter.workload
+                )
+            })?;
+            let Some(pack) = adapter
+                .delivery_pack
+                .as_deref()
+                .filter(|p| delivery::valid_pack_segment(p))
+            else {
+                bail!(
+                    "adapter {} with delivery_mode = pack_output needs a valid delivery_pack",
+                    adapter.workload
+                )
+            };
+            let Some(token_env) = adapter.hub_token_file_env.as_deref() else {
+                bail!(
+                    "adapter {} with delivery_mode = pack_output needs its own hub_token_file_env distinct from worker.hub_token_file_env",
+                    adapter.workload
+                )
+            };
+            delivery::verify_token_separation(&config.worker.hub_token_file_env, token_env)?;
+            if let Some(prev_env) = pack_token_envs.insert(pack.to_owned(), token_env.to_owned()) {
+                if prev_env != token_env {
+                    bail!(
+                        "delivery_pack '{pack}' has conflicting hub_token_file_env values ('{prev_env}' vs '{token_env}')"
+                    )
+                }
+            }
+        }
         for queue in &adapter.queues {
             for profile in &adapter.profiles {
                 if !served.insert((adapter.workload.clone(), queue.clone(), profile.clone())) {
@@ -886,6 +958,21 @@ async fn execute_job(
         );
         return fail(&client, &lease, "invalid_input").await;
     };
+    if !adapter.preempt_requeue && job.max_attempts != 1 {
+        warn!(
+            job = %lease.job_id.as_str(),
+            max_attempts = job.max_attempts,
+            "non-requeueing adapter requires max_attempts == 1"
+        );
+        return fail_terminal(&client, &lease, "invalid_input:max_attempts_must_be_1").await;
+    }
+    if !adapter.preempt_requeue && !client.mark_require_settlement(&lease).await? {
+        warn!(
+            job = %lease.job_id.as_str(),
+            "lease was fenced before persisting require_settlement"
+        );
+        return Ok(());
+    }
     let staging = staging_directory(&config, &lease.job_id, lease.attempt);
     let output_directory = staging.join("out");
     let cancel_path = staging.join("CANCEL");
@@ -895,6 +982,26 @@ async fn execute_job(
             output_directory.display()
         )
     })?;
+    // For pack_output / isolated cross-UID runner handoff, explicitly set group-write
+    // setgid mode (0o2770) on job/attempt/out directories regardless of process umask
+    // so the separate `infernix-image-runner` UID (in the shared handoff group) can
+    // create `journal/` and publish `out/image.png`.
+    if adapter.delivery_mode == DeliveryMode::PackOutput
+        || std::env::var_os("INFERNIX_IMAGE_RUNNER_SOCKET").is_some()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [
+            staging.parent(),
+            Some(staging.as_path()),
+            Some(output_directory.as_path()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770))
+                .with_context(|| format!("set shared handoff permissions on {}", dir.display()))?;
+        }
+    }
 
     let envelope = JobEnvelope {
         protocol_version: PROTOCOL_VERSION,
@@ -921,11 +1028,10 @@ async fn execute_job(
     )
     .await?;
 
-    // A preemption hands the job back without spending its attempt; the
-    // ledger's retry delay bounds the retries. Whatever the exit code, the
-    // adapter's group must be empty before this worker decides between
-    // completion and release, and the adapter exits 15 on SIGTERM, so this
-    // must never reach the cancellation path.
+    // A preemption hands the job back without spending its attempt when
+    // `preempt_requeue` is true; non-idempotent post-submit adapters
+    // (`preempt_requeue = false`) only return to pending on a proven pre-start
+    // `EXIT_RESOURCE_BUSY` (10) refusal and otherwise fail terminally without retry.
     if run.preempted {
         ensure_group_gone(
             &client,
@@ -936,16 +1042,29 @@ async fn execute_job(
             &mut run.heartbeat,
         )
         .await?;
-        if run.output.status.code() != Some(0) {
-            // The reclaim reuses this attempt's staging directory, so the
-            // `CANCEL` written by the preemption must not survive the release.
+        let exit_code = run.output.status.code();
+        if exit_code != Some(0) {
             clear_cancel(&cancel_path);
-            release_preempted(&client, &config, &lease).await?;
+            if adapter.preempt_requeue {
+                release_preempted(&client, &config, &lease).await?;
+            } else if exit_code == Some(EXIT_RESOURCE_BUSY) {
+                release_busy(&client, &config, &lease).await?;
+            } else if exit_code == Some(EXIT_CANCELLED) {
+                fail_terminal(&client, &lease, "interrupted").await?;
+            } else {
+                fail_terminal(&client, &lease, "interrupted_unsettled").await?;
+            }
             return Ok(());
         }
     }
 
-    if run.cancel_requested {
+    let code = run.output.status.code();
+
+    // For pack_output jobs, a verified exit-0 render races cancellation through
+    // the ledger fence so a completed output is preserved instead of discarded.
+    if run.cancel_requested
+        && !(adapter.delivery_mode == DeliveryMode::PackOutput && code == Some(0))
+    {
         ensure_group_gone(
             &client,
             &config,
@@ -955,6 +1074,19 @@ async fn execute_job(
             &mut run.heartbeat,
         )
         .await?;
+        if !adapter.preempt_requeue && code != Some(EXIT_CANCELLED) {
+            warn!(
+                job = %lease.job_id.as_str(),
+                exit_code = ?code,
+                "adapter exited without proving engine settlement during cancellation; refusing to confirm cancelled"
+            );
+            fail_terminal(&client, &lease, "cancel_unsettled").await?;
+            bail!(
+                "job {} cancellation unsettled (adapter exit {:?})",
+                lease.job_id.as_str(),
+                code
+            )
+        }
         if client.confirm_cancelled(&lease).await? {
             info!(job = %lease.job_id.as_str(), "cancellation confirmed");
         } else {
@@ -963,17 +1095,22 @@ async fn execute_job(
         return Ok(());
     }
 
-    let code = run.output.status.code();
     match code {
         Some(0) => finish_success(&client, &config, &adapter, &staging, &job, run, shutdown).await,
         Some(EXIT_RESOURCE_BUSY) => {
             release_busy(&client, &config, &lease).await?;
             Ok(())
         }
-        Some(EXIT_GPU_UNAVAILABLE) => fail(&client, &lease, "gpu_unavailable").await,
-        Some(EXIT_OOM) => fail(&client, &lease, "oom").await,
-        Some(EXIT_BACKEND_MISMATCH) => fail(&client, &lease, "backend_mismatch").await,
-        Some(EXIT_INVALID_INPUT) => fail(&client, &lease, "invalid_input").await,
+        Some(EXIT_GPU_UNAVAILABLE) => {
+            fail_for_adapter(&client, &adapter, &lease, "gpu_unavailable").await
+        }
+        Some(EXIT_OOM) => fail_for_adapter(&client, &adapter, &lease, "oom").await,
+        Some(EXIT_BACKEND_MISMATCH) => {
+            fail_for_adapter(&client, &adapter, &lease, "backend_mismatch").await
+        }
+        Some(EXIT_INVALID_INPUT) => {
+            fail_for_adapter(&client, &adapter, &lease, "invalid_input").await
+        }
         Some(EXIT_CANCELLED) => {
             // The adapter reported cancellation itself: its group still has to
             // be empty before the ledger records the cancellation.
@@ -989,14 +1126,14 @@ async fn execute_job(
             if !client.confirm_cancelled(&lease).await? {
                 // The adapter cancelled without a ledger request: fail rather
                 // than leave the lease dangling until it expires.
-                return fail(&client, &lease, "cancelled").await;
+                return fail_for_adapter(&client, &adapter, &lease, "cancelled").await;
             }
             info!(job = %lease.job_id.as_str(), "adapter-reported cancellation confirmed");
             Ok(())
         }
         other => {
             let error = format!("adapter exited with {other:?}");
-            fail(&client, &lease, &error).await?;
+            fail_for_adapter(&client, &adapter, &lease, &error).await?;
             bail!("job {} failed: {error}", lease.job_id.as_str())
         }
     }
@@ -1025,7 +1162,27 @@ async fn run_adapter(
     if let Some(directory) = &adapter.working_directory {
         command.current_dir(directory);
     }
+    // Strip workerd's database URL, generic procedure token, systemd credential dir,
+    // and every other adapter's token env so adapters only see their own scoped env.
+    command.env_remove(&config.database_url_env);
+    command.env_remove(&config.worker.hub_token_file_env);
+    command.env_remove("CREDENTIALS_DIRECTORY");
+    for other in &config.adapters {
+        if let Some(other_env) = &other.hub_token_file_env {
+            if adapter.hub_token_file_env.as_deref() != Some(other_env.as_str()) {
+                command.env_remove(other_env);
+            }
+        }
+    }
     command.envs(&adapter.environment);
+    if adapter.delivery_mode == DeliveryMode::PackOutput {
+        if let Some(token_env) = &adapter.hub_token_file_env {
+            command.env("INFERNIX_PACK_WORKER_TOKEN_FILE_ENV", token_env);
+        }
+        if let Some(hub_url) = &config.worker.hub_url {
+            command.env("INFERNIX_PACK_HUB_URL", hub_url);
+        }
+    }
     command.env(
         "INFERNIX_WORKLOAD_STAGING_DIRECTORY",
         &envelope.staging_directory,
@@ -1423,6 +1580,30 @@ async fn fail(
     Ok(())
 }
 
+async fn fail_terminal(
+    client: &WorkloadClient,
+    lease: &infernix_workload::Lease,
+    error: &str,
+) -> Result<()> {
+    if client.fail_terminal(lease, error).await?.is_none() {
+        warn!(job = %lease.job_id.as_str(), "terminal failure report was fenced");
+    }
+    Ok(())
+}
+
+async fn fail_for_adapter(
+    client: &WorkloadClient,
+    adapter: &AdapterConfig,
+    lease: &infernix_workload::Lease,
+    error: &str,
+) -> Result<()> {
+    if adapter.preempt_requeue {
+        fail(client, lease, error).await
+    } else {
+        fail_terminal(client, lease, error).await
+    }
+}
+
 async fn finish_success(
     client: &WorkloadClient,
     config: &Config,
@@ -1435,6 +1616,7 @@ async fn finish_success(
     let lease = &job.lease;
     let AdapterRun {
         output,
+        cancel_requested,
         pid,
         kill_at,
         mut heartbeat,
@@ -1446,7 +1628,7 @@ async fn finish_success(
             Ok(validated) => Some(validated),
             Err(error) => {
                 let reason = format!("invalid_result:{}", error.code());
-                fail(client, lease, &reason).await?;
+                fail_for_adapter(client, adapter, lease, &reason).await?;
                 bail!(
                     "job {} produced an invalid result: {reason}",
                     lease.job_id.as_str()
@@ -1458,10 +1640,35 @@ async fn finish_success(
     };
 
     let stored = match &validated {
-        Some(validated) => {
-            let (hub_url, generation) = delivery_coordinates(config, &job.payload)?;
-            validated.clone().with_delivery(&hub_url, &generation).value
-        }
+        Some(validated) => match adapter.delivery_mode {
+            DeliveryMode::Generations => {
+                let (hub_url, generation) = delivery_coordinates(config, &job.payload)?;
+                validated.clone().with_delivery(&hub_url, &generation).value
+            }
+            DeliveryMode::PackOutput => {
+                if validated.artifacts.len() != 1 {
+                    fail_for_adapter(client, adapter, lease, "invalid_result:pack_output_count")
+                        .await?;
+                    bail!(
+                        "job {} with pack_output must produce exactly 1 artifact, got {}",
+                        lease.job_id.as_str(),
+                        validated.artifacts.len()
+                    )
+                }
+                let (pack, pack_job_id) =
+                    pack_delivery_coordinates(adapter, &job.payload, lease.job_id.as_str())?;
+                validated
+                    .clone()
+                    .with_pack_delivery(result::PackDeliveryMeta {
+                        pack: &pack,
+                        pack_job_id: &pack_job_id,
+                        lease_token: lease.token.as_str(),
+                        worker_id: lease.worker_id.as_str(),
+                        attempt: lease.attempt,
+                    })
+                    .value
+            }
+        },
         None => {
             if output.stdout.is_empty() {
                 json!({"status": "completed"})
@@ -1472,46 +1679,43 @@ async fn finish_success(
         }
     };
 
-    if !client.complete(lease, &stored).await? {
-        // A requested cancellation refuses completion: the adapter's group must
-        // be empty (ESRCH) before the worker confirms the cancellation.
+    let completed = if adapter.delivery_mode == DeliveryMode::PackOutput {
+        client.complete_allow_cancel_race(lease, &stored).await?
+    } else {
+        client.complete(lease, &stored).await?
+    };
+
+    if !completed {
+        // A requested cancellation or expired lease refused completion.
         ensure_group_gone(client, config, lease, pid, kill_at, &mut heartbeat).await?;
-        if client.confirm_cancelled(lease).await? {
+        if adapter.preempt_requeue && client.confirm_cancelled(lease).await? {
             info!(
                 job = %lease.job_id.as_str(),
                 "cancellation confirmed instead of completion"
             );
             return Ok(());
         }
-        // Another attempt won the lease; its result is the only one uploaded.
         warn!(
             job = %lease.job_id.as_str(),
+            cancel_requested,
             "completion was fenced; nothing is uploaded"
         );
         return Ok(());
     }
 
     if let Some(validated) = &validated {
-        let hub_url = stored["delivery"]["hubUrl"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        let generation = stored["delivery"]["generationRequestId"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
         if *shutdown.borrow() {
             return Ok(());
         }
         tokio::select! {
-            result = deliver_artifacts(
+            result = deliver_from_stored(
                 client,
                 config,
+                adapter,
                 &job_id,
                 &lease.worker_id,
-                &hub_url,
-                &generation,
-                validated,
+                &stored["delivery"],
+                &validated.artifacts,
             ) => result?,
             _ = shutdown.changed() => return Ok(()),
         }
@@ -1524,30 +1728,168 @@ async fn finish_success(
     Ok(())
 }
 
-async fn deliver_artifacts(
+async fn deliver_from_stored(
     client: &WorkloadClient,
     config: &Config,
+    adapter: &AdapterConfig,
     job_id: &JobId,
     worker: &WorkerId,
-    hub_url: &str,
-    generation: &str,
-    validated: &ValidatedResult,
+    coordinates: &Value,
+    artifacts: &[crate::result::ValidatedArtifact],
 ) -> Result<()> {
-    let token = delivery::read_token(&config.worker.hub_token_file_env)?;
-    let hub = HubDelivery::new(hub_url, generation, token)?;
     let http = delivery::http_client()?;
-    let outcomes = delivery::deliver_all(&http, &hub, &validated.artifacts).await?;
-    client.mark_delivered(job_id, worker).await?;
-    info!(
-        job = %job_id.as_str(),
-        artifacts = validated.artifacts.len(),
-        replays = outcomes
-            .iter()
-            .filter(|outcome| **outcome == delivery::DeliveryOutcome::Replayed)
-            .count(),
-        "artifacts delivered"
-    );
-    Ok(())
+    deliver_from_stored_with_http(
+        client,
+        config,
+        adapter,
+        job_id,
+        worker,
+        &http,
+        coordinates,
+        artifacts,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_from_stored_with_http(
+    client: &WorkloadClient,
+    config: &Config,
+    adapter: &AdapterConfig,
+    job_id: &JobId,
+    worker: &WorkerId,
+    http: &reqwest::Client,
+    coordinates: &Value,
+    artifacts: &[crate::result::ValidatedArtifact],
+) -> Result<()> {
+    // Dispatch strictly on the trusted configured adapter's delivery_mode — NEVER
+    // let persisted DB result JSON select the credential class or switch packs.
+    let persisted_mode = coordinates.get("mode").and_then(Value::as_str);
+    match adapter.delivery_mode {
+        DeliveryMode::Generations => {
+            if let Some(m) = persisted_mode {
+                if m != "generations" {
+                    bail!(
+                        "persisted delivery mode '{m}' contradicts configured generations adapter"
+                    );
+                }
+            }
+            let hub_url = coordinates
+                .get("hubUrl")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+            let generation = coordinates
+                .get("generationRequestId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+            let token = delivery::read_token(&config.worker.hub_token_file_env)?;
+            let hub = HubDelivery::new(hub_url, generation, token)?;
+            let outcomes = delivery::deliver_all(http, &hub, artifacts).await?;
+            client.mark_delivered(job_id, worker).await?;
+            info!(
+                job = %job_id.as_str(),
+                artifacts = artifacts.len(),
+                replays = outcomes
+                    .iter()
+                    .filter(|outcome| **outcome == delivery::DeliveryOutcome::Replayed)
+                    .count(),
+                "artifacts delivered"
+            );
+            Ok(())
+        }
+        DeliveryMode::PackOutput => {
+            if persisted_mode != Some("pack_output") {
+                bail!(
+                    "persisted delivery mode {:?} contradicts configured pack_output adapter",
+                    persisted_mode
+                );
+            }
+            let [artifact] = artifacts else {
+                bail!("pack_output delivery requires exactly one artifact");
+            };
+            let configured_pack = adapter
+                .delivery_pack
+                .as_deref()
+                .ok_or_else(|| anyhow!("configured pack_output adapter missing delivery_pack"))?;
+            let persisted_pack = coordinates
+                .get("pack")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+            if persisted_pack != configured_pack {
+                bail!(
+                    "persisted delivery pack '{persisted_pack}' contradicts configured adapter pack '{configured_pack}'"
+                );
+            }
+            let pack_job_id = coordinates
+                .get("packJobId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+            let lease_token = coordinates
+                .get("leaseToken")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+            let worker_id = coordinates
+                .get("workerId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+            let attempt = coordinates
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
+            // Resolve BOTH hub origin and pack token env exclusively from the
+            // worker's current trusted adapter configuration.
+            let hub_url = config
+                .worker
+                .hub_url
+                .as_deref()
+                .ok_or_else(|| anyhow!("worker.hub_url is not configured for pack_output"))?;
+            let token_env = adapter
+                .hub_token_file_env
+                .as_deref()
+                .ok_or_else(|| anyhow!("configured pack adapter missing hub_token_file_env"))?;
+            delivery::verify_token_separation(&config.worker.hub_token_file_env, token_env)?;
+            let token = delivery::read_token(token_env)?;
+            let target = PackOutputDelivery::new(
+                hub_url,
+                configured_pack,
+                pack_job_id,
+                token,
+                lease_token.to_owned(),
+                worker_id.to_owned(),
+                attempt,
+            )?;
+            let outcome = delivery::deliver_pack_output(http, &target, artifact).await?;
+            client.mark_delivered(job_id, worker).await?;
+            info!(
+                job = %job_id.as_str(),
+                pack = configured_pack,
+                replayed = outcome == delivery::DeliveryOutcome::Replayed,
+                "pack output delivered"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn pack_delivery_coordinates(
+    adapter: &AdapterConfig,
+    payload: &Value,
+    fallback_job_id: &str,
+) -> Result<(String, String)> {
+    let pack = adapter
+        .delivery_pack
+        .clone()
+        .ok_or_else(|| anyhow!("adapter missing delivery_pack"))?;
+    let pack_job_id = payload
+        .get("packJobId")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_job_id)
+        .to_owned();
+    if !delivery::valid_pack_segment(&pack_job_id) {
+        bail!("the payload packJobId is invalid");
+    }
+    Ok((pack, pack_job_id))
 }
 
 /// Hub coordinates travel in the job payload (spec section 2), with the
@@ -1676,19 +2018,32 @@ async fn finish_one_delivery(
             return Ok(());
         }
     };
+    let adapter = adapter_for(
+        config,
+        &status.workload,
+        &status.queue,
+        job_profile(&status.requirements),
+    )
+    .ok_or_else(|| {
+        anyhow!(
+            "no currently configured adapter serves {}:{} ({:?}) for retained delivery",
+            status.workload,
+            status.queue,
+            job_profile(&status.requirements)
+        )
+    })?;
     let coordinates = stored.get("delivery").cloned().unwrap_or(Value::Null);
-    let hub_url = coordinates
-        .get("hubUrl")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
-    let generation = coordinates
-        .get("generationRequestId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!(DELIVERY_METADATA_MISSING))?;
-    let token = delivery::read_token(&config.worker.hub_token_file_env)?;
-    let hub = HubDelivery::new(hub_url, generation, token)?;
-    delivery::deliver_all(http, &hub, &artifacts).await?;
-    client.mark_delivered(&job_id, worker).await?;
+    deliver_from_stored_with_http(
+        client,
+        config,
+        adapter,
+        &job_id,
+        worker,
+        http,
+        &coordinates,
+        &artifacts,
+    )
+    .await?;
     remove_staging(&staging);
     info!(job = %job_id.as_str(), "recovered delivery");
     Ok(())
@@ -1919,5 +2274,157 @@ timeout_secs = {timeout_secs}
             "a deny observed by a run must invalidate the cached admit"
         );
         std::fs::remove_file(&probes).unwrap();
+    }
+
+    #[test]
+    fn pack_output_adapter_requires_separate_token_env_hub_url_and_pack_name() {
+        let valid: Config = toml::from_str(
+            r#"
+[worker]
+id = "atlas"
+hub_url = "http://127.0.0.1:8014"
+
+[[adapters]]
+workload = "vagrant"
+queues = ["image"]
+profiles = ["vagrant.z-image-turbo-text"]
+command = "/bin/true"
+artifacts = true
+delivery_mode = "pack_output"
+delivery_pack = "vagrant"
+hub_token_file_env = "INFERNIX_VAGRANT_WORKER_TOKEN_FILE"
+preempt_requeue = false
+"#,
+        )
+        .unwrap();
+        assert!(validate_config(&valid).is_ok());
+        assert!(!valid.adapters[0].preempt_requeue);
+
+        let missing_hub_url: Config = toml::from_str(
+            r#"
+[worker]
+id = "atlas"
+
+[[adapters]]
+workload = "vagrant"
+queues = ["image"]
+profiles = ["vagrant.z-image-turbo-text"]
+command = "/bin/true"
+artifacts = true
+delivery_mode = "pack_output"
+delivery_pack = "vagrant"
+hub_token_file_env = "INFERNIX_VAGRANT_WORKER_TOKEN_FILE"
+"#,
+        )
+        .unwrap();
+        assert!(validate_config(&missing_hub_url).is_err());
+
+        let same_token: Config = toml::from_str(
+            r#"
+[worker]
+id = "atlas"
+hub_url = "http://127.0.0.1:8014"
+
+[[adapters]]
+workload = "vagrant"
+queues = ["image"]
+profiles = ["vagrant.z-image-turbo-text"]
+command = "/bin/true"
+artifacts = true
+delivery_mode = "pack_output"
+delivery_pack = "vagrant"
+hub_token_file_env = "INFERNIX_HUB_TOKEN_FILE"
+"#,
+        )
+        .unwrap();
+        assert!(validate_config(&same_token).is_err());
+
+        let missing_pack: Config = toml::from_str(
+            r#"
+[worker]
+id = "atlas"
+hub_url = "http://127.0.0.1:8014"
+
+[[adapters]]
+workload = "vagrant"
+queues = ["image"]
+profiles = ["vagrant.z-image-turbo-text"]
+command = "/bin/true"
+artifacts = true
+delivery_mode = "pack_output"
+hub_token_file_env = "INFERNIX_VAGRANT_WORKER_TOKEN_FILE"
+"#,
+        )
+        .unwrap();
+        assert!(validate_config(&missing_pack).is_err());
+    }
+
+    #[test]
+    fn token_separation_rejects_aliased_files_and_identical_contents() {
+        let dir = std::env::temp_dir().join(format!(
+            "infx-tok-sep-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f_gen = dir.join("gen.tok");
+        let f_same_content = dir.join("pack-copy.tok");
+        let f_distinct = dir.join("pack-distinct.tok");
+        let f_empty = dir.join("pack-empty.tok");
+        let f_missing = dir.join("pack-missing.tok");
+        let f_link = dir.join("pack-link.tok");
+        std::fs::write(&f_gen, "shared-secret-value\n").unwrap();
+        std::fs::write(&f_same_content, "shared-secret-value\n").unwrap();
+        std::fs::write(&f_distinct, "distinct-pack-secret\n").unwrap();
+        std::fs::write(&f_empty, "   \n").unwrap();
+        std::os::unix::fs::symlink(&f_gen, &f_link).unwrap();
+
+        let env_gen = format!(
+            "INFERNIX_TEST_GEN_{}",
+            &Uuid::new_v4().simple().to_string()[..6]
+        );
+        let env_link = format!(
+            "INFERNIX_TEST_LINK_{}",
+            &Uuid::new_v4().simple().to_string()[..6]
+        );
+        let env_copy = format!(
+            "INFERNIX_TEST_COPY_{}",
+            &Uuid::new_v4().simple().to_string()[..6]
+        );
+        let env_empty = format!(
+            "INFERNIX_TEST_EMPTY_{}",
+            &Uuid::new_v4().simple().to_string()[..6]
+        );
+        let env_missing = format!(
+            "INFERNIX_TEST_MISS_{}",
+            &Uuid::new_v4().simple().to_string()[..6]
+        );
+        let env_ok = format!(
+            "INFERNIX_TEST_OK_{}",
+            &Uuid::new_v4().simple().to_string()[..6]
+        );
+
+        // SAFETY: unique test-scoped env var names.
+        unsafe {
+            std::env::set_var(&env_gen, &f_gen);
+            std::env::set_var(&env_link, &f_link);
+            std::env::set_var(&env_copy, &f_same_content);
+            std::env::set_var(&env_empty, &f_empty);
+            std::env::set_var(&env_missing, &f_missing);
+            std::env::set_var(&env_ok, &f_distinct);
+        }
+        assert!(delivery::verify_token_separation(&env_gen, &env_link).is_err());
+        assert!(delivery::verify_token_separation(&env_gen, &env_copy).is_err());
+        assert!(delivery::verify_token_separation(&env_gen, &env_empty).is_err());
+        assert!(delivery::verify_token_separation(&env_gen, &env_missing).is_err());
+        assert!(delivery::verify_token_separation(&env_gen, &env_ok).is_ok());
+        unsafe {
+            std::env::remove_var(&env_gen);
+            std::env::remove_var(&env_link);
+            std::env::remove_var(&env_copy);
+            std::env::remove_var(&env_empty);
+            std::env::remove_var(&env_missing);
+            std::env::remove_var(&env_ok);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

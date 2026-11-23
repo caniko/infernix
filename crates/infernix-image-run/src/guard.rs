@@ -93,10 +93,16 @@ pub struct QuarantineState {
     pub qwen_pgid: Option<u32>,
     #[serde(default)]
     pub qwen_vram_baseline_mib: Option<u64>,
+    #[serde(default)]
+    pub qwen_stage_dir: Option<PathBuf>,
     /// True whenever lease acquisition or release left host lease restoration unverified;
     /// preserved across quarantine updates so auto-clearable kinds can never weaken it.
     #[serde(default)]
     pub lease_uncertain: bool,
+    /// Original acquired lease deferred while the engine was quarantined; must be
+    /// released via the lease hook after engine settlement before clearing quarantine.
+    #[serde(default)]
+    pub pending_lease_release: Option<LeaseContext>,
 }
 
 /// Process-local quarantine latches keyed by `quarantine_path`.
@@ -158,6 +164,12 @@ pub fn record_quarantine(
             if !merged.reason.contains(&prev.reason) {
                 merged.reason = format!("{}; {}", prev.reason, merged.reason);
             }
+        }
+        if merged.pending_lease_release.is_none() {
+            merged.pending_lease_release = prev.pending_lease_release;
+        }
+        if merged.qwen_stage_dir.is_none() {
+            merged.qwen_stage_dir = prev.qwen_stage_dir;
         }
     }
     if let Err(err) = write_quarantine(path, &merged) {
@@ -541,11 +553,14 @@ impl Drop for FileLock {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LeaseContext {
     pub job_id: String,
     pub profile_id: String,
+    #[serde(default)]
     pub lease_id: Option<String>,
+    #[serde(default)]
     pub lease_generation: Option<u64>,
 }
 
@@ -637,7 +652,9 @@ impl ActiveLease {
                         qwen_cgroup: None,
                         qwen_pgid: None,
                         qwen_vram_baseline_mib: None,
+                        qwen_stage_dir: None,
                         lease_uncertain: true,
+                        pending_lease_release: None,
                     },
                     None,
                 )?;
@@ -663,6 +680,30 @@ impl ActiveLease {
                 "lease recheck failed to execute: {msg}"
             ))),
         }
+    }
+
+    pub fn pending_release_context(&self) -> Option<LeaseContext> {
+        self.acquired.then(|| self.ctx.clone())
+    }
+
+    /// Release a lease previously deferred while engine quarantine was active.
+    pub async fn release_pending(
+        cfg: &GuardConfig,
+        ctx: &LeaseContext,
+        quarantine_path: &Path,
+    ) -> RunnerResult<()> {
+        if cfg.lease_hook.is_empty() {
+            return Err(RunnerError::gpu_unavailable(
+                "cannot release deferred quarantine lease: no local lease hook is configured",
+            ));
+        }
+        let mut lease = Self {
+            hook: cfg.lease_hook.clone(),
+            timeout: cfg.lease_timeout,
+            ctx: ctx.clone(),
+            acquired: true,
+        };
+        lease.release(quarantine_path).await
     }
 
     /// Release the acquired lease. On failure, retains `acquired = true`, writes a
@@ -698,7 +739,9 @@ impl ActiveLease {
                         qwen_cgroup: None,
                         qwen_pgid: None,
                         qwen_vram_baseline_mib: None,
+                        qwen_stage_dir: None,
                         lease_uncertain: true,
+                        pending_lease_release: None,
                     },
                     None,
                 )?;

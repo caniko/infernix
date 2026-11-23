@@ -157,6 +157,9 @@ async fn check_or_resolve_quarantine(
     match q.kind.as_str() {
         "comfy_unsettled" => {
             if invocation_is_dead(q.comfy_unit.as_deref(), q.comfy_invocation_id.as_deref()).await {
+                if let Some(pending) = q.pending_lease_release.as_ref() {
+                    ActiveLease::release_pending(&cfg.guard, pending, quarantine_path).await?;
+                }
                 clear_quarantine(quarantine_path)?;
                 return Ok(());
             }
@@ -178,6 +181,21 @@ async fn check_or_resolve_quarantine(
             if cg_empty && pg_gone && vram_restored {
                 if let Some(cg) = &q.qwen_cgroup {
                     let _ = fs::remove_dir(cg);
+                }
+                if let Some(stage_dir) = &q.qwen_stage_dir {
+                    match fs::remove_dir_all(stage_dir) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(RunnerError::gpu_unavailable(format!(
+                                "failed to remove quarantined Qwen staging dir {}: {err}",
+                                stage_dir.display()
+                            )));
+                        }
+                    }
+                }
+                if let Some(pending) = q.pending_lease_release.as_ref() {
+                    ActiveLease::release_pending(&cfg.guard, pending, quarantine_path).await?;
                 }
                 clear_quarantine(quarantine_path)?;
                 return Ok(());
@@ -419,7 +437,9 @@ pub async fn execute_request(
     };
 
     // Retain lease fencing when the engine entered quarantine: never restore
-    // other GPU tenants onto an unsettled host/GPU.
+    // other GPU tenants onto an unsettled host/GPU. The engine's atomic quarantine
+    // write already persisted `pending_lease_release` so host restoration runs once
+    // engine settlement succeeds.
     if quarantined.load(Ordering::SeqCst) {
         return outcome;
     }

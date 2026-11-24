@@ -4612,8 +4612,22 @@ async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
         .await
         .expect("cgroup recheck succeeds");
 
-    // 3. Release clears env token and omits --cgroup / --attempt-id.
+    // 3. Ordinary release forwards attempt-id & private env token (never --reconcile).
     lease.release(&quarantine).await.expect("release succeeds");
+
+    // 3b. Deferred quarantine reconciliation passes explicit --reconcile and scrubs env token.
+    ActiveLease::release_pending(
+        &cfg,
+        &LeaseContext {
+            job_id: "job.50-pending".to_owned(),
+            profile_id: "vagrant.qwen-image-edit-2511-lightning-4".to_owned(),
+            lease_id: Some("batch-50".to_owned()),
+            lease_generation: Some(9),
+        },
+        &quarantine,
+    )
+    .await
+    .expect("reconcile release_pending succeeds");
 
     let lines: Vec<String> = fs::read_to_string(&log_file)
         .unwrap()
@@ -4622,8 +4636,8 @@ async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
         .collect();
     assert_eq!(
         lines.len(),
-        4,
-        "expected acquire, plain recheck, cgroup recheck, release: {lines:?}"
+        5,
+        "expected acquire, plain recheck, cgroup recheck, ordinary release, reconcile release: {lines:?}"
     );
 
     assert!(lines[0].starts_with("ARGS:acquire --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9|TOKEN:"));
@@ -4659,7 +4673,12 @@ async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
 
     assert_eq!(
         lines[3],
-        "ARGS:release --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9|TOKEN:"
+        "ARGS:release --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9 --attempt-id 77|TOKEN:0123456789abcdef0123456789abcdef"
+    );
+
+    assert_eq!(
+        lines[4],
+        "ARGS:release --job-id job.50-pending --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9 --reconcile|TOKEN:"
     );
 
     // 4. End-to-end Qwen execution invokes acquire -> pre-spawn recheck -> in-loop recheck (>=1s) -> release
@@ -4799,4 +4818,13 @@ async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
             "every Qwen recheck must forward slot attempt-id and private env token: {line}"
         );
     }
+    let release_line = e2e_lines
+        .iter()
+        .find(|l| l.starts_with("ARGS:release "))
+        .expect("e2e qwen run must invoke lease release");
+    assert!(
+        release_line.contains("--attempt-id 88|TOKEN:fedcba9876543210fedcba9876543210")
+            && !release_line.contains("--reconcile"),
+        "normal Qwen release must forward attempt-id and private env token without --reconcile: {release_line}"
+    );
 }

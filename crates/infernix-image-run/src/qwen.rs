@@ -135,17 +135,47 @@ fn child_exited_without_reap(pid: u32) -> bool {
     unsafe { info.si_pid() != 0 }
 }
 
-/// True if any process other than `leader_pid` itself currently belongs to
-/// process group `leader_pid`. Only called while `leader_pid` is still unreaped
-/// so PGID `leader_pid` cannot have been recycled.
-fn other_members_in_pgid(leader_pid: u32) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PgidScan {
+    Empty,
+    Populated,
+    Inconclusive,
+}
+
+/// Parse the process group ID (field 5, `pgrp`) from raw `/proc/<pid>/stat`
+/// bytes without requiring UTF-8 for `comm` (field 2), anchored after the last
+/// `b')'` byte so arbitrary Linux process names (non-UTF-8 or containing `)`)
+/// are handled faithfully.
+fn parse_proc_stat_pgrp(stat_bytes: &[u8]) -> Option<u32> {
+    let rparen = stat_bytes.iter().rposition(|&b| b == b')')?;
+    let after_comm = stat_bytes.get(rparen + 1..)?;
+    let mut fields = after_comm
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|tok| !tok.is_empty());
+    let _state = fields.next()?;
+    let _ppid = fields.next()?;
+    let pgrp_bytes = fields.next()?;
+    std::str::from_utf8(pgrp_bytes).ok()?.parse::<u32>().ok()
+}
+
+/// Inspect `proc_root` (production: `/proc`) for any process other than
+/// `leader_pid` whose PGID equals `leader_pid`. Distinguishes a proven-empty
+/// group (`PgidScan::Empty`) from a populated group (`PgidScan::Populated`) or
+/// an unreadable/inconclusive scan (`PgidScan::Inconclusive`) so failed
+/// observation is NEVER mistaken for a drained process group.
+fn scan_proc_root_for_pgid(proc_root: &Path, leader_pid: u32) -> PgidScan {
     if leader_pid == 0 {
-        return false;
+        return PgidScan::Empty;
     }
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return false;
+    let Ok(entries) = fs::read_dir(proc_root) else {
+        return PgidScan::Inconclusive;
     };
-    for entry in entries.flatten() {
+    let mut saw_unreadable = false;
+    for entry_res in entries {
+        let Ok(entry) = entry_res else {
+            saw_unreadable = true;
+            continue;
+        };
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
             continue;
@@ -156,22 +186,34 @@ fn other_members_in_pgid(leader_pid: u32) -> bool {
         if p == leader_pid {
             continue;
         }
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let Some(after_comm) = stat.rfind(')').and_then(|idx| stat.get(idx + 1..)) else {
-            continue;
-        };
-        let mut fields = after_comm.split_whitespace();
-        let _state = fields.next();
-        let _ppid = fields.next();
-        if let Some(pgrp_str) = fields.next() {
-            if pgrp_str.parse::<u32>().ok() == Some(leader_pid) {
-                return true;
+        let stat_bytes = match fs::read(entry.path().join("stat")) {
+            Ok(bytes) => bytes,
+            Err(err)
+                if err.kind() == ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                // Process exited concurrently while scanning `/proc`.
+                continue;
             }
+            Err(_) => {
+                saw_unreadable = true;
+                continue;
+            }
+        };
+        match parse_proc_stat_pgrp(&stat_bytes) {
+            Some(pgrp) if pgrp == leader_pid => return PgidScan::Populated,
+            Some(_) => {}
+            None => saw_unreadable = true,
         }
     }
-    false
+    if saw_unreadable {
+        PgidScan::Inconclusive
+    } else {
+        PgidScan::Empty
+    }
+}
+
+fn scan_other_members_in_pgid(leader_pid: u32) -> PgidScan {
+    scan_proc_root_for_pgid(Path::new("/proc"), leader_pid)
 }
 
 pub fn group_gone(pid: u32) -> bool {
@@ -733,11 +775,12 @@ async fn terminate_and_drain(
 
     // Uncontained fallback (`cg.is_none()`): NEVER signal `-pid` after reaping
     // the leader. Poll with `WNOWAIT` so the zombie leader reserves PGID `pid`
-    // until all descendants have exited.
+    // until all descendants have exited. Only `PgidScan::Empty` proves drain;
+    // `Populated` and `Inconclusive` both fail closed.
     signal_group_unreaped(pid, libc::SIGTERM);
     let term_deadline = Instant::now() + grace;
     loop {
-        if child_exited_without_reap(pid) && !other_members_in_pgid(pid) {
+        if child_exited_without_reap(pid) && scan_other_members_in_pgid(pid) == PgidScan::Empty {
             let _ = child.try_wait();
             return Ok(());
         }
@@ -751,14 +794,17 @@ async fn terminate_and_drain(
     let kill_deadline = Instant::now() + kill_wait;
     let mut drained_before_reap = false;
     while Instant::now() < kill_deadline {
-        if child_exited_without_reap(pid) && !other_members_in_pgid(pid) {
+        if child_exited_without_reap(pid) && scan_other_members_in_pgid(pid) == PgidScan::Empty {
             drained_before_reap = true;
             break;
         }
         signal_group_unreaped(pid, libc::SIGKILL);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    if !drained_before_reap && child_exited_without_reap(pid) && !other_members_in_pgid(pid) {
+    if !drained_before_reap
+        && child_exited_without_reap(pid)
+        && scan_other_members_in_pgid(pid) == PgidScan::Empty
+    {
         drained_before_reap = true;
     }
 
@@ -1235,11 +1281,13 @@ pub async fn run_qwen_streaming(
             }
         } else if child_exited_without_reap(pid) {
             let drain_deadline = Instant::now() + qwen.kill_drain_wait;
-            while other_members_in_pgid(pid) && Instant::now() < drain_deadline {
+            while scan_other_members_in_pgid(pid) != PgidScan::Empty
+                && Instant::now() < drain_deadline
+            {
                 signal_group_unreaped(pid, libc::SIGKILL);
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let drained_before_reap = !other_members_in_pgid(pid);
+            let drained_before_reap = scan_other_members_in_pgid(pid) == PgidScan::Empty;
             let status = child
                 .wait()
                 .await
@@ -1747,17 +1795,21 @@ mod tests {
             child_exited_without_reap(u_pid),
             "uncontained leader should exit while remaining unreaped"
         );
-        assert!(
-            other_members_in_pgid(u_pid),
+        assert_eq!(
+            scan_other_members_in_pgid(u_pid),
+            PgidScan::Populated,
             "orphan grandchild should still be alive in unreaped PGID before drain"
         );
         let drain_deadline = Instant::now() + Duration::from_secs(3);
-        while other_members_in_pgid(u_pid) && Instant::now() < drain_deadline {
+        while scan_other_members_in_pgid(u_pid) != PgidScan::Empty
+            && Instant::now() < drain_deadline
+        {
             signal_group_unreaped(u_pid, libc::SIGKILL);
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(
-            !other_members_in_pgid(u_pid),
+        assert_eq!(
+            scan_other_members_in_pgid(u_pid),
+            PgidScan::Empty,
             "grandchild must be drained before reaping leader"
         );
         let status = uncontained.wait().await.unwrap();
@@ -1783,5 +1835,62 @@ mod tests {
         .await
         .expect("uncontained terminate_and_drain cleanly kills leader and grandchild before reap");
         assert!(group_gone(c_pid));
+    }
+
+    #[test]
+    fn proc_pgid_scan_handles_non_utf8_comm_and_fails_closed_on_unreadable_entries() {
+        // Non-UTF-8 bytes and embedded `)` inside comm must still parse pgrp accurately.
+        assert_eq!(
+            parse_proc_stat_pgrp(b"4242 (bad\xff)name) S 1 9999 9999 0 -1\n"),
+            Some(9999)
+        );
+        assert_eq!(parse_proc_stat_pgrp(b"4242 (unclosed S 1 9999\n"), None);
+
+        let base =
+            std::env::temp_dir().join(format!("infernix-pgid-scan-{}", Uuid::new_v4().simple()));
+        // 1. Missing proc root -> Inconclusive (never Empty).
+        assert_eq!(
+            scan_proc_root_for_pgid(&base.join("does-not-exist"), 9999),
+            PgidScan::Inconclusive
+        );
+
+        // 2. Non-UTF-8 comm with matching pgrp -> Populated.
+        let proc_dir = base.join("proc");
+        fs::create_dir_all(proc_dir.join("4242")).unwrap();
+        fs::write(
+            proc_dir.join("4242/stat"),
+            b"4242 (qwen\xfe)worker) S 1 9999 9999 0 -1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            scan_proc_root_for_pgid(&proc_dir, 9999),
+            PgidScan::Populated
+        );
+
+        // 3. Unrelated process only -> Empty.
+        fs::write(
+            proc_dir.join("4242/stat"),
+            b"4242 (other\xfe)worker) S 1 1234 1234 0 -1\n",
+        )
+        .unwrap();
+        assert_eq!(scan_proc_root_for_pgid(&proc_dir, 9999), PgidScan::Empty);
+
+        // 4. Corrupt / unparseable stat file -> Inconclusive (never Empty).
+        fs::create_dir_all(proc_dir.join("4243")).unwrap();
+        fs::write(proc_dir.join("4243/stat"), b"corrupt-stat").unwrap();
+        assert_eq!(
+            scan_proc_root_for_pgid(&proc_dir, 9999),
+            PgidScan::Inconclusive
+        );
+
+        // 5. Unreadable stat (directory at stat path -> EISDIR) -> Inconclusive.
+        fs::remove_file(proc_dir.join("4243/stat")).unwrap();
+        fs::create_dir(proc_dir.join("4243/stat")).unwrap();
+        assert_eq!(
+            scan_proc_root_for_pgid(&proc_dir, 9999),
+            PgidScan::Inconclusive
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

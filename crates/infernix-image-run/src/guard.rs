@@ -623,7 +623,7 @@ impl ActiveLease {
             slot_attempt_id: None,
             slot_token: None,
         };
-        match lease.invoke("acquire", None, false).await {
+        match lease.invoke("acquire", None, None, false).await {
             HookOutcome::Ok { stdout } => {
                 lease.acquired = true;
                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&stdout) {
@@ -651,7 +651,7 @@ impl ActiveLease {
                 let cause = if !allow_ambiguous_release {
                     "lease acquire terminated ambiguously (timeout/signal) while prior engine ownership remained unsettled"
                 } else if matches!(
-                    lease.invoke("release", None, true).await,
+                    lease.invoke("release", None, None, true).await,
                     HookOutcome::Ok { .. }
                 ) {
                     return Err(RunnerError::resource_busy(
@@ -690,14 +690,18 @@ impl ActiveLease {
     }
 
     pub async fn recheck(&self) -> RunnerResult<()> {
-        self.recheck_with_cgroup(None).await
+        self.recheck_with_cgroup(None, None).await
     }
 
-    pub async fn recheck_with_cgroup(&self, cgroup: Option<&str>) -> RunnerResult<()> {
+    pub async fn recheck_with_cgroup(
+        &self,
+        cgroup: Option<&str>,
+        cgroup_identity: Option<(u64, u64)>,
+    ) -> RunnerResult<()> {
         if !self.acquired {
             return Ok(());
         }
-        match self.invoke("recheck", cgroup, false).await {
+        match self.invoke("recheck", cgroup, cgroup_identity, false).await {
             HookOutcome::Ok { .. } => Ok(()),
             HookOutcome::Denied(code) => Err(RunnerError::cancelled(format!(
                 "lease revoked or stale (exit {code})"
@@ -751,7 +755,7 @@ impl ActiveLease {
         if !self.acquired {
             return Ok(());
         }
-        match self.invoke("release", None, reconcile).await {
+        match self.invoke("release", None, None, reconcile).await {
             HookOutcome::Ok { .. } => {
                 self.acquired = false;
                 Ok(())
@@ -790,7 +794,13 @@ impl ActiveLease {
         }
     }
 
-    async fn invoke(&self, action: &str, cgroup: Option<&str>, reconcile: bool) -> HookOutcome {
+    async fn invoke(
+        &self,
+        action: &str,
+        cgroup: Option<&str>,
+        cgroup_identity: Option<(u64, u64)>,
+        reconcile: bool,
+    ) -> HookOutcome {
         let Some((prog, base_args)) = self.hook.split_first() else {
             return HookOutcome::Ok { stdout: Vec::new() };
         };
@@ -810,6 +820,9 @@ impl ActiveLease {
         if action == "recheck" {
             if let Some(cg) = cgroup {
                 cmd.arg("--cgroup").arg(cg);
+            }
+            if let Some((dev, ino)) = cgroup_identity {
+                cmd.arg("--cgroup-inode").arg(format!("{dev}:{ino}"));
             }
             if let Some(attempt_id) = self.slot_attempt_id {
                 cmd.arg("--attempt-id").arg(attempt_id.to_string());

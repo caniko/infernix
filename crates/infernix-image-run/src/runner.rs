@@ -179,9 +179,10 @@ async fn check_or_resolve_quarantine(
                 None => true,
             };
             if cg_empty && pg_gone && vram_restored {
-                if let Some(cg) = &q.qwen_cgroup {
-                    let _ = fs::remove_dir(cg);
-                }
+                // Leave `q.qwen_cgroup` untouched during deferred quarantine recovery:
+                // across process restarts there is no live pinned `dirfd` proving the
+                // directory at that path is still the original cgroup inode rather than
+                // an empty replacement with the same basename.
                 if let Some(stage_dir) = &q.qwen_stage_dir {
                     match fs::remove_dir_all(stage_dir) {
                         Ok(()) => {}

@@ -623,7 +623,7 @@ impl ActiveLease {
             slot_attempt_id: None,
             slot_token: None,
         };
-        match lease.invoke("acquire", None).await {
+        match lease.invoke("acquire", None, false).await {
             HookOutcome::Ok { stdout } => {
                 lease.acquired = true;
                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&stdout) {
@@ -650,7 +650,10 @@ impl ActiveLease {
                 // restoring competing GPU tenants before prompt settlement would violate fencing.
                 let cause = if !allow_ambiguous_release {
                     "lease acquire terminated ambiguously (timeout/signal) while prior engine ownership remained unsettled"
-                } else if matches!(lease.invoke("release", None).await, HookOutcome::Ok { .. }) {
+                } else if matches!(
+                    lease.invoke("release", None, true).await,
+                    HookOutcome::Ok { .. }
+                ) {
                     return Err(RunnerError::resource_busy(
                         "lease acquire terminated ambiguously; cleanup release succeeded",
                     ));
@@ -694,7 +697,7 @@ impl ActiveLease {
         if !self.acquired {
             return Ok(());
         }
-        match self.invoke("recheck", cgroup).await {
+        match self.invoke("recheck", cgroup, false).await {
             HookOutcome::Ok { .. } => Ok(()),
             HookOutcome::Denied(code) => Err(RunnerError::cancelled(format!(
                 "lease revoked or stale (exit {code})"
@@ -730,17 +733,25 @@ impl ActiveLease {
             slot_attempt_id: None,
             slot_token: None,
         };
-        lease.release(quarantine_path).await
+        lease.release_with_mode(quarantine_path, true).await
     }
 
     /// Release the acquired lease. On failure, retains `acquired = true`, writes a
     /// durable quarantine marker so no subsequent job can bypass host restoration,
     /// and returns an error.
     pub async fn release(&mut self, quarantine_path: &Path) -> RunnerResult<()> {
+        self.release_with_mode(quarantine_path, false).await
+    }
+
+    async fn release_with_mode(
+        &mut self,
+        quarantine_path: &Path,
+        reconcile: bool,
+    ) -> RunnerResult<()> {
         if !self.acquired {
             return Ok(());
         }
-        match self.invoke("release", None).await {
+        match self.invoke("release", None, reconcile).await {
             HookOutcome::Ok { .. } => {
                 self.acquired = false;
                 Ok(())
@@ -779,7 +790,7 @@ impl ActiveLease {
         }
     }
 
-    async fn invoke(&self, action: &str, cgroup: Option<&str>) -> HookOutcome {
+    async fn invoke(&self, action: &str, cgroup: Option<&str>, reconcile: bool) -> HookOutcome {
         let Some((prog, base_args)) = self.hook.split_first() else {
             return HookOutcome::Ok { stdout: Vec::new() };
         };
@@ -807,6 +818,20 @@ impl ActiveLease {
                 cmd.env(LEASE_SLOT_TOKEN_ENV, token);
             } else {
                 cmd.env_remove(LEASE_SLOT_TOKEN_ENV);
+            }
+        } else if action == "release" {
+            if reconcile {
+                cmd.arg("--reconcile");
+                cmd.env_remove(LEASE_SLOT_TOKEN_ENV);
+            } else {
+                if let Some(attempt_id) = self.slot_attempt_id {
+                    cmd.arg("--attempt-id").arg(attempt_id.to_string());
+                }
+                if let Some(token) = &self.slot_token {
+                    cmd.env(LEASE_SLOT_TOKEN_ENV, token);
+                } else {
+                    cmd.env_remove(LEASE_SLOT_TOKEN_ENV);
+                }
             }
         } else {
             cmd.env_remove(LEASE_SLOT_TOKEN_ENV);

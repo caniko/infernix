@@ -11,6 +11,8 @@ mod result;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
+    io::ErrorKind,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     pin::Pin,
     process::{Output, Stdio},
@@ -31,9 +33,10 @@ use infernix_workload::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream},
     process::Command,
-    sync::watch,
+    sync::{Semaphore, mpsc, oneshot, watch},
     task::JoinSet,
     time::{Instant, Interval, interval, sleep, sleep_until, timeout},
 };
@@ -182,6 +185,9 @@ struct WorkerConfig {
     /// Host admission probe for this worker's GPU (optional).
     #[serde(default)]
     admission: Option<AdmissionConfig>,
+    /// Optional local Unix domain control socket for claim quiesce/idle acks.
+    #[serde(default)]
+    control_socket: Option<PathBuf>,
 }
 
 /// A host-specific admission probe. Exit 0 admits GPU work; every other
@@ -723,6 +729,217 @@ impl AdmissionGate {
     }
 }
 
+const CONTROL_MAX_REQUEST_BYTES: usize = 4096;
+const CONTROL_IO_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const CONTROL_MAX_CLIENTS: usize = 8;
+const CONTROL_MAX_PAUSE_TTL_SECS: u64 = 60;
+
+fn default_pause_ttl_secs() -> u64 {
+    30
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum ControlRequest {
+    PauseClaims {
+        #[serde(default = "default_pause_ttl_secs")]
+        ttl_secs: u64,
+    },
+    ResumeClaims,
+    Status,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ControlResponse {
+    ok: bool,
+    paused: bool,
+    idle: bool,
+    active_tasks: usize,
+    pause_remaining_secs: u64,
+}
+
+struct ControlCommand {
+    request: ControlRequest,
+    reply: oneshot::Sender<ControlResponse>,
+}
+
+struct ControlSocketGuard {
+    path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ControlSocketGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn control_peer_authorized(peer_uid: u32, self_uid: u32) -> bool {
+    peer_uid == 0 || peer_uid == self_uid
+}
+
+fn spawn_control_socket(
+    path: &Path,
+) -> Result<(ControlSocketGuard, mpsc::Receiver<ControlCommand>)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("create workerd control socket parent {}", parent.display())
+        })?;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("remove stale workerd control socket {}", path.display())
+            });
+        }
+    }
+    let listener = UnixListener::bind(path)
+        .with_context(|| format!("bind workerd control socket {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+        .with_context(|| format!("chmod 0660 {}", path.display()))?;
+
+    let self_uid = unsafe { libc::geteuid() };
+    let permits = Arc::new(Semaphore::new(CONTROL_MAX_CLIENTS));
+    let (tx, rx) = mpsc::channel::<ControlCommand>(CONTROL_MAX_CLIENTS);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let Ok(cred) = stream.peer_cred() else {
+                continue;
+            };
+            if !control_peer_authorized(cred.uid(), self_uid) {
+                drop(stream);
+                continue;
+            }
+            let Ok(permit) = permits.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = handle_control_connection(stream, tx).await;
+            });
+        }
+    });
+    Ok((
+        ControlSocketGuard {
+            path: path.to_path_buf(),
+            task,
+        },
+        rx,
+    ))
+}
+
+async fn handle_control_connection(
+    stream: UnixStream,
+    tx: mpsc::Sender<ControlCommand>,
+) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half.take(CONTROL_MAX_REQUEST_BYTES as u64));
+    let mut line = String::new();
+    let read_res = timeout(CONTROL_IO_TIMEOUT, reader.read_line(&mut line)).await;
+    let Ok(Ok(n)) = read_res else {
+        return Ok(());
+    };
+    if n == 0 {
+        return Ok(());
+    }
+    let Ok(request) = serde_json::from_str::<ControlRequest>(line.trim()) else {
+        let _ = timeout(
+            CONTROL_IO_TIMEOUT,
+            write_half.write_all(b"{\"ok\":false,\"paused\":false,\"idle\":false,\"activeTasks\":0,\"pauseRemainingSecs\":0}\n"),
+        )
+        .await;
+        return Ok(());
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if tx
+        .send(ControlCommand {
+            request,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    if let Ok(resp) = reply_rx.await {
+        if let Ok(mut bytes) = serde_json::to_vec(&resp) {
+            bytes.push(b'\n');
+            let _ = timeout(CONTROL_IO_TIMEOUT, write_half.write_all(&bytes)).await;
+        }
+    }
+    Ok(())
+}
+
+fn is_claims_paused(claims_paused_until: &mut Option<Instant>) -> bool {
+    match *claims_paused_until {
+        Some(until) if Instant::now() < until => true,
+        Some(_) => {
+            *claims_paused_until = None;
+            false
+        }
+        None => false,
+    }
+}
+
+fn apply_control_command(
+    cmd: ControlCommand,
+    claims_paused_until: &mut Option<Instant>,
+    active_tasks: usize,
+) {
+    match cmd.request {
+        ControlRequest::PauseClaims { ttl_secs } => {
+            let ttl = ttl_secs.clamp(1, CONTROL_MAX_PAUSE_TTL_SECS);
+            *claims_paused_until = Some(Instant::now() + StdDuration::from_secs(ttl));
+        }
+        ControlRequest::ResumeClaims => {
+            *claims_paused_until = None;
+        }
+        ControlRequest::Status => {}
+    }
+    let paused = is_claims_paused(claims_paused_until);
+    let pause_remaining_secs = claims_paused_until
+        .map(|u| u.saturating_duration_since(Instant::now()).as_secs())
+        .unwrap_or(0);
+    let _ = cmd.reply.send(ControlResponse {
+        ok: true,
+        paused,
+        idle: active_tasks == 0,
+        active_tasks,
+        pause_remaining_secs,
+    });
+}
+
+fn drain_control_commands(
+    control_rx: &mut Option<mpsc::Receiver<ControlCommand>>,
+    claims_paused_until: &mut Option<Instant>,
+    active_tasks: usize,
+) {
+    let Some(rx) = control_rx.as_mut() else {
+        return;
+    };
+    while let Ok(cmd) = rx.try_recv() {
+        apply_control_command(cmd, claims_paused_until, active_tasks);
+    }
+}
+
+async fn recv_control_optional(
+    control_rx: &mut Option<mpsc::Receiver<ControlCommand>>,
+) -> Option<ControlCommand> {
+    match control_rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -736,6 +953,20 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
     });
     let boot_id = resolve_boot_id(&config.worker)?;
     let worker = worker_profile(&config, &boot_id)?;
+
+    // Bind the local control socket BEFORE startup worker registration and
+    // retained-delivery recovery so a host-local lease owner attempting to
+    // pause/drain a freshly restarted worker connects immediately and waits
+    // until startup delivery recovery finishes before receiving `idle = true`.
+    let (_control_guard, mut control_rx) = match &config.worker.control_socket {
+        Some(path) => {
+            let (guard, rx) = spawn_control_socket(path)?;
+            (Some(guard), Some(rx))
+        }
+        None => (None, None),
+    };
+    let mut claims_paused_until: Option<Instant> = None;
+
     client
         .register_worker(&worker)
         .await
@@ -772,7 +1003,11 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
     let capabilities = worker.capabilities.iter().cloned().collect::<Vec<_>>();
 
     loop {
-        while !*shutdown.borrow() && tasks.len() < config.worker.concurrency {
+        drain_control_commands(&mut control_rx, &mut claims_paused_until, tasks.len());
+        while !*shutdown.borrow()
+            && !is_claims_paused(&mut claims_paused_until)
+            && tasks.len() < config.worker.concurrency
+        {
             if config.worker.admission.is_some() {
                 // Housekeeping must not depend on admitting new GPU work.
                 client
@@ -788,7 +1023,11 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
                     break;
                 }
             }
-            if *shutdown.borrow() {
+            // Re-check pending control commands right before issuing `claim()`
+            // so a `pause_claims` that arrived during `has_claimable` /
+            // `admission.admits` prevents any new claim immediately.
+            drain_control_commands(&mut control_rx, &mut claims_paused_until, tasks.len());
+            if *shutdown.borrow() || is_claims_paused(&mut claims_paused_until) {
                 break;
             }
             let Some(job) = client
@@ -835,8 +1074,12 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
             return Ok(());
         }
 
+        let paused_now = is_claims_paused(&mut claims_paused_until);
         tokio::select! {
             _ = shutdown.changed() => {}
+            Some(cmd) = recv_control_optional(&mut control_rx) => {
+                apply_control_command(cmd, &mut claims_paused_until, tasks.len());
+            }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 match result {
                     Ok(Ok(())) => {}
@@ -848,8 +1091,11 @@ async fn run_worker(client: WorkloadClient, config: Config, once: bool) -> Resul
                     Err(error) => error!(%error, "workload task panicked"),
                 }
             }
+            _ = sleep_until_optional(claims_paused_until) => {
+                claims_paused_until = None;
+            }
             _ = sleep(poll) => {}
-            _ = sleep_until(delivery_due) => {
+            _ = sleep_until(delivery_due), if !paused_now => {
                 let failures = match finish_pending_deliveries(&client, &config, &worker.id, shutdown.clone()).await {
                     Ok(failures) => failures,
                     Err(error) => {
@@ -2425,6 +2671,76 @@ hub_token_file_env = "INFERNIX_VAGRANT_WORKER_TOKEN_FILE"
             std::env::remove_var(&env_missing);
             std::env::remove_var(&env_ok);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn control_socket_pauses_claims_and_reports_exact_idle_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "infx-workerd-ctrl-{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control.sock");
+        let (guard, mut rx) = spawn_control_socket(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut paused_until: Option<Instant> = None;
+            // 1. Idle worker: pause_claims reports paused=true, idle=true, active_tasks=0
+            if let Some(cmd) = rx.recv().await {
+                apply_control_command(cmd, &mut paused_until, 0);
+            }
+            // 2. Busy worker: pause_claims reports paused=true, idle=false, active_tasks=1
+            if let Some(cmd) = rx.recv().await {
+                apply_control_command(cmd, &mut paused_until, 1);
+            }
+            // 3. Resume clears pause state
+            if let Some(cmd) = rx.recv().await {
+                apply_control_command(cmd, &mut paused_until, 0);
+            }
+        });
+
+        async fn call(sock: &Path, body: &str) -> ControlResponse {
+            let mut stream = UnixStream::connect(sock).await.unwrap();
+            stream.write_all(body.as_bytes()).await.unwrap();
+            stream.write_all(b"\n").await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut resp = String::new();
+            reader.read_line(&mut resp).await.unwrap();
+            serde_json::from_str(resp.trim()).unwrap()
+        }
+
+        let r1 = call(&sock, r#"{"op":"pause_claims","ttl_secs":30}"#).await;
+        assert!(r1.ok && r1.paused && r1.idle && r1.active_tasks == 0);
+        assert!(r1.pause_remaining_secs >= 28 && r1.pause_remaining_secs <= 30);
+
+        let r2 = call(&sock, r#"{"op":"pause_claims","ttl_secs":999}"#).await;
+        assert!(r2.ok && r2.paused && !r2.idle && r2.active_tasks == 1);
+        assert!(r2.pause_remaining_secs <= CONTROL_MAX_PAUSE_TTL_SECS);
+
+        let r3 = call(&sock, r#"{"op":"resume_claims"}"#).await;
+        assert!(r3.ok && !r3.paused && r3.idle && r3.active_tasks == 0);
+
+        server.await.unwrap();
+        drop(guard);
+        assert!(!sock.exists(), "control socket must be unlinked on drop");
+        assert!(control_peer_authorized(0, 994));
+        assert!(control_peer_authorized(994, 994));
+        assert!(!control_peer_authorized(1000, 994));
+
+        let parsed: Config = toml::from_str(
+            r#"
+[worker]
+id = "nomad"
+control_socket = "/run/infernix-workload/workerd-control.sock"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.worker.control_socket.as_deref(),
+            Some(Path::new("/run/infernix-workload/workerd-control.sock"))
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

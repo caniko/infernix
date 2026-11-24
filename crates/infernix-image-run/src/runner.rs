@@ -21,6 +21,7 @@ use crate::{
     guard::{
         ActiveLease, FileLock, GuardConfig, LeaseContext, check_quarantine_persist_latch,
         clear_quarantine, quarantine_path_for_lock, read_free_vram_mib, read_quarantine,
+        release_held_quarantine_locks,
     },
     png::read_verified_input_png,
     qwen::{QwenConfig, cgroup_is_empty, group_gone, run_qwen_streaming},
@@ -157,6 +158,10 @@ async fn check_or_resolve_quarantine(
     match q.kind.as_str() {
         "comfy_unsettled" => {
             if invocation_is_dead(q.comfy_unit.as_deref(), q.comfy_invocation_id.as_deref()).await {
+                // Local settlement is proven; hand off any retained quarantine GPU flock before
+                // asking the lease owner to verify/release the slot, while retaining the
+                // quarantine marker on disk until acknowledgment.
+                release_held_quarantine_locks(quarantine_path);
                 if let Some(pending) = q.pending_lease_release.as_ref() {
                     ActiveLease::release_pending(&cfg.guard, pending, quarantine_path).await?;
                 }
@@ -195,6 +200,12 @@ async fn check_or_resolve_quarantine(
                         }
                     }
                 }
+                // Local Qwen settlement is proven; hand off any retained quarantine GPU flock
+                // BEFORE invoking the pending lease release RPC (while keeping the quarantine
+                // marker on disk until acknowledgment) so the lease owner can acquire the
+                // non-blocking GPU lock and settle the slot instead of denying due to our own
+                // held flock.
+                release_held_quarantine_locks(quarantine_path);
                 if let Some(pending) = q.pending_lease_release.as_ref() {
                     ActiveLease::release_pending(&cfg.guard, pending, quarantine_path).await?;
                 }

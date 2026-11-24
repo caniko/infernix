@@ -4970,3 +4970,289 @@ async fn qwen_drain_quarantine_recovery_leaves_ambiguous_cgroup_directory_untouc
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn qwen_quarantine_recovery_releases_held_gpu_flock_before_pending_lease_release_rpc() {
+    use infernix_image_run::guard::{
+        FileLock, LeaseContext, QuarantineState, quarantine_path_for_lock, read_quarantine,
+        record_quarantine,
+    };
+
+    let dir = temp_dir("qwen-quarantine-flock-handoff");
+    let (meminfo, psi) = write_host_fixtures(&dir, 50, 0.1);
+    let (reg_dir, _, _, qwen_digest) = write_registry(&dir, false, None);
+    let src_png = encode_test_png(1024, 1024, &[]);
+    let src_path = dir.join("src.png");
+    fs::write(&src_path, &src_png).unwrap();
+    let gpu_lock = dir.join("gpu.lock");
+    fs::write(&gpu_lock, b"").unwrap();
+    let out_png_path = dir.join("fixture-out.png");
+    fs::write(&out_png_path, encode_test_png(1024, 1024, &[])).unwrap();
+
+    let fake_adapter = dir.join("fake_adapter.py");
+    fs::write(
+        &fake_adapter,
+        format!(
+            "import hashlib, json, sys\n\
+             from pathlib import Path\n\
+             args = sys.argv[1:]\n\
+             staging = Path(args[args.index('--staging') + 1])\n\
+             job = json.loads(sys.stdin.read())\n\
+             data = Path({out_fixture:?}).read_bytes()\n\
+             (staging / job['output']).write_bytes(data)\n\
+             sha = hashlib.sha256(data).hexdigest()\n\
+             print(json.dumps({{\n\
+               'state': 'rendered',\n\
+               'recipe': {{\n\
+                 'id': 'qwen-image-edit-2511-lightning-4-bf16-streaming',\n\
+                 'steps': job['steps'],\n\
+                 'size': job['size'],\n\
+                 'seed': job['seed'],\n\
+                 'lora': job['lora'],\n\
+               }},\n\
+               'models': {{}},\n\
+               'output': {{'path': job['output'], 'sha256': sha}},\n\
+             }}))\n",
+            out_fixture = out_png_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    // Case 1: Successful recovery hands off the retained GPU flock BEFORE
+    // invoking the pending lease release hook while keeping the quarantine
+    // marker file on disk until the hook acknowledges.
+    let runner_lock = dir.join("runner.lock");
+    let quarantine_path = quarantine_path_for_lock(&runner_lock);
+    let empty_cg = dir.join("settled-cg");
+    fs::create_dir_all(&empty_cg).unwrap();
+    fs::write(empty_cg.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+    fs::write(empty_cg.join("cgroup.procs"), "").unwrap();
+    let stage_dir = dir.join("quarantined-stage");
+    fs::create_dir_all(&stage_dir).unwrap();
+
+    let held_gpu_lock = FileLock::acquire_exclusive(&gpu_lock, false, Duration::from_secs(1), None)
+        .await
+        .expect("acquire test gpu lock");
+    record_quarantine(
+        &quarantine_path,
+        &QuarantineState {
+            kind: "qwen_drain".to_owned(),
+            reason: "simulated wait error with retained gpu flock".to_owned(),
+            job_id: Some("job-quarantined-58".to_owned()),
+            prompt_id: None,
+            client_id: None,
+            comfy_unit: None,
+            comfy_invocation_id: None,
+            qwen_cgroup: Some(empty_cg.clone()),
+            qwen_pgid: None,
+            qwen_vram_baseline_mib: Some(15900),
+            qwen_stage_dir: Some(stage_dir.clone()),
+            lease_uncertain: false,
+            pending_lease_release: Some(LeaseContext {
+                job_id: "job-quarantined-58".to_owned(),
+                profile_id: "vagrant.qwen-image-edit-2511-lightning-4".to_owned(),
+                lease_id: Some("batch-58".to_owned()),
+                lease_generation: Some(12),
+            }),
+        },
+        Some(held_gpu_lock),
+    )
+    .expect("record qwen_drain quarantine with held flock");
+
+    assert!(
+        FileLock::acquire_exclusive(&gpu_lock, false, Duration::ZERO, None)
+            .await
+            .is_err(),
+        "quarantine vault must retain the GPU flock while quarantined"
+    );
+
+    let hook_log = dir.join("hook.log");
+    let hook_py = dir.join("lease_hook.py");
+    fs::write(
+        &hook_py,
+        format!(
+            concat!(
+                "import fcntl, os, sys\n",
+                "from pathlib import Path\n",
+                "args = sys.argv[1:]\n",
+                "log = Path({hook_log:?})\n",
+                "gpu_lock = Path({gpu_lock:?})\n",
+                "qpath = Path({qpath:?})\n",
+                "if args and args[0] == 'release' and '--reconcile' in args:\n",
+                "    fd = os.open(gpu_lock, os.O_RDWR | os.O_CREAT, 0o600)\n",
+                "    try:\n",
+                "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n",
+                "    except BlockingIOError:\n",
+                "        with log.open('a') as f:\n",
+                "            f.write('LOCK_HELD\\n')\n",
+                "        sys.exit(1)\n",
+                "    finally:\n",
+                "        os.close(fd)\n",
+                "    if not qpath.exists():\n",
+                "        with log.open('a') as f:\n",
+                "            f.write('MARKER_MISSING\\n')\n",
+                "        sys.exit(2)\n",
+                "    with log.open('a') as f:\n",
+                "        f.write('RELEASE_LOCK_FREE_MARKER_PRESENT\\n')\n",
+                "elif args and args[0] == 'acquire':\n",
+                "    print('{{\"schemaVersion\":1,\"ok\":true,\"status\":\"ok\",\"data\":{{\"ok\":true,\"slotAttemptId\":58,\"slotToken\":\"0123456789abcdef0123456789abcdef\"}}}}')\n",
+                "sys.exit(0)\n",
+            ),
+            hook_log = hook_log.to_string_lossy(),
+            gpu_lock = gpu_lock.to_string_lossy(),
+            qpath = quarantine_path.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+
+    let runner_cfg = RunnerConfig {
+        registry_dir: reg_dir.clone(),
+        runner_lock_path: runner_lock,
+        runner_lock_wait: Duration::from_secs(2),
+        guard: GuardConfig {
+            meminfo_path: meminfo.clone(),
+            memory_psi_path: psi.clone(),
+            vram_floor_mib: Some(12000),
+            vram_override_mib: Some(15900),
+            lease_required: true,
+            lease_hook: vec!["python3".to_owned(), hook_py.to_string_lossy().into_owned()],
+            lease_timeout: Duration::from_secs(5),
+            ..GuardConfig::default()
+        },
+        comfy: None,
+        qwen: Some(QwenConfig {
+            python: PathBuf::from("python3"),
+            adapter_script: fake_adapter.clone(),
+            backend: "cuda".to_owned(),
+            denoiser_dir: dir.clone(),
+            snapshot_dir: dir.clone(),
+            lightning_dir: dir.clone(),
+            gpu_lock_path: gpu_lock.clone(),
+            gpu_lock_wait: Duration::from_secs(1),
+            cancel_grace: Duration::from_secs(1),
+            kill_drain_wait: Duration::from_secs(1),
+            vram_release_wait: Duration::from_secs(1),
+            cgroup_parent: None,
+            require_cgroup_containment: false,
+            extra_env: vec![],
+        }),
+    };
+    let req = RunRequest {
+        schema_version: 1,
+        job_id: "qwen-recover-58".to_owned(),
+        profile_id: "vagrant.qwen-image-edit-2511-lightning-4".to_owned(),
+        revision: "v1".to_owned(),
+        manifest_digest: qwen_digest.clone(),
+        inputs: vec![LocalInput {
+            path: src_path.clone(),
+            sha256: sha256_hex(&src_png),
+        }],
+        parameters: ImageParameters {
+            prompt: "recover flock handoff".to_owned(),
+            seed: 5800,
+            steps: Some(4),
+            denoise: None,
+        },
+        output_path: dir.join("recover-58-out.png"),
+        cancel_path: dir.join("cancel-58"),
+        journal_dir: dir.join("j-recover-58"),
+        lease_id: Some("batch-58".to_owned()),
+        lease_generation: Some(12),
+    };
+    let (_tx, rx) = watch::channel(false);
+    let receipt = execute_request(&runner_cfg, &req, rx)
+        .await
+        .expect("qwen_drain recovery must hand off GPU flock before pending lease release");
+    assert_eq!(receipt.state, "rendered");
+    let log_text = fs::read_to_string(&hook_log).unwrap();
+    assert!(
+        log_text.contains("RELEASE_LOCK_FREE_MARKER_PRESENT"),
+        "expected pending lease release to observe free GPU flock with quarantine marker intact; got: {log_text}"
+    );
+    assert!(
+        !quarantine_path.exists(),
+        "quarantine marker must be cleared after pending lease release succeeds"
+    );
+    assert!(
+        !stage_dir.exists(),
+        "quarantined staging dir must be removed before lease release"
+    );
+
+    // Case 2: If pending lease release fails after flock handoff, quarantine
+    // marker remains latched as `lease_uncertain: true`.
+    let runner_lock_deny = dir.join("runner-deny.lock");
+    let qpath_deny = quarantine_path_for_lock(&runner_lock_deny);
+    let held_gpu_lock2 =
+        FileLock::acquire_exclusive(&gpu_lock, false, Duration::from_secs(1), None)
+            .await
+            .expect("re-acquire test gpu lock");
+    record_quarantine(
+        &qpath_deny,
+        &QuarantineState {
+            kind: "qwen_drain".to_owned(),
+            reason: "simulated wait error before denied release".to_owned(),
+            job_id: Some("job-quarantined-58-deny".to_owned()),
+            prompt_id: None,
+            client_id: None,
+            comfy_unit: None,
+            comfy_invocation_id: None,
+            qwen_cgroup: Some(empty_cg),
+            qwen_pgid: None,
+            qwen_vram_baseline_mib: Some(15900),
+            qwen_stage_dir: None,
+            lease_uncertain: false,
+            pending_lease_release: Some(LeaseContext {
+                job_id: "job-quarantined-58-deny".to_owned(),
+                profile_id: "vagrant.qwen-image-edit-2511-lightning-4".to_owned(),
+                lease_id: Some("batch-58".to_owned()),
+                lease_generation: Some(12),
+            }),
+        },
+        Some(held_gpu_lock2),
+    )
+    .expect("record second qwen_drain quarantine");
+
+    let deny_hook_py = dir.join("deny_hook.py");
+    fs::write(
+        &deny_hook_py,
+        format!(
+            concat!(
+                "import fcntl, os, sys\n",
+                "from pathlib import Path\n",
+                "fd = os.open(Path({gpu_lock:?}), os.O_RDWR | os.O_CREAT, 0o600)\n",
+                "try:\n",
+                "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n",
+                "finally:\n",
+                "    os.close(fd)\n",
+                "assert Path({qpath:?}).exists()\n",
+                "sys.exit(1)\n",
+            ),
+            gpu_lock = gpu_lock.to_string_lossy(),
+            qpath = qpath_deny.to_string_lossy(),
+        ),
+    )
+    .unwrap();
+    let mut deny_cfg = runner_cfg;
+    deny_cfg.runner_lock_path = runner_lock_deny;
+    deny_cfg.guard.lease_hook = vec![
+        "python3".to_owned(),
+        deny_hook_py.to_string_lossy().into_owned(),
+    ];
+    let (_tx2, rx2) = watch::channel(false);
+    let err = execute_request(&deny_cfg, &req, rx2)
+        .await
+        .expect_err("denied pending lease release must fail recovery");
+    assert!(
+        err.message.contains("lease release failed"),
+        "unexpected error: {}",
+        err.message
+    );
+    let latched = read_quarantine(&qpath_deny)
+        .expect("read latched quarantine")
+        .expect("quarantine marker must remain on disk");
+    assert!(
+        latched.lease_uncertain,
+        "denied pending release must latch lease_uncertain"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

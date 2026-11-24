@@ -131,6 +131,7 @@ fn discover_cgroup_parent() -> Option<PathBuf> {
 }
 
 struct ChildCgroup {
+    name: String,
     dir: PathBuf,
     procs_fd: OwnedFd,
 }
@@ -158,7 +159,7 @@ impl ChildCgroup {
             },
             &Uuid::new_v4().simple().to_string()[..8]
         );
-        let dir = parent.join(cg_name);
+        let dir = parent.join(&cg_name);
         fs::create_dir(&dir).map_err(|e| {
             RunnerError::gpu_unavailable(format!(
                 "create dedicated Qwen cgroup {}: {e}",
@@ -201,9 +202,14 @@ impl ChildCgroup {
                 RunnerError::gpu_unavailable(format!("open cgroup.procs in {}: {e}", dir.display()))
             })?;
         Ok(Self {
+            name: cg_name,
             dir,
             procs_fd: procs_file.into(),
         })
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn signal_all(&self, sig: i32) {
@@ -623,6 +629,16 @@ pub async fn run_qwen_streaming(
         None
     };
 
+    // Register the exact runner-created child cgroup with the lease owner
+    // BEFORE spawning the Qwen child so preemption and watchdog teardown can
+    // force-drain this exact cgroup immediately if the child hangs.
+    if let Some(cg) = &child_cg {
+        if let Err(err) = lease.recheck_with_cgroup(Some(cg.name())).await {
+            cg.remove_if_empty();
+            return Err(err);
+        }
+    }
+
     // Stage private local working directory strictly without following symlinks.
     let child_stage = work_dir.join(format!(
         "qwen-child-{}",
@@ -826,7 +842,10 @@ pub async fn run_qwen_streaming(
             return Err(err);
         }
         if last_lease_recheck.elapsed() >= Duration::from_secs(1) {
-            if let Err(err) = lease.recheck().await {
+            if let Err(err) = lease
+                .recheck_with_cgroup(child_cg.as_ref().map(ChildCgroup::name))
+                .await
+            {
                 if let Err(drain_err) = terminate_and_drain(
                     &mut child,
                     pid,

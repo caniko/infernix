@@ -963,6 +963,48 @@ async fn wait_for_vram_release(
     }
 }
 
+/// RAII cleanup guard replacing `Command::kill_on_drop(true)`.
+/// - When contained (`cg.is_some()`), terminates strictly via the pinned
+///   `ChildCgroup` (`dirfd` + `(st_dev, st_ino)`), NEVER via raw numeric PID.
+/// - When uncontained (`cg.is_none()`), signals `-pid` ONLY if `poll_child_unreaped(pid)`
+///   proves this process STILL holds wait ownership (`Running` or `ExitedUnreaped`),
+///   NEVER on `OwnershipLost` (`ECHILD`) so a recycled PID/PGID can never be signaled!
+struct QwenChildDropGuard<'a> {
+    pid: u32,
+    cg: Option<&'a ChildCgroup>,
+    armed: bool,
+}
+
+impl<'a> QwenChildDropGuard<'a> {
+    fn new(pid: u32, cg: Option<&'a ChildCgroup>) -> Self {
+        Self {
+            pid,
+            cg,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QwenChildDropGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(c) = self.cg {
+            c.kill_all();
+        } else if matches!(
+            poll_child_unreaped(self.pid),
+            UnreapedWaitStatus::Running | UnreapedWaitStatus::ExitedUnreaped
+        ) {
+            signal_group_unreaped(self.pid, libc::SIGKILL);
+        }
+    }
+}
+
 /// RAII guard that removes the runner-owned `0700` Qwen child staging directory
 /// under the runner identity once execution has settled (so `infernix-workerd`
 /// under a different UID is never left with untraversable private files).
@@ -1311,8 +1353,7 @@ pub async fn run_qwen_streaming(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
+        .process_group(0);
     for (k, _) in std::env::vars() {
         if k.starts_with("PYTHON") {
             cmd.env_remove(k);
@@ -1355,6 +1396,10 @@ pub async fn run_qwen_streaming(
         }
     };
     let pid = child.id().unwrap_or(0);
+    // Use our identity-verified drop guard instead of `kill_on_drop(true)` so
+    // an early return after `OwnershipLost` (`ECHILD`) can NEVER signal a
+    // recycled numeric PID via `std::process::Child::kill`!
+    let mut child_drop_guard = QwenChildDropGuard::new(pid, child_cg.as_ref());
 
     // Immediately start concurrent bounded drainers for BOTH stdout and stderr so
     // the child can never deadlock on a full pipe.
@@ -1383,16 +1428,36 @@ pub async fn run_qwen_streaming(
     let mut last_lease_recheck = Instant::now();
     let (status, post_exit_drained) = loop {
         if let Some(c) = &child_cg {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|e| RunnerError::internal(format!("poll qwen child: {e}")))?
-            {
-                let drain_deadline = Instant::now() + qwen.kill_drain_wait;
-                while !c.is_empty() && Instant::now() < drain_deadline {
-                    c.kill_all();
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let drain_deadline = Instant::now() + qwen.kill_drain_wait;
+                    while !c.is_empty() && Instant::now() < drain_deadline {
+                        c.kill_all();
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    let empty = c.is_empty();
+                    if empty {
+                        child_drop_guard.disarm();
+                    }
+                    break (status, empty);
                 }
-                break (status, c.is_empty());
+                Ok(None) => {}
+                Err(e) => {
+                    let err = RunnerError::internal(format!("poll qwen child failed: {e}"));
+                    record_qwen_quarantine(
+                        quarantine_path,
+                        quarantined,
+                        job_id,
+                        pid,
+                        child_cg.as_ref(),
+                        before_vram,
+                        &mut stage_guard,
+                        lease,
+                        gpu_lock,
+                        err.message.clone(),
+                    )?;
+                    return Err(err);
+                }
             }
         } else {
             match poll_child_unreaped(pid) {
@@ -1410,19 +1475,60 @@ pub async fn run_qwen_streaming(
                         signal_group_unreaped(pid, libc::SIGKILL);
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    let drained_before_reap =
-                        !ownership_lost && scan_other_members_in_pgid(pid) == PgidScan::Empty;
-                    let status = child
-                        .wait()
-                        .await
-                        .map_err(|e| RunnerError::internal(format!("reap qwen child: {e}")))?;
-                    let post_exit_drained =
-                        uncontained_group_drained_after_reap(pid, drained_before_reap, true);
-                    break (status, post_exit_drained);
+                    if ownership_lost {
+                        child_drop_guard.disarm();
+                        let err = RunnerError::internal(
+                            "uncontained Qwen child wait ownership lost during post-exit drain; refusing numeric PGID signal",
+                        );
+                        record_qwen_quarantine(
+                            quarantine_path,
+                            quarantined,
+                            job_id,
+                            pid,
+                            child_cg.as_ref(),
+                            before_vram,
+                            &mut stage_guard,
+                            lease,
+                            gpu_lock,
+                            err.message.clone(),
+                        )?;
+                        return Err(err);
+                    }
+                    let drained_before_reap = scan_other_members_in_pgid(pid) == PgidScan::Empty;
+                    match child.wait().await {
+                        Ok(status) => {
+                            child_drop_guard.disarm();
+                            let post_exit_drained = uncontained_group_drained_after_reap(
+                                pid,
+                                drained_before_reap,
+                                true,
+                            );
+                            break (status, post_exit_drained);
+                        }
+                        Err(e) => {
+                            child_drop_guard.disarm();
+                            let err = RunnerError::internal(format!("reap qwen child failed: {e}"));
+                            record_qwen_quarantine(
+                                quarantine_path,
+                                quarantined,
+                                job_id,
+                                pid,
+                                child_cg.as_ref(),
+                                before_vram,
+                                &mut stage_guard,
+                                lease,
+                                gpu_lock,
+                                err.message.clone(),
+                            )?;
+                            return Err(err);
+                        }
+                    }
                 }
                 UnreapedWaitStatus::OwnershipLost => {
-                    // PGID wait ownership lost (`ECHILD` / auto-reaped): NEVER
-                    // send a terminating signal to `-pid`; quarantine fail-closed.
+                    // PGID wait ownership lost (`ECHILD` / auto-reaped): disarm
+                    // drop guard and NEVER signal `-pid` or numeric `pid`;
+                    // record quarantine fail-closed.
+                    child_drop_guard.disarm();
                     let err = RunnerError::internal(
                         "uncontained Qwen child wait ownership lost (ECHILD); refusing numeric PGID signal",
                     );
@@ -1443,6 +1549,7 @@ pub async fn run_qwen_streaming(
             }
         }
         if cancel_path.exists() || *shutdown.borrow() {
+            child_drop_guard.disarm();
             if let Err(err) = terminate_and_drain(
                 &mut child,
                 pid,
@@ -1486,6 +1593,7 @@ pub async fn run_qwen_streaming(
             return Err(RunnerError::cancelled("qwen child cancelled and drained"));
         }
         if let Err(err) = check_host_running(guard) {
+            child_drop_guard.disarm();
             if let Err(drain_err) = terminate_and_drain(
                 &mut child,
                 pid,
@@ -1536,6 +1644,7 @@ pub async fn run_qwen_streaming(
                 )
                 .await
             {
+                child_drop_guard.disarm();
                 if let Err(drain_err) = terminate_and_drain(
                     &mut child,
                     pid,
@@ -1853,7 +1962,7 @@ mod tests {
         //    Contained cleanup MUST NEVER call `kill(-pid, ...)`!
         let mut innocent = Command::new("/bin/sh")
             .arg("-c")
-            .arg("sleep 30")
+            .arg("exec sleep 30")
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
@@ -1898,7 +2007,7 @@ mod tests {
 
         let mut short_child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("sleep 0.1")
+            .arg("exec sleep 0.1")
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
@@ -1925,19 +2034,26 @@ mod tests {
         let _ = innocent.wait().await;
         let _ = fs::remove_dir_all(&base);
 
-        // 2. Uncontained post-exit drain: spawn a leader that forks an orphan
-        //    grandchild in its own process group and exits immediately. Prove
-        //    `child_exited_without_reap` detects exit while keeping the zombie
-        //    unreaped so `signal_group_unreaped` kills the grandchild BEFORE
-        //    reaping, leaving zero surviving members!
+        // 2. Uncontained post-exit drain: spawn BOTH the leader and a second
+        //    group member as direct children of this test (`exec sleep 30` with
+        //    zero grandchildren) so we reap both directly with ZERO reliance on
+        //    container PID 1 reaping orphans!
         let mut uncontained = Command::new("/bin/sh")
             .arg("-c")
-            .arg("sleep 30 </dev/null >/dev/null 2>&1 & exit 0")
+            .arg("read _ || true")
+            .stdin(Stdio::piped())
             .process_group(0)
-            .kill_on_drop(true)
             .spawn()
             .unwrap();
         let u_pid = uncontained.id().unwrap();
+        let u_stdin = uncontained.stdin.take().unwrap();
+        let mut u_member = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .process_group(u_pid as i32)
+            .spawn()
+            .unwrap();
+        drop(u_stdin);
         let wait_deadline = Instant::now() + Duration::from_secs(3);
         while poll_child_unreaped(u_pid) == UnreapedWaitStatus::Running
             && Instant::now() < wait_deadline
@@ -1952,33 +2068,36 @@ mod tests {
         assert_eq!(
             scan_other_members_in_pgid(u_pid),
             PgidScan::Populated,
-            "orphan grandchild should still be alive in unreaped PGID before drain"
+            "direct group member should still be alive in unreaped PGID before drain"
         );
-        let drain_deadline = Instant::now() + Duration::from_secs(3);
-        while scan_other_members_in_pgid(u_pid) != PgidScan::Empty
-            && Instant::now() < drain_deadline
-        {
-            signal_group_unreaped(u_pid, libc::SIGKILL);
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        signal_group_unreaped(u_pid, libc::SIGKILL);
+        let _ = u_member.wait().await.unwrap();
         assert_eq!(
             scan_other_members_in_pgid(u_pid),
             PgidScan::Empty,
-            "grandchild must be drained before reaping leader"
+            "group member must be drained before reaping leader"
         );
         let status = uncontained.wait().await.unwrap();
         assert!(status.success());
+        assert!(group_gone(u_pid));
 
-        // 3. Uncontained `terminate_and_drain` with a surviving grandchild.
+        // 3. Uncontained `terminate_and_drain` with a surviving direct-child
+        //    member (reaped by this fixture, zero orphans / zero PID 1 reliance).
         let mut cancel_child = Command::new("/bin/sh")
             .arg("-c")
-            .arg("trap '' TERM; sleep 30 </dev/null >/dev/null 2>&1 & sleep 30")
+            .arg("trap '' TERM; exec sleep 30")
             .process_group(0)
-            .kill_on_drop(true)
             .spawn()
             .unwrap();
         let c_pid = cancel_child.id().unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut cancel_member = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; exec sleep 30")
+            .process_group(c_pid as i32)
+            .spawn()
+            .unwrap();
+        let member_reaper = tokio::spawn(async move { cancel_member.wait().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
         terminate_and_drain(
             &mut cancel_child,
             c_pid,
@@ -1987,7 +2106,9 @@ mod tests {
             Duration::from_secs(3),
         )
         .await
-        .expect("uncontained terminate_and_drain cleanly kills leader and grandchild before reap");
+        .expect("uncontained terminate_and_drain cleanly kills leader and member before reap");
+        let member_status = member_reaper.await.unwrap().unwrap();
+        assert!(!member_status.success());
         assert!(group_gone(c_pid));
     }
 
@@ -2148,14 +2269,14 @@ mod tests {
     #[tokio::test]
     async fn uncontained_post_reap_group_gone_catches_surviving_member_without_signaling() {
         let _sig_guard = CHILD_SIGNAL_TEST_MUTEX.lock().await;
-        // Make BOTH process-group members direct children of this test so we
-        // reap them directly with zero reliance on container PID 1 reaping orphans!
+        // Make BOTH process-group members direct children of this test (`exec
+        // sleep 30` so no intermediate shell child exists) and reap them
+        // directly with zero reliance on container PID 1 reaping orphans!
         let mut leader = Command::new("/bin/sh")
             .arg("-c")
             .arg("read _ || true")
             .stdin(Stdio::piped())
             .process_group(0)
-            .kill_on_drop(true)
             .spawn()
             .unwrap();
         let leader_pid = leader.id().unwrap();
@@ -2163,16 +2284,19 @@ mod tests {
 
         let mut member = Command::new("/bin/sh")
             .arg("-c")
-            .arg("sleep 30")
+            .arg("exec sleep 30")
             .process_group(leader_pid as i32)
-            .kill_on_drop(true)
             .spawn()
             .unwrap();
 
-        // Exit and reap the leader while `member` remains alive in PGID `leader_pid`.
+        // Exit and reap the leader directly via raw `waitpid` WITHOUT calling
+        // `leader.wait()` so Tokio's `Child` handle still holds `leader_pid`
+        // (simulating kernel auto-reap / `ECHILD` where `kill_on_drop` would
+        // otherwise signal a recycled numeric PID!).
         drop(leader_stdin);
-        let status = leader.wait().await.unwrap();
-        assert!(status.success());
+        let mut wstatus: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(leader_pid as libc::pid_t, &mut wstatus, 0) };
+        assert_eq!(waited, leader_pid as libc::pid_t);
 
         // `poll_child_unreaped` MUST report `OwnershipLost` (ECHILD) for the
         // already-reaped leader rather than treating `ECHILD` as unreaped exit!
@@ -2181,8 +2305,10 @@ mod tests {
             UnreapedWaitStatus::OwnershipLost,
             "ECHILD on reaped leader must report OwnershipLost, never ExitedUnreaped"
         );
-        // `terminate_and_drain` MUST refuse to signal `-leader_pid` when wait
-        // ownership is lost, leaving `member` alive and returning Err!
+        // `terminate_and_drain` MUST refuse to signal `-leader_pid` on
+        // `OwnershipLost`, and dropping BOTH `QwenChildDropGuard` and the
+        // unwaited Tokio `Child` handle (no `kill_on_drop`) MUST send ZERO
+        // signals to `member`!
         let err = terminate_and_drain(
             &mut leader,
             leader_pid,
@@ -2197,9 +2323,13 @@ mod tests {
             "unexpected error: {}",
             err.message
         );
+        {
+            let _guard = QwenChildDropGuard::new(leader_pid, None);
+        }
+        drop(leader);
         assert!(
             member.try_wait().unwrap().is_none(),
-            "terminate_and_drain on OwnershipLost MUST NOT signal surviving member in PGID"
+            "terminate_and_drain and dropping unowned child/guard after ECHILD MUST NOT signal surviving process"
         );
 
         // Post-reap kernel `kill(-pgid, 0)` check detects the surviving member

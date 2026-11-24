@@ -220,11 +220,22 @@ pub fn group_gone(pid: u32) -> bool {
     if pid == 0 {
         return true;
     }
-    // SAFETY: signal 0 tests process-group existence.
-    if unsafe { libc::kill(-(pid as i32), 0) } == 0 {
+    let Ok(pgid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 is a read-only kernel check for process-group existence.
+    if unsafe { libc::kill(-pgid, 0) } == 0 {
         return false;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Final post-reap verification for the uncontained fallback: requires BOTH the
+/// pre-reap `/proc` scan and a kernel-atomic read-only `kill(-pid, 0) == ESRCH`
+/// check after the leader has been reaped, without ever sending a terminating
+/// signal to the numeric PGID after reaping.
+fn uncontained_group_drained_after_reap(pid: u32, drained_before_reap: bool, reaped: bool) -> bool {
+    drained_before_reap && reaped && group_gone(pid)
 }
 
 fn discover_cgroup_parent() -> Option<PathBuf> {
@@ -665,6 +676,8 @@ impl ChildCgroup {
     /// Inspect pinned cgroup emptiness strictly through `dirfd` while alive;
     /// if the original cgroup identity is gone, fall back to read-only
     /// verification of the path (never signaling a replacement).
+    /// Requires BOTH empty `cgroup.procs` AND an explicit `populated 0` in
+    /// `cgroup.events` so incomplete observation never passes as empty.
     fn is_empty(&self) -> bool {
         if !self.is_same_live_cgroup() {
             return cgroup_is_empty(&self.dir);
@@ -672,13 +685,14 @@ impl ChildCgroup {
         let procs_empty = read_at_to_string(self.dirfd.as_raw_fd(), "cgroup.procs")
             .map(|s| s.trim().is_empty())
             .unwrap_or(false);
-        let events_empty = match read_at_to_string(self.dirfd.as_raw_fd(), "cgroup.events") {
-            Ok(text) => text
-                .lines()
-                .find_map(|l| l.strip_prefix("populated "))
-                .is_some_and(|v| v.trim() == "0"),
-            Err(_) => procs_empty,
-        };
+        let events_empty = read_at_to_string(self.dirfd.as_raw_fd(), "cgroup.events")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix("populated "))
+                    .map(|v| v.trim() == "0")
+            })
+            .unwrap_or(false);
         procs_empty && events_empty
     }
 
@@ -702,19 +716,23 @@ impl ChildCgroup {
 }
 
 pub fn cgroup_is_empty(dir: &Path) -> bool {
-    if !dir.exists() {
-        return true;
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return false,
+        Err(err) if err.kind() == ErrorKind::NotFound => return true,
+        Err(_) => return false,
     }
     let procs_empty = fs::read_to_string(dir.join("cgroup.procs"))
         .map(|s| s.trim().is_empty())
         .unwrap_or(false);
-    let events_empty = match fs::read_to_string(dir.join("cgroup.events")) {
-        Ok(text) => text
-            .lines()
-            .find_map(|l| l.strip_prefix("populated "))
-            .is_some_and(|v| v.trim() == "0"),
-        Err(_) => procs_empty,
-    };
+    let events_empty = fs::read_to_string(dir.join("cgroup.events"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("populated "))
+                .map(|v| v.trim() == "0")
+        })
+        .unwrap_or(false);
     procs_empty && events_empty
 }
 
@@ -781,8 +799,15 @@ async fn terminate_and_drain(
     let term_deadline = Instant::now() + grace;
     loop {
         if child_exited_without_reap(pid) && scan_other_members_in_pgid(pid) == PgidScan::Empty {
-            let _ = child.try_wait();
-            return Ok(());
+            let reaped = matches!(child.try_wait(), Ok(Some(_)));
+            if uncontained_group_drained_after_reap(pid, true, reaped) {
+                return Ok(());
+            }
+            // Leader was already reaped (or could not be reaped cleanly); never
+            // send a terminating signal to `-pid` after reaping!
+            return Err(RunnerError::internal(
+                "Qwen child process group was not proven absent after reaping leader",
+            ));
         }
         if Instant::now() >= term_deadline {
             break;
@@ -814,7 +839,7 @@ async fn terminate_and_drain(
     } else {
         matches!(child.try_wait(), Ok(Some(_)))
     };
-    if drained_before_reap && reaped {
+    if uncontained_group_drained_after_reap(pid, drained_before_reap, reaped) {
         Ok(())
     } else {
         Err(RunnerError::internal(
@@ -1292,7 +1317,9 @@ pub async fn run_qwen_streaming(
                 .wait()
                 .await
                 .map_err(|e| RunnerError::internal(format!("reap qwen child: {e}")))?;
-            break (status, drained_before_reap);
+            let post_exit_drained =
+                uncontained_group_drained_after_reap(pid, drained_before_reap, true);
+            break (status, post_exit_drained);
         }
         if cancel_path.exists() || *shutdown.borrow() {
             if let Err(err) = terminate_and_drain(
@@ -1892,5 +1919,160 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cgroup_emptiness_requires_populated_zero_and_distinguishes_metadata_errors() {
+        let base =
+            std::env::temp_dir().join(format!("infernix-cg-strict-{}", Uuid::new_v4().simple()));
+        let cg_dir = base.join("qwen-strict-cg");
+        fs::create_dir_all(&cg_dir).unwrap();
+        fs::write(cg_dir.join("cgroup.procs"), "").unwrap();
+
+        let parent_dirfd: OwnedFd = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&base)
+            .unwrap()
+            .into();
+        let dirfd: OwnedFd = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&cg_dir)
+            .unwrap()
+            .into();
+        let st = fstat_fd(dirfd.as_raw_fd()).unwrap();
+        let procs_fd = openat_fd(
+            dirfd.as_raw_fd(),
+            "cgroup.procs",
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+        .unwrap();
+        let cg = ChildCgroup {
+            name: "qwen-strict-cg".to_owned(),
+            dir: cg_dir.clone(),
+            parent_dirfd,
+            dirfd,
+            identity: (st.st_dev, st.st_ino),
+            procs_fd,
+        };
+
+        // 1. Missing `cgroup.events` with empty `cgroup.procs` MUST fail closed.
+        assert!(
+            !cg.is_empty(),
+            "ChildCgroup::is_empty must fail closed when cgroup.events is missing"
+        );
+        assert!(
+            !cgroup_is_empty(&cg_dir),
+            "cgroup_is_empty must fail closed when cgroup.events is missing"
+        );
+
+        // 2. Unreadable `cgroup.events` (directory -> EISDIR) MUST fail closed.
+        fs::create_dir(cg_dir.join("cgroup.events")).unwrap();
+        assert!(!cg.is_empty());
+        assert!(!cgroup_is_empty(&cg_dir));
+        fs::remove_dir(cg_dir.join("cgroup.events")).unwrap();
+
+        // 3. `cgroup.events` without `populated` field MUST fail closed.
+        fs::write(cg_dir.join("cgroup.events"), "frozen 0\n").unwrap();
+        assert!(!cg.is_empty());
+        assert!(!cgroup_is_empty(&cg_dir));
+
+        // 4. `populated 1` with empty `cgroup.procs` (descendant in child cgroup) MUST fail closed.
+        fs::write(cg_dir.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(!cg.is_empty());
+        assert!(!cgroup_is_empty(&cg_dir));
+
+        // 5. Explicit `populated 0` AND empty `cgroup.procs` proves emptiness.
+        fs::write(cg_dir.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(cg.is_empty());
+        assert!(cgroup_is_empty(&cg_dir));
+
+        // 6. Path-based helper distinguishes NotFound (true) from non-NotFound
+        //    metadata errors (ENOTDIR, non-directory, EACCES -> false).
+        assert!(cgroup_is_empty(&base.join("does-not-exist")));
+        let blocker_file = base.join("not-a-dir");
+        fs::write(&blocker_file, b"x").unwrap();
+        assert!(
+            !cgroup_is_empty(&blocker_file),
+            "regular file at cgroup path must not be treated as empty"
+        );
+        assert!(
+            !cgroup_is_empty(&blocker_file.join("child")),
+            "ENOTDIR metadata error must fail closed rather than look like NotFound"
+        );
+        // Also exercise EACCES on non-root runs.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let locked_parent = base.join("locked-parent");
+            let hidden_child = locked_parent.join("qwen-hidden");
+            fs::create_dir_all(&hidden_child).unwrap();
+            fs::set_permissions(&locked_parent, fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                !cgroup_is_empty(&hidden_child),
+                "EACCES metadata error must fail closed rather than look like NotFound"
+            );
+            fs::set_permissions(&locked_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn uncontained_post_reap_group_gone_catches_surviving_member_without_signaling() {
+        // Spawn an uncontained leader that forks a long-lived grandchild in its
+        // own process group and exits immediately. Reap the leader WITHOUT
+        // killing the grandchild to simulate a racing `/proc` scan miss, then
+        // prove `uncontained_group_drained_after_reap` fails closed via
+        // kernel `kill(-pid, 0)` without signaling the surviving grandchild.
+        let pid_file = std::env::temp_dir().join(format!(
+            "infernix-qwen-grandchild-{}.pid",
+            Uuid::new_v4().simple()
+        ));
+        let mut leader = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}' ; exit 0",
+                pid_file.display()
+            ))
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let leader_pid = leader.id().unwrap();
+        let status = leader.wait().await.unwrap();
+        assert!(status.success());
+
+        let grandchild_pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = fs::remove_file(&pid_file);
+
+        assert!(
+            !group_gone(leader_pid),
+            "kernel kill(-pgid, 0) must detect surviving grandchild after leader reap"
+        );
+        assert!(
+            !uncontained_group_drained_after_reap(leader_pid, true, true),
+            "post-reap verifier must fail closed even if a racing /proc scan reported Empty"
+        );
+        // Confirm the read-only check did NOT terminate the surviving process.
+        assert_eq!(
+            unsafe { libc::kill(grandchild_pid, 0) },
+            0,
+            "read-only post-reap check must not kill surviving members"
+        );
+
+        // Clean up the test grandchild and verify group_gone flips to true.
+        unsafe {
+            libc::kill(grandchild_pid, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !group_gone(leader_pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(uncontained_group_drained_after_reap(leader_pid, true, true));
     }
 }

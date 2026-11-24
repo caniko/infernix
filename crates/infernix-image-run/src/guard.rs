@@ -627,8 +627,11 @@ impl ActiveLease {
             HookOutcome::Ok { stdout } => {
                 lease.acquired = true;
                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&stdout) {
-                    lease.slot_attempt_id = val.get("slotAttemptId").and_then(|v| v.as_u64());
-                    lease.slot_token = val
+                    // Support both flat JSON payloads and the `canix --output json`
+                    // v1 envelope (`{"schemaVersion": 1, "ok": true, "data": {...}}`).
+                    let payload = val.get("data").filter(|v| v.is_object()).unwrap_or(&val);
+                    lease.slot_attempt_id = payload.get("slotAttemptId").and_then(|v| v.as_u64());
+                    lease.slot_token = payload
                         .get("slotToken")
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())

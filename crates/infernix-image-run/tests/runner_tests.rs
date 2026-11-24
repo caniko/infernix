@@ -4711,7 +4711,7 @@ async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
             "#!/bin/sh\n\
              printf 'ARGS:%s|TOKEN:%s\\n' \"$*\" \"${{CANIX_LEASE_SLOT_TOKEN-}}\" >> {}\n\
              if [ \"$1\" = \"acquire\" ]; then\n\
-               printf '{{\"ok\":true,\"slotAttemptId\":88,\"slotToken\":\"fedcba9876543210fedcba9876543210\"}}\\n'\n\
+               printf '{{\"schemaVersion\":1,\"ok\":true,\"status\":\"ok\",\"data\":{{\"ok\":true,\"slotAttemptId\":88,\"slotToken\":\"fedcba9876543210fedcba9876543210\"}}}}\\n'\n\
              fi\n\
              exit 0\n",
             e2e_log.display()

@@ -1652,6 +1652,12 @@
       };
         pkgs.runCommand "infernix-mcp-adapters" {} ''touch $out'';
 
+      skill-telemetry = assert import ./tests/skill-telemetry.nix {
+        inherit pkgs;
+        homeManager = home-manager;
+      };
+        pkgs.runCommand "infernix-skill-telemetry-check" {} ''touch "$out"'';
+
       model-fetch = import ./tests/model-fetch {
         inherit pkgs nixpkgs;
         nixosModule = self.nixosModules.default;

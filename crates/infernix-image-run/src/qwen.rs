@@ -111,12 +111,51 @@ fn signal_group_unreaped(pid: u32, sig: i32) {
     }
 }
 
-/// Check whether child `pid` has exited WITHOUT reaping it (`WNOWAIT`), so its
-/// numeric PID and PGID stay reserved in the kernel while draining any
-/// remaining process-group members for uncontained jobs.
-fn child_exited_without_reap(pid: u32) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnreapedWaitStatus {
+    /// Child leader is still running and waitable by this process.
+    Running,
+    /// Child leader has exited and remains an unreaped zombie owned by this
+    /// process (`WNOWAIT`), so PGID `pid` is guaranteed reserved by the kernel.
+    ExitedUnreaped,
+    /// Wait ownership is absent or was lost (`ECHILD` or unexpected error, e.g.
+    /// auto-reaped): caller has NO signaling authority over numeric `-pid`.
+    OwnershipLost,
+}
+
+/// Ensure inherited `SIGCHLD=SIG_IGN` or `SA_NOCLDWAIT` cannot cause the kernel
+/// to auto-reap child leaders before we drain their process group. Leaves
+/// existing custom handlers (such as Tokio's `SIGCHLD` handler) untouched.
+fn ensure_sigchld_waitable() -> RunnerResult<()> {
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: querying current `SIGCHLD` disposition into aligned `old`.
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) } != 0 {
+        return Err(RunnerError::internal(format!(
+            "query SIGCHLD disposition: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if old.sa_sigaction == libc::SIG_IGN || (old.sa_flags & libc::SA_NOCLDWAIT) != 0 {
+        let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+        act.sa_sigaction = libc::SIG_DFL;
+        // SAFETY: resetting ignored/nocldwait SIGCHLD to default makes spawned
+        // children waitable without replacing any active custom signal handler.
+        if unsafe { libc::sigaction(libc::SIGCHLD, &act, std::ptr::null_mut()) } != 0 {
+            return Err(RunnerError::internal(format!(
+                "reset SIGCHLD disposition: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Poll whether direct child `pid` is running, exited-but-unreaped (`WNOWAIT`),
+/// or no longer owned/waitable (`ECHILD`). Treats `ECHILD` strictly as loss of
+/// signaling authority so an auto-reaped or foreign PGID is NEVER signaled.
+fn poll_child_unreaped(pid: u32) -> UnreapedWaitStatus {
     if pid == 0 {
-        return true;
+        return UnreapedWaitStatus::OwnershipLost;
     }
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is valid aligned storage for `waitid(P_PID, ..., WNOWAIT)`.
@@ -129,10 +168,17 @@ fn child_exited_without_reap(pid: u32) -> bool {
         )
     };
     if rc != 0 {
-        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        return UnreapedWaitStatus::OwnershipLost;
     }
     // SAFETY: Linux populates `si_pid` to the exited child's PID, or 0 if still running.
-    unsafe { info.si_pid() != 0 }
+    let si_pid = unsafe { info.si_pid() };
+    if si_pid == 0 {
+        UnreapedWaitStatus::Running
+    } else if si_pid == pid as libc::pid_t {
+        UnreapedWaitStatus::ExitedUnreaped
+    } else {
+        UnreapedWaitStatus::OwnershipLost
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -791,23 +837,44 @@ async fn terminate_and_drain(
         ));
     }
 
-    // Uncontained fallback (`cg.is_none()`): NEVER signal `-pid` after reaping
-    // the leader. Poll with `WNOWAIT` so the zombie leader reserves PGID `pid`
-    // until all descendants have exited. Only `PgidScan::Empty` proves drain;
-    // `Populated` and `Inconclusive` both fail closed.
-    signal_group_unreaped(pid, libc::SIGTERM);
+    // Uncontained fallback (`cg.is_none()`): NEVER signal `-pid` if wait
+    // ownership is lost (`OwnershipLost` / `ECHILD`) or after reaping the
+    // leader. Poll with `WNOWAIT` so the zombie leader reserves PGID `pid`
+    // until all descendants have exited. Only `PgidScan::Empty` plus post-reap
+    // `group_gone(pid)` proves drain; `Populated`, `Inconclusive`, and
+    // `OwnershipLost` all fail closed.
+    match poll_child_unreaped(pid) {
+        UnreapedWaitStatus::Running | UnreapedWaitStatus::ExitedUnreaped => {
+            signal_group_unreaped(pid, libc::SIGTERM);
+        }
+        UnreapedWaitStatus::OwnershipLost => {
+            return Err(RunnerError::internal(
+                "uncontained Qwen child wait ownership lost before SIGTERM; refusing numeric PGID signal",
+            ));
+        }
+    }
     let term_deadline = Instant::now() + grace;
     loop {
-        if child_exited_without_reap(pid) && scan_other_members_in_pgid(pid) == PgidScan::Empty {
-            let reaped = matches!(child.try_wait(), Ok(Some(_)));
-            if uncontained_group_drained_after_reap(pid, true, reaped) {
-                return Ok(());
+        match poll_child_unreaped(pid) {
+            UnreapedWaitStatus::OwnershipLost => {
+                return Err(RunnerError::internal(
+                    "uncontained Qwen child wait ownership lost during grace period; refusing numeric PGID signal",
+                ));
             }
-            // Leader was already reaped (or could not be reaped cleanly); never
-            // send a terminating signal to `-pid` after reaping!
-            return Err(RunnerError::internal(
-                "Qwen child process group was not proven absent after reaping leader",
-            ));
+            UnreapedWaitStatus::ExitedUnreaped => {
+                if scan_other_members_in_pgid(pid) == PgidScan::Empty {
+                    let reaped = matches!(child.try_wait(), Ok(Some(_)));
+                    if uncontained_group_drained_after_reap(pid, true, reaped) {
+                        return Ok(());
+                    }
+                    // Leader was already reaped (or could not be reaped cleanly); never
+                    // send a terminating signal to `-pid` after reaping!
+                    return Err(RunnerError::internal(
+                        "Qwen child process group was not proven absent after reaping leader",
+                    ));
+                }
+            }
+            UnreapedWaitStatus::Running => {}
         }
         if Instant::now() >= term_deadline {
             break;
@@ -815,26 +882,47 @@ async fn terminate_and_drain(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    signal_group_unreaped(pid, libc::SIGKILL);
+    match poll_child_unreaped(pid) {
+        UnreapedWaitStatus::Running | UnreapedWaitStatus::ExitedUnreaped => {
+            signal_group_unreaped(pid, libc::SIGKILL);
+        }
+        UnreapedWaitStatus::OwnershipLost => {
+            return Err(RunnerError::internal(
+                "uncontained Qwen child wait ownership lost before SIGKILL; refusing numeric PGID signal",
+            ));
+        }
+    }
     let kill_deadline = Instant::now() + kill_wait;
     let mut drained_before_reap = false;
     while Instant::now() < kill_deadline {
-        if child_exited_without_reap(pid) && scan_other_members_in_pgid(pid) == PgidScan::Empty {
-            drained_before_reap = true;
-            break;
+        match poll_child_unreaped(pid) {
+            UnreapedWaitStatus::OwnershipLost => {
+                return Err(RunnerError::internal(
+                    "uncontained Qwen child wait ownership lost during SIGKILL drain; refusing numeric PGID signal",
+                ));
+            }
+            UnreapedWaitStatus::ExitedUnreaped => {
+                if scan_other_members_in_pgid(pid) == PgidScan::Empty {
+                    drained_before_reap = true;
+                    break;
+                }
+                signal_group_unreaped(pid, libc::SIGKILL);
+            }
+            UnreapedWaitStatus::Running => {
+                signal_group_unreaped(pid, libc::SIGKILL);
+            }
         }
-        signal_group_unreaped(pid, libc::SIGKILL);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     if !drained_before_reap
-        && child_exited_without_reap(pid)
+        && poll_child_unreaped(pid) == UnreapedWaitStatus::ExitedUnreaped
         && scan_other_members_in_pgid(pid) == PgidScan::Empty
     {
         drained_before_reap = true;
     }
 
     // Reap leader ONLY AFTER finishing all process-group signaling.
-    let reaped = if child_exited_without_reap(pid) {
+    let reaped = if poll_child_unreaped(pid) == UnreapedWaitStatus::ExitedUnreaped {
         matches!(timeout(kill_wait, child.wait()).await, Ok(Ok(_)))
     } else {
         matches!(child.try_wait(), Ok(Some(_)))
@@ -1253,6 +1341,8 @@ pub async fn run_qwen_streaming(
         });
     }
 
+    ensure_sigchld_waitable()?;
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1304,22 +1394,53 @@ pub async fn run_qwen_streaming(
                 }
                 break (status, c.is_empty());
             }
-        } else if child_exited_without_reap(pid) {
-            let drain_deadline = Instant::now() + qwen.kill_drain_wait;
-            while scan_other_members_in_pgid(pid) != PgidScan::Empty
-                && Instant::now() < drain_deadline
-            {
-                signal_group_unreaped(pid, libc::SIGKILL);
-                tokio::time::sleep(Duration::from_millis(50)).await;
+        } else {
+            match poll_child_unreaped(pid) {
+                UnreapedWaitStatus::Running => {}
+                UnreapedWaitStatus::ExitedUnreaped => {
+                    let drain_deadline = Instant::now() + qwen.kill_drain_wait;
+                    let mut ownership_lost = false;
+                    while scan_other_members_in_pgid(pid) != PgidScan::Empty
+                        && Instant::now() < drain_deadline
+                    {
+                        if poll_child_unreaped(pid) != UnreapedWaitStatus::ExitedUnreaped {
+                            ownership_lost = true;
+                            break;
+                        }
+                        signal_group_unreaped(pid, libc::SIGKILL);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    let drained_before_reap =
+                        !ownership_lost && scan_other_members_in_pgid(pid) == PgidScan::Empty;
+                    let status = child
+                        .wait()
+                        .await
+                        .map_err(|e| RunnerError::internal(format!("reap qwen child: {e}")))?;
+                    let post_exit_drained =
+                        uncontained_group_drained_after_reap(pid, drained_before_reap, true);
+                    break (status, post_exit_drained);
+                }
+                UnreapedWaitStatus::OwnershipLost => {
+                    // PGID wait ownership lost (`ECHILD` / auto-reaped): NEVER
+                    // send a terminating signal to `-pid`; quarantine fail-closed.
+                    let err = RunnerError::internal(
+                        "uncontained Qwen child wait ownership lost (ECHILD); refusing numeric PGID signal",
+                    );
+                    record_qwen_quarantine(
+                        quarantine_path,
+                        quarantined,
+                        job_id,
+                        pid,
+                        child_cg.as_ref(),
+                        before_vram,
+                        &mut stage_guard,
+                        lease,
+                        gpu_lock,
+                        err.message.clone(),
+                    )?;
+                    return Err(err);
+                }
             }
-            let drained_before_reap = scan_other_members_in_pgid(pid) == PgidScan::Empty;
-            let status = child
-                .wait()
-                .await
-                .map_err(|e| RunnerError::internal(format!("reap qwen child: {e}")))?;
-            let post_exit_drained =
-                uncontained_group_drained_after_reap(pid, drained_before_reap, true);
-            break (status, post_exit_drained);
         }
         if cancel_path.exists() || *shutdown.borrow() {
             if let Err(err) = terminate_and_drain(
@@ -1722,8 +1843,11 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    static CHILD_SIGNAL_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn contained_drain_never_signals_numeric_pgid_and_uncontained_drains_before_reap() {
+        let _sig_guard = CHILD_SIGNAL_TEST_MUTEX.lock().await;
         // 1. Contained `terminate_and_drain`: spawn an unrelated innocent process
         //    group and pass its PGID as `pid` alongside a pinned `ChildCgroup`.
         //    Contained cleanup MUST NEVER call `kill(-pid, ...)`!
@@ -1815,11 +1939,14 @@ mod tests {
             .unwrap();
         let u_pid = uncontained.id().unwrap();
         let wait_deadline = Instant::now() + Duration::from_secs(3);
-        while !child_exited_without_reap(u_pid) && Instant::now() < wait_deadline {
+        while poll_child_unreaped(u_pid) == UnreapedWaitStatus::Running
+            && Instant::now() < wait_deadline
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            child_exited_without_reap(u_pid),
+        assert_eq!(
+            poll_child_unreaped(u_pid),
+            UnreapedWaitStatus::ExitedUnreaped,
             "uncontained leader should exit while remaining unreaped"
         );
         assert_eq!(
@@ -2020,59 +2147,103 @@ mod tests {
 
     #[tokio::test]
     async fn uncontained_post_reap_group_gone_catches_surviving_member_without_signaling() {
-        // Spawn an uncontained leader that forks a long-lived grandchild in its
-        // own process group and exits immediately. Reap the leader WITHOUT
-        // killing the grandchild to simulate a racing `/proc` scan miss, then
-        // prove `uncontained_group_drained_after_reap` fails closed via
-        // kernel `kill(-pid, 0)` without signaling the surviving grandchild.
-        let pid_file = std::env::temp_dir().join(format!(
-            "infernix-qwen-grandchild-{}.pid",
-            Uuid::new_v4().simple()
-        ));
+        let _sig_guard = CHILD_SIGNAL_TEST_MUTEX.lock().await;
+        // Make BOTH process-group members direct children of this test so we
+        // reap them directly with zero reliance on container PID 1 reaping orphans!
         let mut leader = Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!(
-                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}' ; exit 0",
-                pid_file.display()
-            ))
+            .arg("read _ || true")
+            .stdin(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
             .unwrap();
         let leader_pid = leader.id().unwrap();
+        let leader_stdin = leader.stdin.take().unwrap();
+
+        let mut member = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .process_group(leader_pid as i32)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        // Exit and reap the leader while `member` remains alive in PGID `leader_pid`.
+        drop(leader_stdin);
         let status = leader.wait().await.unwrap();
         assert!(status.success());
 
-        let grandchild_pid: i32 = fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let _ = fs::remove_file(&pid_file);
+        // `poll_child_unreaped` MUST report `OwnershipLost` (ECHILD) for the
+        // already-reaped leader rather than treating `ECHILD` as unreaped exit!
+        assert_eq!(
+            poll_child_unreaped(leader_pid),
+            UnreapedWaitStatus::OwnershipLost,
+            "ECHILD on reaped leader must report OwnershipLost, never ExitedUnreaped"
+        );
+        // `terminate_and_drain` MUST refuse to signal `-leader_pid` when wait
+        // ownership is lost, leaving `member` alive and returning Err!
+        let err = terminate_and_drain(
+            &mut leader,
+            leader_pid,
+            None,
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("terminate_and_drain must fail closed on OwnershipLost without signaling");
+        assert!(
+            err.message.contains("ownership lost"),
+            "unexpected error: {}",
+            err.message
+        );
+        assert!(
+            member.try_wait().unwrap().is_none(),
+            "terminate_and_drain on OwnershipLost MUST NOT signal surviving member in PGID"
+        );
 
+        // Post-reap kernel `kill(-pgid, 0)` check detects the surviving member
+        // without terminating it.
         assert!(
             !group_gone(leader_pid),
-            "kernel kill(-pgid, 0) must detect surviving grandchild after leader reap"
+            "kernel kill(-pgid, 0) must detect surviving member after leader reap"
         );
         assert!(
             !uncontained_group_drained_after_reap(leader_pid, true, true),
             "post-reap verifier must fail closed even if a racing /proc scan reported Empty"
         );
-        // Confirm the read-only check did NOT terminate the surviving process.
-        assert_eq!(
-            unsafe { libc::kill(grandchild_pid, 0) },
-            0,
+        assert!(
+            member.try_wait().unwrap().is_none(),
             "read-only post-reap check must not kill surviving members"
         );
 
-        // Clean up the test grandchild and verify group_gone flips to true.
-        unsafe {
-            libc::kill(grandchild_pid, libc::SIGKILL);
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !group_gone(leader_pid) && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // Kill and directly reap our own child `member` -> group disappears
+        // deterministically without depending on PID 1 reaping orphans!
+        member.kill().await.unwrap();
+        let _ = member.wait().await.unwrap();
+        assert!(group_gone(leader_pid));
         assert!(uncontained_group_drained_after_reap(leader_pid, true, true));
+
+        // Also verify `ensure_sigchld_waitable` clears inherited `SIG_IGN`.
+        let mut prev: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut ign: libc::sigaction = unsafe { std::mem::zeroed() };
+        ign.sa_sigaction = libc::SIG_IGN;
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, &ign, &mut prev) },
+            0
+        );
+        ensure_sigchld_waitable().expect("ensure_sigchld_waitable resets SIG_IGN");
+        let mut after: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut after) },
+            0
+        );
+        assert_ne!(after.sa_sigaction, libc::SIG_IGN);
+        assert_eq!(after.sa_flags & libc::SA_NOCLDWAIT, 0);
+        // Restore prior handler (e.g. Tokio's SIGCHLD handler) for the test binary.
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, &prev, std::ptr::null_mut()) },
+            0
+        );
     }
 }

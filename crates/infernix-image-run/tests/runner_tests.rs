@@ -4606,9 +4606,9 @@ async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
     // 1. Plain recheck before cgroup creation forwards attempt-id & private env token, no --cgroup.
     lease.recheck().await.expect("plain recheck succeeds");
 
-    // 2. Cgroup-scoped recheck forwards exact --cgroup basename + --attempt-id + env token (never token in argv).
+    // 2. Cgroup-scoped recheck forwards exact --cgroup basename + --cgroup-inode dev:ino + --attempt-id + env token (never token in argv).
     lease
-        .recheck_with_cgroup(Some("qwen-job50-a1b2c3d4"))
+        .recheck_with_cgroup(Some("qwen-job50-a1b2c3d4"), Some((42, 98765)))
         .await
         .expect("cgroup recheck succeeds");
 
@@ -4659,7 +4659,7 @@ async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
 
     assert_eq!(
         lines[2],
-        "ARGS:recheck --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9 --cgroup qwen-job50-a1b2c3d4 --attempt-id 77|TOKEN:0123456789abcdef0123456789abcdef"
+        "ARGS:recheck --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9 --cgroup qwen-job50-a1b2c3d4 --cgroup-inode 42:98765 --attempt-id 77|TOKEN:0123456789abcdef0123456789abcdef"
     );
     assert!(
         !lines[2]
@@ -4827,4 +4827,146 @@ async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
             && !release_line.contains("--reconcile"),
         "normal Qwen release must forward attempt-id and private env token without --reconcile: {release_line}"
     );
+}
+
+#[tokio::test]
+async fn qwen_drain_quarantine_recovery_leaves_ambiguous_cgroup_directory_untouched() {
+    let dir = temp_dir("qwen-quarantine-preserve-dir");
+    let (meminfo, psi) = write_host_fixtures(&dir, 50, 0.1);
+    let (reg_dir, _, _, qwen_digest) = write_registry(&dir, false, None);
+    let src_png = encode_test_png(1024, 1024, &[]);
+    let src_path = dir.join("src.png");
+    fs::write(&src_path, &src_png).unwrap();
+    let gpu_lock = dir.join("gpu.lock");
+    fs::write(&gpu_lock, b"").unwrap();
+    let out_png_path = dir.join("fixture-out.png");
+    fs::write(&out_png_path, encode_test_png(1024, 1024, &[])).unwrap();
+
+    // Create an empty replacement directory at the quarantined `qwen_cgroup` path.
+    let replacement_cg = dir.join("qwen-replaced-12345678");
+    fs::create_dir_all(&replacement_cg).unwrap();
+    fs::write(
+        replacement_cg.join("cgroup.events"),
+        "populated 0\nfrozen 0\n",
+    )
+    .unwrap();
+    fs::write(replacement_cg.join("cgroup.procs"), "").unwrap();
+
+    // Write a `qwen_drain` quarantine marker pointing at `replacement_cg`.
+    let runner_lock = dir.join("runner.lock");
+    let quarantine_path = quarantine_path_for_lock(&runner_lock);
+    write_quarantine(
+        &quarantine_path,
+        &QuarantineState {
+            kind: "qwen_drain".to_owned(),
+            reason: "prior qwen drain timeout".to_owned(),
+            job_id: Some("old-job".to_owned()),
+            prompt_id: None,
+            client_id: None,
+            comfy_unit: None,
+            comfy_invocation_id: None,
+            qwen_cgroup: Some(replacement_cg.clone()),
+            qwen_pgid: None,
+            qwen_vram_baseline_mib: None,
+            qwen_stage_dir: None,
+            lease_uncertain: false,
+            pending_lease_release: None,
+        },
+    )
+    .unwrap();
+
+    let fake_adapter = dir.join("fake_adapter.py");
+    fs::write(
+        &fake_adapter,
+        format!(
+            "import hashlib, json, sys\n\
+             from pathlib import Path\n\
+             args = sys.argv[1:]\n\
+             staging = Path(args[args.index('--staging') + 1])\n\
+             job = json.loads(sys.stdin.read())\n\
+             out = Path({:?}).read_bytes()\n\
+             (staging / 'edit.png').write_bytes(out)\n\
+             receipt = {{\n\
+               'state': 'rendered',\n\
+               'recipe': {{\n\
+                 'id': 'qwen-image-edit-2511-lightning-4-bf16-streaming',\n\
+                 'steps': 4,\n\
+                 'size': [1024, 1024],\n\
+                 'seed': job['seed'],\n\
+                 'lora': job['lora'],\n\
+               }},\n\
+               'models': {{}},\n\
+               'output': {{'sha256': hashlib.sha256(out).hexdigest()}},\n\
+             }}\n\
+             print(json.dumps(receipt))\n",
+            out_png_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let runner_cfg = RunnerConfig {
+        registry_dir: reg_dir,
+        runner_lock_path: runner_lock,
+        runner_lock_wait: Duration::from_secs(2),
+        guard: GuardConfig {
+            meminfo_path: meminfo,
+            memory_psi_path: psi,
+            vram_floor_mib: Some(12000),
+            vram_override_mib: Some(15900),
+            ..GuardConfig::default()
+        },
+        comfy: None,
+        qwen: Some(QwenConfig {
+            python: PathBuf::from("python3"),
+            adapter_script: fake_adapter,
+            backend: "cuda".to_owned(),
+            denoiser_dir: dir.clone(),
+            snapshot_dir: dir.clone(),
+            lightning_dir: dir.clone(),
+            gpu_lock_path: gpu_lock,
+            gpu_lock_wait: Duration::from_secs(5),
+            cancel_grace: Duration::from_secs(1),
+            kill_drain_wait: Duration::from_secs(2),
+            vram_release_wait: Duration::from_secs(2),
+            cgroup_parent: None,
+            require_cgroup_containment: false,
+            extra_env: vec![],
+        }),
+    };
+    let req = RunRequest {
+        schema_version: 1,
+        job_id: "qwen-after-quarantine".to_owned(),
+        profile_id: "vagrant.qwen-image-edit-2511-lightning-4".to_owned(),
+        revision: "v1".to_owned(),
+        manifest_digest: qwen_digest,
+        inputs: vec![LocalInput {
+            path: src_path,
+            sha256: sha256_hex(&src_png),
+        }],
+        parameters: ImageParameters {
+            prompt: "after quarantine".to_owned(),
+            seed: 5300,
+            steps: Some(4),
+            denoise: None,
+        },
+        output_path: dir.join("after-q-out.png"),
+        cancel_path: dir.join("cancel"),
+        journal_dir: dir.join("j-after-q"),
+        lease_id: None,
+        lease_generation: None,
+    };
+    let (_tx, rx) = watch::channel(false);
+    let receipt = execute_request(&runner_cfg, &req, rx)
+        .await
+        .expect("qwen_drain quarantine should clear once cgroup is empty");
+    assert_eq!(receipt.state, "rendered");
+    assert!(
+        !quarantine_path.exists(),
+        "quarantine file should be cleared after recovery"
+    );
+    assert!(
+        replacement_cg.exists(),
+        "deferred quarantine recovery MUST leave ambiguous qwen_cgroup directory untouched"
+    );
+    let _ = fs::remove_dir_all(&dir);
 }

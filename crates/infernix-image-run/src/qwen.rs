@@ -36,7 +36,7 @@ use crate::{
     guard::{
         ActiveLease, FileLock, GuardConfig, QuarantineState, check_host_admission,
         check_host_running, check_vram_admission, read_free_vram_mib, record_quarantine,
-        run_admission_probe, unload_llama_swap, verify_qwen_cgroup_limits,
+        run_admission_probe, unload_llama_swap,
     },
     png::{MAX_PNG_BYTES, PngInfo, sha256_hex, write_verified_png_checked},
     registry::{ProfileEntry, QwenSpec, validate_parameters},
@@ -101,13 +101,77 @@ where
     })
 }
 
-fn signal_group(pid: u32, sig: i32) {
+fn signal_group_unreaped(pid: u32, sig: i32) {
     if pid != 0 {
-        // SAFETY: child spawned with `process_group(0)` so `-pid` targets only its group.
+        // SAFETY: caller MUST only invoke this for uncontained jobs BEFORE reaping
+        // the group leader `pid`, while the kernel still reserves PGID `pid`.
         unsafe {
             libc::kill(-(pid as i32), sig);
         }
     }
+}
+
+/// Check whether child `pid` has exited WITHOUT reaping it (`WNOWAIT`), so its
+/// numeric PID and PGID stay reserved in the kernel while draining any
+/// remaining process-group members for uncontained jobs.
+fn child_exited_without_reap(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is valid aligned storage for `waitid(P_PID, ..., WNOWAIT)`.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+    }
+    // SAFETY: Linux populates `si_pid` to the exited child's PID, or 0 if still running.
+    unsafe { info.si_pid() != 0 }
+}
+
+/// True if any process other than `leader_pid` itself currently belongs to
+/// process group `leader_pid`. Only called while `leader_pid` is still unreaped
+/// so PGID `leader_pid` cannot have been recycled.
+fn other_members_in_pgid(leader_pid: u32) -> bool {
+    if leader_pid == 0 {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(p) = name_str.parse::<u32>() else {
+            continue;
+        };
+        if p == leader_pid {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(after_comm) = stat.rfind(')').and_then(|idx| stat.get(idx + 1..)) else {
+            continue;
+        };
+        let mut fields = after_comm.split_whitespace();
+        let _state = fields.next();
+        let _ppid = fields.next();
+        if let Some(pgrp_str) = fields.next() {
+            if pgrp_str.parse::<u32>().ok() == Some(leader_pid) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn group_gone(pid: u32) -> bool {
@@ -145,6 +209,19 @@ fn fstat_fd(fd: RawFd) -> std::io::Result<libc::stat> {
     }
 }
 
+fn fstatat_nofollow(dirfd: RawFd, rel: &str) -> std::io::Result<libc::stat> {
+    let c_rel = CString::new(rel)
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "NUL byte in cgroup entry"))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_rel` is NUL-terminated and `st` is a valid aligned `libc::stat`.
+    let rc = unsafe { libc::fstatat(dirfd, c_rel.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc == 0 {
+        Ok(st)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn openat_fd(dirfd: RawFd, rel: &str, flags: libc::c_int) -> std::io::Result<OwnedFd> {
     let c_rel = CString::new(rel)
         .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "NUL byte in cgroup entry"))?;
@@ -158,6 +235,70 @@ fn openat_fd(dirfd: RawFd, rel: &str, flags: libc::c_int) -> std::io::Result<Own
     }
 }
 
+fn mkdirat_rel(dirfd: RawFd, rel: &str, mode: libc::mode_t) -> std::io::Result<()> {
+    let c_rel = CString::new(rel)
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "NUL byte in cgroup entry"))?;
+    // SAFETY: `c_rel` is NUL-terminated and `mkdirat` validates `dirfd`.
+    let rc = unsafe { libc::mkdirat(dirfd, c_rel.as_ptr(), mode) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn unlinkat_dir(dirfd: RawFd, rel: &str) -> std::io::Result<()> {
+    let c_rel = CString::new(rel)
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "NUL byte in cgroup entry"))?;
+    // SAFETY: `c_rel` is NUL-terminated and `unlinkat` validates `dirfd`.
+    let rc = unsafe { libc::unlinkat(dirfd, c_rel.as_ptr(), libc::AT_REMOVEDIR) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+struct FdFlockGuard {
+    fd: RawFd,
+}
+
+impl FdFlockGuard {
+    fn lock_exclusive(fd: RawFd) -> std::io::Result<Self> {
+        loop {
+            // SAFETY: `fd` is an open directory fd owned for the lifetime of this guard.
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc == 0 {
+                return Ok(Self { fd });
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+}
+
+impl Drop for FdFlockGuard {
+    fn drop(&mut self) {
+        // SAFETY: unlocks the advisory lock acquired in `lock_exclusive`.
+        unsafe {
+            let _ = libc::flock(self.fd, libc::LOCK_UN);
+        }
+    }
+}
+
+fn write_at_all(dirfd: RawFd, rel: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let fd = openat_fd(
+        dirfd,
+        rel,
+        libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    )?;
+    let mut file = File::from(fd);
+    file.write_all(bytes)
+}
+
 fn read_at_to_string(dirfd: RawFd, rel: &str) -> std::io::Result<String> {
     let fd = openat_fd(
         dirfd,
@@ -168,6 +309,69 @@ fn read_at_to_string(dirfd: RawFd, rel: &str) -> std::io::Result<String> {
     let mut buf = String::new();
     file.read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+fn verify_qwen_cgroup_limits_fd(
+    dirfd: RawFd,
+    display_dir: &Path,
+    expected_memory: u64,
+) -> RunnerResult<()> {
+    let max_raw = read_at_to_string(dirfd, "memory.max").map_err(|_| {
+        RunnerError::gpu_unavailable(format!(
+            "cannot read memory.max in {}",
+            display_dir.display()
+        ))
+    })?;
+    let swap_raw = read_at_to_string(dirfd, "memory.swap.max").map_err(|_| {
+        RunnerError::gpu_unavailable(format!(
+            "cannot read memory.swap.max in {}",
+            display_dir.display()
+        ))
+    })?;
+    let actual_max = max_raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| RunnerError::gpu_unavailable("cgroup memory.max is not bounded"))?;
+    let actual_swap = swap_raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| RunnerError::gpu_unavailable("cgroup memory.swap.max is not bounded"))?;
+    if actual_max != expected_memory || actual_swap != 0 {
+        return Err(RunnerError::gpu_unavailable(format!(
+            "unexpected cgroup limits in {}: memory.max={actual_max} (want {expected_memory}), swap.max={actual_swap} (want 0)",
+            display_dir.display()
+        )));
+    }
+    let high_raw = read_at_to_string(dirfd, "memory.high").map_err(|_| {
+        RunnerError::gpu_unavailable(format!(
+            "cannot read memory.high in {}",
+            display_dir.display()
+        ))
+    })?;
+    let actual_high = high_raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| RunnerError::gpu_unavailable("cgroup memory.high is not bounded"))?;
+    if actual_high != expected_memory {
+        return Err(RunnerError::gpu_unavailable(format!(
+            "unexpected memory.high in {}: {actual_high} (want {expected_memory})",
+            display_dir.display()
+        )));
+    }
+    let oom_group_raw = read_at_to_string(dirfd, "memory.oom.group").map_err(|_| {
+        RunnerError::gpu_unavailable(format!(
+            "cannot read memory.oom.group in {}",
+            display_dir.display()
+        ))
+    })?;
+    if oom_group_raw.trim() != "1" {
+        return Err(RunnerError::gpu_unavailable(format!(
+            "unexpected memory.oom.group in {}: {} (want 1)",
+            display_dir.display(),
+            oom_group_raw.trim()
+        )));
+    }
+    Ok(())
 }
 
 fn pid_belongs_to_cgroup_identity(pid: u32, expected_identity: (u64, u64)) -> bool {
@@ -204,6 +408,7 @@ fn pid_belongs_to_cgroup_identity(pid: u32, expected_identity: (u64, u64)) -> bo
 struct ChildCgroup {
     name: String,
     dir: PathBuf,
+    parent_dirfd: OwnedFd,
     dirfd: OwnedFd,
     identity: (u64, u64),
     procs_fd: OwnedFd,
@@ -211,11 +416,34 @@ struct ChildCgroup {
 
 impl ChildCgroup {
     fn create(parent: &Path, job_id: &str, memory_bytes: u64) -> RunnerResult<Self> {
+        let parent_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(parent)
+            .map_err(|e| {
+                RunnerError::gpu_unavailable(format!(
+                    "open delegated Qwen cgroup parent {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        let parent_dirfd: OwnedFd = parent_file.into();
+        // Serialize child cgroup creation/removal against concurrent runner
+        // operations on the same parent directory.
+        let _parent_lock = FdFlockGuard::lock_exclusive(parent_dirfd.as_raw_fd()).map_err(|e| {
+            RunnerError::gpu_unavailable(format!(
+                "lock delegated Qwen cgroup parent {}: {e}",
+                parent.display()
+            ))
+        })?;
+
         // Ensure parent enables memory + pids for child cgroups if needed.
-        let subtree_path = parent.join("cgroup.subtree_control");
-        if let Ok(cur) = fs::read_to_string(&subtree_path) {
+        if let Ok(cur) = read_at_to_string(parent_dirfd.as_raw_fd(), "cgroup.subtree_control") {
             if !cur.split_whitespace().any(|t| t == "memory") {
-                let _ = fs::write(&subtree_path, "+memory +pids\n");
+                let _ = write_at_all(
+                    parent_dirfd.as_raw_fd(),
+                    "cgroup.subtree_control",
+                    b"+memory +pids\n",
+                );
             }
         }
         let safe_job: String = job_id
@@ -233,27 +461,27 @@ impl ChildCgroup {
             &Uuid::new_v4().simple().to_string()[..8]
         );
         let dir = parent.join(&cg_name);
-        fs::create_dir(&dir).map_err(|e| {
+        mkdirat_rel(parent_dirfd.as_raw_fd(), &cg_name, 0o755).map_err(|e| {
             RunnerError::gpu_unavailable(format!(
                 "create dedicated Qwen cgroup {}: {e}",
                 dir.display()
             ))
         })?;
 
-        let dir_file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&dir)
-            .map_err(|e| {
-                let _ = fs::remove_dir(&dir);
-                RunnerError::gpu_unavailable(format!(
-                    "pin dedicated Qwen cgroup dirfd {}: {e}",
-                    dir.display()
-                ))
-            })?;
-        let dirfd: OwnedFd = dir_file.into();
+        let dirfd = openat_fd(
+            parent_dirfd.as_raw_fd(),
+            &cg_name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+        .map_err(|e| {
+            let _ = unlinkat_dir(parent_dirfd.as_raw_fd(), &cg_name);
+            RunnerError::gpu_unavailable(format!(
+                "pin dedicated Qwen cgroup dirfd {}: {e}",
+                dir.display()
+            ))
+        })?;
         let st = fstat_fd(dirfd.as_raw_fd()).map_err(|e| {
-            let _ = fs::remove_dir(&dir);
+            let _ = unlinkat_dir(parent_dirfd.as_raw_fd(), &cg_name);
             RunnerError::gpu_unavailable(format!(
                 "fstat dedicated Qwen cgroup {}: {e}",
                 dir.display()
@@ -262,29 +490,39 @@ impl ChildCgroup {
         let identity = (st.st_dev, st.st_ino);
 
         let setup: RunnerResult<()> = (|| {
-            fs::write(dir.join("memory.high"), format!("{memory_bytes}\n")).map_err(|e| {
+            write_at_all(
+                dirfd.as_raw_fd(),
+                "memory.high",
+                format!("{memory_bytes}\n").as_bytes(),
+            )
+            .map_err(|e| {
                 RunnerError::gpu_unavailable(format!("write memory.high in {}: {e}", dir.display()))
             })?;
-            fs::write(dir.join("memory.max"), format!("{memory_bytes}\n")).map_err(|e| {
+            write_at_all(
+                dirfd.as_raw_fd(),
+                "memory.max",
+                format!("{memory_bytes}\n").as_bytes(),
+            )
+            .map_err(|e| {
                 RunnerError::gpu_unavailable(format!("write memory.max in {}: {e}", dir.display()))
             })?;
-            fs::write(dir.join("memory.swap.max"), "0\n").map_err(|e| {
+            write_at_all(dirfd.as_raw_fd(), "memory.swap.max", b"0\n").map_err(|e| {
                 RunnerError::gpu_unavailable(format!(
                     "write memory.swap.max in {}: {e}",
                     dir.display()
                 ))
             })?;
-            fs::write(dir.join("memory.oom.group"), "1\n").map_err(|e| {
+            write_at_all(dirfd.as_raw_fd(), "memory.oom.group", b"1\n").map_err(|e| {
                 RunnerError::gpu_unavailable(format!(
                     "write memory.oom.group in {}: {e}",
                     dir.display()
                 ))
             })?;
-            verify_qwen_cgroup_limits(&dir, memory_bytes)?;
+            verify_qwen_cgroup_limits_fd(dirfd.as_raw_fd(), &dir, memory_bytes)?;
             Ok(())
         })();
         if let Err(err) = setup {
-            let _ = fs::remove_dir(&dir);
+            let _ = unlinkat_dir(parent_dirfd.as_raw_fd(), &cg_name);
             return Err(err);
         }
 
@@ -294,12 +532,13 @@ impl ChildCgroup {
             libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
         .map_err(|e| {
-            let _ = fs::remove_dir(&dir);
+            let _ = unlinkat_dir(parent_dirfd.as_raw_fd(), &cg_name);
             RunnerError::gpu_unavailable(format!("open cgroup.procs in {}: {e}", dir.display()))
         })?;
         Ok(Self {
             name: cg_name,
             dir,
+            parent_dirfd,
             dirfd,
             identity,
             procs_fd,
@@ -308,6 +547,10 @@ impl ChildCgroup {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn identity(&self) -> (u64, u64) {
+        self.identity
     }
 
     /// True ONLY while our pinned `dirfd` still refers to the original live
@@ -397,13 +640,20 @@ impl ChildCgroup {
         procs_empty && events_empty
     }
 
+    /// Serialize removal against concurrent cgroup replacement via `flock(parent_dirfd)`
+    /// and unlink strictly via `unlinkat(parent_dirfd, name, AT_REMOVEDIR)` only after
+    /// verifying BOTH the pinned `dirfd` and `fstatat(parent_dirfd, name)` match
+    /// `self.identity`. If identity is lost, leave the directory untouched.
     fn remove_if_empty(&self) {
+        let Ok(_parent_lock) = FdFlockGuard::lock_exclusive(self.parent_dirfd.as_raw_fd()) else {
+            return;
+        };
         if !self.is_same_live_cgroup() {
             return;
         }
-        if let Ok(meta) = fs::symlink_metadata(&self.dir) {
-            if (meta.dev(), meta.ino()) == self.identity {
-                let _ = fs::remove_dir(&self.dir);
+        if let Ok(st) = fstatat_nofollow(self.parent_dirfd.as_raw_fd(), &self.name) {
+            if (st.st_dev, st.st_ino) == self.identity {
+                let _ = unlinkat_dir(self.parent_dirfd.as_raw_fd(), &self.name);
             }
         }
     }
@@ -426,11 +676,13 @@ pub fn cgroup_is_empty(dir: &Path) -> bool {
     procs_empty && events_empty
 }
 
-fn is_drained(pid: u32, cg: Option<&ChildCgroup>) -> bool {
-    let cg_ok = cg.is_none_or(ChildCgroup::is_empty);
-    cg_ok && group_gone(pid)
-}
-
+/// Terminate and drain a Qwen child and all of its descendants safely:
+/// - For cgroup-contained jobs (`cg.is_some()`), NEVER signal or poll a numeric
+///   process group (`-pid`); strictly use the pinned `ChildCgroup` dirfd/inode.
+/// - For uncontained fallback jobs (`cg.is_none()`), keep the child leader
+///   UNREAPED (`waitid(..., WNOWAIT)`) across all process-group signaling so the
+///   kernel keeps PGID `pid` reserved, verify no other member remains in `pid`'s
+///   process group, and NEVER signal `-pid` after reaping the leader.
 async fn terminate_and_drain(
     child: &mut tokio::process::Child,
     pid: u32,
@@ -440,15 +692,54 @@ async fn terminate_and_drain(
 ) -> RunnerResult<()> {
     if let Some(c) = cg {
         c.signal_all(libc::SIGTERM);
-    }
-    signal_group(pid, libc::SIGTERM);
-
-    let term_deadline = Instant::now() + grace;
-    loop {
-        if let Ok(Some(_)) = child.try_wait() {
-            if is_drained(pid, cg) {
+        let mut reaped = false;
+        let term_deadline = Instant::now() + grace;
+        loop {
+            if !reaped && matches!(child.try_wait(), Ok(Some(_))) {
+                reaped = true;
+            }
+            if reaped && c.is_empty() {
+                c.remove_if_empty();
                 return Ok(());
             }
+            if Instant::now() >= term_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        c.kill_all();
+        if !reaped && matches!(timeout(kill_wait, child.wait()).await, Ok(Ok(_))) {
+            reaped = true;
+        }
+
+        let kill_deadline = Instant::now() + kill_wait;
+        while !(reaped && c.is_empty()) && Instant::now() < kill_deadline {
+            c.kill_all();
+            if !reaped && matches!(child.try_wait(), Ok(Some(_))) {
+                reaped = true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        if reaped && c.is_empty() {
+            c.remove_if_empty();
+            return Ok(());
+        }
+        return Err(RunnerError::internal(
+            "Qwen child cgroup did not drain before deadline",
+        ));
+    }
+
+    // Uncontained fallback (`cg.is_none()`): NEVER signal `-pid` after reaping
+    // the leader. Poll with `WNOWAIT` so the zombie leader reserves PGID `pid`
+    // until all descendants have exited.
+    signal_group_unreaped(pid, libc::SIGTERM);
+    let term_deadline = Instant::now() + grace;
+    loop {
+        if child_exited_without_reap(pid) && !other_members_in_pgid(pid) {
+            let _ = child.try_wait();
+            return Ok(());
         }
         if Instant::now() >= term_deadline {
             break;
@@ -456,30 +747,32 @@ async fn terminate_and_drain(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    if let Some(c) = cg {
-        c.kill_all();
-    }
-    signal_group(pid, libc::SIGKILL);
-    let _ = timeout(kill_wait, child.wait()).await;
-
+    signal_group_unreaped(pid, libc::SIGKILL);
     let kill_deadline = Instant::now() + kill_wait;
-    while !is_drained(pid, cg) && Instant::now() < kill_deadline {
-        if let Some(c) = cg {
-            c.kill_all();
+    let mut drained_before_reap = false;
+    while Instant::now() < kill_deadline {
+        if child_exited_without_reap(pid) && !other_members_in_pgid(pid) {
+            drained_before_reap = true;
+            break;
         }
-        signal_group(pid, libc::SIGKILL);
-        let _ = child.try_wait();
+        signal_group_unreaped(pid, libc::SIGKILL);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    if !drained_before_reap && child_exited_without_reap(pid) && !other_members_in_pgid(pid) {
+        drained_before_reap = true;
+    }
 
-    if is_drained(pid, cg) {
-        if let Some(c) = cg {
-            c.remove_if_empty();
-        }
+    // Reap leader ONLY AFTER finishing all process-group signaling.
+    let reaped = if child_exited_without_reap(pid) {
+        matches!(timeout(kill_wait, child.wait()).await, Ok(Ok(_)))
+    } else {
+        matches!(child.try_wait(), Ok(Some(_)))
+    };
+    if drained_before_reap && reaped {
         Ok(())
     } else {
         Err(RunnerError::internal(
-            "Qwen child cgroup/process group did not drain before deadline",
+            "Qwen child process group did not drain before deadline",
         ))
     }
 }
@@ -569,7 +862,11 @@ fn record_qwen_quarantine(
             comfy_unit: None,
             comfy_invocation_id: None,
             qwen_cgroup: cg.map(|c| c.dir.clone()),
-            qwen_pgid: (pid != 0).then_some(pid),
+            qwen_pgid: if cg.is_some() {
+                None
+            } else {
+                (pid != 0).then_some(pid)
+            },
             qwen_vram_baseline_mib: vram_baseline_mib,
             qwen_stage_dir: Some(stage_dir),
             lease_uncertain: false,
@@ -797,11 +1094,15 @@ pub async fn run_qwen_streaming(
         None
     };
 
-    // Register the exact runner-created child cgroup with the lease owner
-    // BEFORE spawning the Qwen child so preemption and watchdog teardown can
-    // force-drain this exact cgroup immediately if the child hangs.
+    // Register the exact runner-created child cgroup AND its kernel `(dev, ino)`
+    // identity with the lease owner BEFORE spawning the Qwen child so preemption
+    // and watchdog teardown can force-drain this exact cgroup inode immediately
+    // and can never authorize signaling a same-basename replacement.
     if let Some(cg) = &child_cg {
-        if let Err(err) = lease.recheck_with_cgroup(Some(cg.name())).await {
+        if let Err(err) = lease
+            .recheck_with_cgroup(Some(cg.name()), Some(cg.identity()))
+            .await
+        {
             cg.remove_if_empty();
             return Err(err);
         }
@@ -915,13 +1216,35 @@ pub async fn run_qwen_streaming(
     }
 
     // Independent out-of-cgroup watchdog polling memory, PSI, lease, and cancelPath.
+    // For uncontained fallback jobs (`child_cg.is_none()`), poll exit with
+    // `WNOWAIT` so the zombie leader keeps PGID `pid` kernel-reserved until all
+    // surviving process-group members are drained BEFORE reaping.
     let mut last_lease_recheck = Instant::now();
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| RunnerError::internal(format!("poll qwen child: {e}")))?
-        {
-            break status;
+    let (status, post_exit_drained) = loop {
+        if let Some(c) = &child_cg {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| RunnerError::internal(format!("poll qwen child: {e}")))?
+            {
+                let drain_deadline = Instant::now() + qwen.kill_drain_wait;
+                while !c.is_empty() && Instant::now() < drain_deadline {
+                    c.kill_all();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                break (status, c.is_empty());
+            }
+        } else if child_exited_without_reap(pid) {
+            let drain_deadline = Instant::now() + qwen.kill_drain_wait;
+            while other_members_in_pgid(pid) && Instant::now() < drain_deadline {
+                signal_group_unreaped(pid, libc::SIGKILL);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let drained_before_reap = !other_members_in_pgid(pid);
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| RunnerError::internal(format!("reap qwen child: {e}")))?;
+            break (status, drained_before_reap);
         }
         if cancel_path.exists() || *shutdown.borrow() {
             if let Err(err) = terminate_and_drain(
@@ -1011,7 +1334,10 @@ pub async fn run_qwen_streaming(
         }
         if last_lease_recheck.elapsed() >= Duration::from_secs(1) {
             if let Err(err) = lease
-                .recheck_with_cgroup(child_cg.as_ref().map(ChildCgroup::name))
+                .recheck_with_cgroup(
+                    child_cg.as_ref().map(ChildCgroup::name),
+                    child_cg.as_ref().map(ChildCgroup::identity),
+                )
                 .await
             {
                 if let Err(drain_err) = terminate_and_drain(
@@ -1061,17 +1387,10 @@ pub async fn run_qwen_streaming(
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
 
-    // After main child exit, prove the entire cgroup/process group drained cleanly
-    // and GPU VRAM returned to baseline before releasing locks or accepting output.
-    let drain_deadline = Instant::now() + qwen.kill_drain_wait;
-    while !is_drained(pid, child_cg.as_ref()) && Instant::now() < drain_deadline {
-        if let Some(c) = &child_cg {
-            c.kill_all();
-        }
-        signal_group(pid, libc::SIGKILL);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    if !is_drained(pid, child_cg.as_ref()) {
+    // Post-exit drain was already verified either strictly via the pinned
+    // `ChildCgroup` (contained jobs) or before reaping the zombie leader
+    // (uncontained fallback), never signaling a numeric PGID after reaping.
+    if !post_exit_drained {
         let msg = "surviving Qwen descendant remained alive past drain deadline; host quarantined"
             .to_owned();
         record_qwen_quarantine(
@@ -1203,7 +1522,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn child_cgroup_cleanup_stays_pinned_to_original_inode_and_never_signals_replacement() {
+    fn child_cgroup_cleanup_stays_pinned_to_original_inode_and_serializes_removal() {
         let base =
             std::env::temp_dir().join(format!("infernix-qwen-cg-pin-{}", Uuid::new_v4().simple()));
         let orig_dir = base.join("qwen-job52-aabbccdd");
@@ -1212,6 +1531,12 @@ mod tests {
         fs::write(orig_dir.join("cgroup.procs"), "12345\n").unwrap();
         fs::write(orig_dir.join("cgroup.kill"), "").unwrap();
 
+        let parent_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&base)
+            .unwrap();
+        let parent_dirfd: OwnedFd = parent_file.into();
         let dir_file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -1228,11 +1553,13 @@ mod tests {
         let cg = ChildCgroup {
             name: "qwen-job52-aabbccdd".to_owned(),
             dir: orig_dir.clone(),
+            parent_dirfd,
             dirfd,
             identity: (st.st_dev, st.st_ino),
             procs_fd,
         };
 
+        assert_eq!(cg.identity(), (st.st_dev, st.st_ino));
         assert!(cg.is_same_live_cgroup());
         assert!(!cg.is_empty());
         cg.kill_all();
@@ -1242,9 +1569,51 @@ mod tests {
             "kill_all must write to the original pinned cgroup.kill"
         );
 
-        // Remove original cgroup and create a replacement directory under the EXACT SAME basename.
-        fs::remove_dir_all(&orig_dir).unwrap();
-        fs::create_dir(&orig_dir).unwrap();
+        // Hold an independent exclusive flock on the parent directory while
+        // `remove_if_empty` starts on a second thread; replace the directory
+        // under the same basename before releasing the lock and prove the
+        // serialized `remove_if_empty` leaves the replacement untouched!
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&base)
+            .unwrap();
+        let lock_guard = FdFlockGuard::lock_exclusive(lock_file.as_raw_fd()).unwrap();
+
+        let orig_dir_clone = orig_dir.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let remover = std::thread::spawn(move || {
+            let _ = started_tx.send(());
+            cg.remove_if_empty();
+            cg
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // While holding the parent flock, replace the original directory with
+        // a brand-new empty directory under the exact same basename.
+        fs::remove_dir_all(&orig_dir_clone).unwrap();
+        fs::create_dir(&orig_dir_clone).unwrap();
+        let replacement_meta = fs::symlink_metadata(&orig_dir_clone).unwrap();
+        assert_ne!(
+            (replacement_meta.dev(), replacement_meta.ino()),
+            (st.st_dev, st.st_ino)
+        );
+        drop(lock_guard);
+
+        let cg = remover.join().unwrap();
+        assert!(
+            orig_dir.exists(),
+            "serialized remove_if_empty MUST leave empty replacement directory untouched"
+        );
+        let after_meta = fs::symlink_metadata(&orig_dir).unwrap();
+        assert_eq!(
+            (after_meta.dev(), after_meta.ino()),
+            (replacement_meta.dev(), replacement_meta.ino())
+        );
+
+        // Populate replacement and verify signal_all/kill_all leave it untouched
+        // while read-only is_empty fails closed.
         fs::write(orig_dir.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
         fs::write(orig_dir.join("cgroup.procs"), "99999\n").unwrap();
         fs::write(orig_dir.join("cgroup.kill"), "untouched").unwrap();
@@ -1276,5 +1645,143 @@ mod tests {
         assert!(cg.is_empty());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn contained_drain_never_signals_numeric_pgid_and_uncontained_drains_before_reap() {
+        // 1. Contained `terminate_and_drain`: spawn an unrelated innocent process
+        //    group and pass its PGID as `pid` alongside a pinned `ChildCgroup`.
+        //    Contained cleanup MUST NEVER call `kill(-pid, ...)`!
+        let mut innocent = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let innocent_pid = innocent.id().unwrap();
+
+        let base =
+            std::env::temp_dir().join(format!("infernix-qwen-pgid-{}", Uuid::new_v4().simple()));
+        let cg_dir = base.join("qwen-job53-11223344");
+        fs::create_dir_all(&cg_dir).unwrap();
+        fs::write(cg_dir.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        fs::write(cg_dir.join("cgroup.procs"), "").unwrap();
+        fs::write(cg_dir.join("cgroup.kill"), "").unwrap();
+
+        let parent_dirfd: OwnedFd = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&base)
+            .unwrap()
+            .into();
+        let dirfd: OwnedFd = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&cg_dir)
+            .unwrap()
+            .into();
+        let st = fstat_fd(dirfd.as_raw_fd()).unwrap();
+        let procs_fd = openat_fd(
+            dirfd.as_raw_fd(),
+            "cgroup.procs",
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+        .unwrap();
+        let cg = ChildCgroup {
+            name: "qwen-job53-11223344".to_owned(),
+            dir: cg_dir.clone(),
+            parent_dirfd,
+            dirfd,
+            identity: (st.st_dev, st.st_ino),
+            procs_fd,
+        };
+
+        let mut short_child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 0.1")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        // Force both grace SIGTERM and SIGKILL escalation on `terminate_and_drain`
+        // by passing `grace = 20ms` while `short_child` sleeps 100ms, AND pass
+        // `innocent_pid` as the numeric `pid` parameter!
+        terminate_and_drain(
+            &mut short_child,
+            innocent_pid,
+            Some(&cg),
+            Duration::from_millis(20),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("contained terminate_and_drain succeeds");
+
+        assert!(
+            innocent.try_wait().unwrap().is_none(),
+            "contained terminate_and_drain MUST NEVER signal numeric -pid (innocent process group was killed!)"
+        );
+        let _ = innocent.kill().await;
+        let _ = innocent.wait().await;
+        let _ = fs::remove_dir_all(&base);
+
+        // 2. Uncontained post-exit drain: spawn a leader that forks an orphan
+        //    grandchild in its own process group and exits immediately. Prove
+        //    `child_exited_without_reap` detects exit while keeping the zombie
+        //    unreaped so `signal_group_unreaped` kills the grandchild BEFORE
+        //    reaping, leaving zero surviving members!
+        let mut uncontained = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 </dev/null >/dev/null 2>&1 & exit 0")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let u_pid = uncontained.id().unwrap();
+        let wait_deadline = Instant::now() + Duration::from_secs(3);
+        while !child_exited_without_reap(u_pid) && Instant::now() < wait_deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            child_exited_without_reap(u_pid),
+            "uncontained leader should exit while remaining unreaped"
+        );
+        assert!(
+            other_members_in_pgid(u_pid),
+            "orphan grandchild should still be alive in unreaped PGID before drain"
+        );
+        let drain_deadline = Instant::now() + Duration::from_secs(3);
+        while other_members_in_pgid(u_pid) && Instant::now() < drain_deadline {
+            signal_group_unreaped(u_pid, libc::SIGKILL);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !other_members_in_pgid(u_pid),
+            "grandchild must be drained before reaping leader"
+        );
+        let status = uncontained.wait().await.unwrap();
+        assert!(status.success());
+
+        // 3. Uncontained `terminate_and_drain` with a surviving grandchild.
+        let mut cancel_child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30 </dev/null >/dev/null 2>&1 & sleep 30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let c_pid = cancel_child.id().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        terminate_and_drain(
+            &mut cancel_child,
+            c_pid,
+            None,
+            Duration::from_millis(50),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("uncontained terminate_and_drain cleanly kills leader and grandchild before reap");
+        assert!(group_gone(c_pid));
     }
 }

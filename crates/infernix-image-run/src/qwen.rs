@@ -5,9 +5,13 @@
 //! verification, and verified PNG publish.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{Read, Write},
-    os::unix::io::{AsRawFd, OwnedFd},
+    ffi::CString,
+    fs::{self, File, OpenOptions},
+    io::{ErrorKind, Read, Write},
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    },
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
@@ -130,9 +134,78 @@ fn discover_cgroup_parent() -> Option<PathBuf> {
     self_cg.parent().map(Path::to_path_buf)
 }
 
+fn fstat_fd(fd: RawFd) -> std::io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a valid aligned `libc::stat` out-parameter.
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    if rc == 0 {
+        Ok(st)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn openat_fd(dirfd: RawFd, rel: &str, flags: libc::c_int) -> std::io::Result<OwnedFd> {
+    let c_rel = CString::new(rel)
+        .map_err(|_| std::io::Error::new(ErrorKind::InvalidInput, "NUL byte in cgroup entry"))?;
+    // SAFETY: `c_rel` is NUL-terminated and `openat` validates `dirfd`.
+    let raw = unsafe { libc::openat(dirfd, c_rel.as_ptr(), flags, 0) };
+    if raw < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: `raw` is a fresh file descriptor owned exclusively by this caller.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+}
+
+fn read_at_to_string(dirfd: RawFd, rel: &str) -> std::io::Result<String> {
+    let fd = openat_fd(
+        dirfd,
+        rel,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    )?;
+    let mut file = File::from(fd);
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)?;
+    Ok(buf)
+}
+
+fn pid_belongs_to_cgroup_identity(pid: u32, expected_identity: (u64, u64)) -> bool {
+    let Ok(content) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
+        return false;
+    };
+    let Some(rel) = content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    let trimmed = rel.trim_start_matches('/');
+    let mut cur = PathBuf::from("/sys/fs/cgroup");
+    if !trimmed.is_empty() {
+        cur.push(trimmed);
+    }
+    let mut path_opt = Some(cur.as_path());
+    while let Some(p) = path_opt {
+        if let Ok(meta) = fs::symlink_metadata(p) {
+            if (meta.dev(), meta.ino()) == expected_identity {
+                return true;
+            }
+        }
+        if p == Path::new("/sys/fs/cgroup") {
+            break;
+        }
+        path_opt = p.parent();
+    }
+    false
+}
+
 struct ChildCgroup {
     name: String,
     dir: PathBuf,
+    dirfd: OwnedFd,
+    identity: (u64, u64),
     procs_fd: OwnedFd,
 }
 
@@ -167,6 +240,27 @@ impl ChildCgroup {
             ))
         })?;
 
+        let dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&dir)
+            .map_err(|e| {
+                let _ = fs::remove_dir(&dir);
+                RunnerError::gpu_unavailable(format!(
+                    "pin dedicated Qwen cgroup dirfd {}: {e}",
+                    dir.display()
+                ))
+            })?;
+        let dirfd: OwnedFd = dir_file.into();
+        let st = fstat_fd(dirfd.as_raw_fd()).map_err(|e| {
+            let _ = fs::remove_dir(&dir);
+            RunnerError::gpu_unavailable(format!(
+                "fstat dedicated Qwen cgroup {}: {e}",
+                dir.display()
+            ))
+        })?;
+        let identity = (st.st_dev, st.st_ino);
+
         let setup: RunnerResult<()> = (|| {
             fs::write(dir.join("memory.high"), format!("{memory_bytes}\n")).map_err(|e| {
                 RunnerError::gpu_unavailable(format!("write memory.high in {}: {e}", dir.display()))
@@ -194,17 +288,21 @@ impl ChildCgroup {
             return Err(err);
         }
 
-        let procs_file = OpenOptions::new()
-            .write(true)
-            .open(dir.join("cgroup.procs"))
-            .map_err(|e| {
-                let _ = fs::remove_dir(&dir);
-                RunnerError::gpu_unavailable(format!("open cgroup.procs in {}: {e}", dir.display()))
-            })?;
+        let procs_fd = openat_fd(
+            dirfd.as_raw_fd(),
+            "cgroup.procs",
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+        .map_err(|e| {
+            let _ = fs::remove_dir(&dir);
+            RunnerError::gpu_unavailable(format!("open cgroup.procs in {}: {e}", dir.display()))
+        })?;
         Ok(Self {
             name: cg_name,
             dir,
-            procs_fd: procs_file.into(),
+            dirfd,
+            identity,
+            procs_fd,
         })
     }
 
@@ -212,32 +310,102 @@ impl ChildCgroup {
         &self.name
     }
 
+    /// True ONLY while our pinned `dirfd` still refers to the original live
+    /// cgroup inode (`st_nlink > 0` and `(st_dev, st_ino) == self.identity`).
+    fn is_same_live_cgroup(&self) -> bool {
+        matches!(
+            fstat_fd(self.dirfd.as_raw_fd()),
+            Ok(st) if st.st_nlink > 0 && (st.st_dev, st.st_ino) == self.identity
+        )
+    }
+
+    /// Signal processes inside THIS exact pinned cgroup using `openat(dirfd, "cgroup.procs")`,
+    /// `pidfd_open`, and kernel `(st_dev, st_ino)` verification. If the original
+    /// cgroup disappeared (or was replaced under the same basename), do nothing.
     fn signal_all(&self, sig: i32) {
-        if let Ok(raw) = fs::read_to_string(self.dir.join("cgroup.procs")) {
-            for line in raw.lines() {
-                if let Ok(p) = line.trim().parse::<i32>() {
-                    if p > 1 {
-                        // SAFETY: PID read directly from this job's dedicated child cgroup.
-                        unsafe {
-                            libc::kill(p, sig);
-                        }
-                    }
-                }
+        if !self.is_same_live_cgroup() {
+            return;
+        }
+        let Ok(raw) = read_at_to_string(self.dirfd.as_raw_fd(), "cgroup.procs") else {
+            return;
+        };
+        for line in raw.lines() {
+            let Ok(p) = line.trim().parse::<u32>() else {
+                continue;
+            };
+            if p <= 1 {
+                continue;
             }
+            // SAFETY: `pidfd_open` validates `p` and returns a task-pinned fd.
+            let raw_fd =
+                unsafe { libc::syscall(libc::SYS_pidfd_open, p as libc::pid_t, 0 as libc::c_uint) };
+            if raw_fd < 0 {
+                continue;
+            }
+            // SAFETY: `raw_fd` is a fresh pidfd owned exclusively here.
+            let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as RawFd) };
+            if !pid_belongs_to_cgroup_identity(p, self.identity) {
+                continue;
+            }
+            // SAFETY: `pidfd` is pinned to the verified process inside `self.identity`.
+            let _ = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    sig,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0 as libc::c_uint,
+                )
+            };
         }
     }
 
+    /// Force-terminate strictly via `openat(dirfd, "cgroup.kill", O_WRONLY | O_NOFOLLOW)`.
+    /// Never reopens by pathname and never falls back to raw PID signals; if
+    /// the original cgroup identity is gone, leaves any replacement untouched.
     fn kill_all(&self) {
-        let _ = fs::write(self.dir.join("cgroup.kill"), "1\n");
-        self.signal_all(libc::SIGKILL);
+        if !self.is_same_live_cgroup() {
+            return;
+        }
+        if let Ok(fd) = openat_fd(
+            self.dirfd.as_raw_fd(),
+            "cgroup.kill",
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        ) {
+            let mut file = File::from(fd);
+            let _ = file.write_all(b"1\n");
+        }
     }
 
+    /// Inspect pinned cgroup emptiness strictly through `dirfd` while alive;
+    /// if the original cgroup identity is gone, fall back to read-only
+    /// verification of the path (never signaling a replacement).
     fn is_empty(&self) -> bool {
-        cgroup_is_empty(&self.dir)
+        if !self.is_same_live_cgroup() {
+            return cgroup_is_empty(&self.dir);
+        }
+        let procs_empty = read_at_to_string(self.dirfd.as_raw_fd(), "cgroup.procs")
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(false);
+        let events_empty = match read_at_to_string(self.dirfd.as_raw_fd(), "cgroup.events") {
+            Ok(text) => text
+                .lines()
+                .find_map(|l| l.strip_prefix("populated "))
+                .is_some_and(|v| v.trim() == "0"),
+            Err(_) => procs_empty,
+        };
+        procs_empty && events_empty
     }
 
     fn remove_if_empty(&self) {
-        let _ = fs::remove_dir(&self.dir);
+        if !self.is_same_live_cgroup() {
+            return;
+        }
+        if let Ok(meta) = fs::symlink_metadata(&self.dir) {
+            if (meta.dev(), meta.ino()) == self.identity {
+                let _ = fs::remove_dir(&self.dir);
+            }
+        }
     }
 }
 
@@ -1028,4 +1196,85 @@ pub async fn run_qwen_streaming(
         png,
         wall_seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_cgroup_cleanup_stays_pinned_to_original_inode_and_never_signals_replacement() {
+        let base =
+            std::env::temp_dir().join(format!("infernix-qwen-cg-pin-{}", Uuid::new_v4().simple()));
+        let orig_dir = base.join("qwen-job52-aabbccdd");
+        fs::create_dir_all(&orig_dir).unwrap();
+        fs::write(orig_dir.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        fs::write(orig_dir.join("cgroup.procs"), "12345\n").unwrap();
+        fs::write(orig_dir.join("cgroup.kill"), "").unwrap();
+
+        let dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&orig_dir)
+            .unwrap();
+        let dirfd: OwnedFd = dir_file.into();
+        let st = fstat_fd(dirfd.as_raw_fd()).unwrap();
+        let procs_fd = openat_fd(
+            dirfd.as_raw_fd(),
+            "cgroup.procs",
+            libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+        .unwrap();
+        let cg = ChildCgroup {
+            name: "qwen-job52-aabbccdd".to_owned(),
+            dir: orig_dir.clone(),
+            dirfd,
+            identity: (st.st_dev, st.st_ino),
+            procs_fd,
+        };
+
+        assert!(cg.is_same_live_cgroup());
+        assert!(!cg.is_empty());
+        cg.kill_all();
+        assert_eq!(
+            fs::read_to_string(orig_dir.join("cgroup.kill")).unwrap(),
+            "1\n",
+            "kill_all must write to the original pinned cgroup.kill"
+        );
+
+        // Remove original cgroup and create a replacement directory under the EXACT SAME basename.
+        fs::remove_dir_all(&orig_dir).unwrap();
+        fs::create_dir(&orig_dir).unwrap();
+        fs::write(orig_dir.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        fs::write(orig_dir.join("cgroup.procs"), "99999\n").unwrap();
+        fs::write(orig_dir.join("cgroup.kill"), "untouched").unwrap();
+
+        assert!(
+            !cg.is_same_live_cgroup(),
+            "pinned dirfd must detect unlinked original cgroup inode"
+        );
+        assert!(
+            !cg.is_empty(),
+            "when identity is lost, is_empty must still verify read-only and fail closed if replacement is populated"
+        );
+        cg.signal_all(libc::SIGTERM);
+        cg.kill_all();
+        cg.remove_if_empty();
+        assert_eq!(
+            fs::read_to_string(orig_dir.join("cgroup.kill")).unwrap(),
+            "untouched",
+            "replacement cgroup.kill MUST NOT be written"
+        );
+        assert!(
+            orig_dir.exists(),
+            "replacement cgroup directory MUST NOT be removed"
+        );
+
+        // Once the replacement is empty, read-only verification reports empty.
+        fs::write(orig_dir.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        fs::write(orig_dir.join("cgroup.procs"), "").unwrap();
+        assert!(cg.is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

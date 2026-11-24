@@ -4558,3 +4558,245 @@ async fn codex_p2_pr39_comfy_unloads_before_vram_check_and_preserves_invocation_
     let _ = cstop_tx.send(true);
     let _ = cserver.await;
 }
+
+#[tokio::test]
+async fn lease_hook_forwards_attempt_token_and_exact_cgroup_on_recheck() {
+    use infernix_image_run::guard::{ActiveLease, LeaseContext};
+
+    let dir = temp_dir("lease-hook-cgroup");
+    let log_file = dir.join("hook.log");
+    let hook_script = dir.join("lease-hook.sh");
+    fs::write(
+        &hook_script,
+        format!(
+            "#!/bin/sh\n\
+             printf 'ARGS:%s|TOKEN:%s\\n' \"$*\" \"${{CANIX_LEASE_SLOT_TOKEN-}}\" >> {}\n\
+             if [ \"$1\" = \"acquire\" ]; then\n\
+               printf '{{\"ok\":true,\"slotAttemptId\":77,\"slotToken\":\"0123456789abcdef0123456789abcdef\"}}\\n'\n\
+             fi\n\
+             exit 0\n",
+            log_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cfg = GuardConfig {
+        lease_required: true,
+        lease_hook: vec![hook_script.to_string_lossy().into_owned()],
+        lease_timeout: Duration::from_secs(5),
+        ..GuardConfig::default()
+    };
+    let quarantine = dir.join("quarantine.json");
+    let mut lease = ActiveLease::acquire(
+        &cfg,
+        true,
+        true,
+        LeaseContext {
+            job_id: "job.50".to_owned(),
+            profile_id: "vagrant.qwen-image-edit-2511-lightning-4".to_owned(),
+            lease_id: Some("batch-50".to_owned()),
+            lease_generation: Some(9),
+        },
+        &quarantine,
+    )
+    .await
+    .expect("acquire succeeds");
+
+    // 1. Plain recheck before cgroup creation forwards attempt-id & private env token, no --cgroup.
+    lease.recheck().await.expect("plain recheck succeeds");
+
+    // 2. Cgroup-scoped recheck forwards exact --cgroup basename + --attempt-id + env token (never token in argv).
+    lease
+        .recheck_with_cgroup(Some("qwen-job50-a1b2c3d4"))
+        .await
+        .expect("cgroup recheck succeeds");
+
+    // 3. Release clears env token and omits --cgroup / --attempt-id.
+    lease.release(&quarantine).await.expect("release succeeds");
+
+    let lines: Vec<String> = fs::read_to_string(&log_file)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "expected acquire, plain recheck, cgroup recheck, release: {lines:?}"
+    );
+
+    assert!(lines[0].starts_with("ARGS:acquire --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9|TOKEN:"));
+    assert!(
+        lines[0].ends_with("|TOKEN:"),
+        "acquire must not receive a stale slot token: {}",
+        lines[0]
+    );
+
+    assert_eq!(
+        lines[1],
+        "ARGS:recheck --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9 --attempt-id 77|TOKEN:0123456789abcdef0123456789abcdef"
+    );
+    assert!(
+        !lines[1].contains("--cgroup"),
+        "plain recheck must not pass --cgroup: {}",
+        lines[1]
+    );
+
+    assert_eq!(
+        lines[2],
+        "ARGS:recheck --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9 --cgroup qwen-job50-a1b2c3d4 --attempt-id 77|TOKEN:0123456789abcdef0123456789abcdef"
+    );
+    assert!(
+        !lines[2]
+            .split("|TOKEN:")
+            .next()
+            .unwrap()
+            .contains("0123456789abcdef"),
+        "slot token must be passed via private env var, never argv: {}",
+        lines[2]
+    );
+
+    assert_eq!(
+        lines[3],
+        "ARGS:release --job-id job.50 --profile vagrant.qwen-image-edit-2511-lightning-4 --lease-id batch-50 --generation 9|TOKEN:"
+    );
+
+    // 4. End-to-end Qwen execution invokes acquire -> pre-spawn recheck -> in-loop recheck (>=1s) -> release
+    //    forwarding attempt-id & env token (and exact --cgroup when delegated cgroup parent is writable).
+    let (meminfo, psi) = write_host_fixtures(&dir, 50, 0.1);
+    let (reg_dir, _, _, qwen_digest) = write_registry(&dir, false, None);
+    let src_png = encode_test_png(1024, 1024, &[]);
+    let src_path = dir.join("src.png");
+    fs::write(&src_path, &src_png).unwrap();
+    let gpu_lock = dir.join("gpu.lock");
+    fs::write(&gpu_lock, b"").unwrap();
+    let out_png_path = dir.join("fixture-out.png");
+    fs::write(&out_png_path, encode_test_png(1024, 1024, &[])).unwrap();
+    let fake_adapter = dir.join("fake_adapter.py");
+    fs::write(
+        &fake_adapter,
+        format!(
+            "import hashlib, json, sys, time\n\
+             from pathlib import Path\n\
+             args = sys.argv[1:]\n\
+             staging = Path(args[args.index('--staging') + 1])\n\
+             job = json.loads(sys.stdin.read())\n\
+             time.sleep(1.3)\n\
+             data = Path({out_fixture:?}).read_bytes()\n\
+             (staging / job['output']).write_bytes(data)\n\
+             sha = hashlib.sha256(data).hexdigest()\n\
+             print(json.dumps({{\n\
+               'state': 'rendered',\n\
+               'recipe': {{\n\
+                 'id': 'qwen-image-edit-2511-lightning-4-bf16-streaming',\n\
+                 'steps': job['steps'],\n\
+                 'size': job['size'],\n\
+                 'seed': job['seed'],\n\
+                 'lora': job['lora'],\n\
+               }},\n\
+               'models': {{}},\n\
+               'output': {{'path': job['output'], 'sha256': sha}},\n\
+             }}))\n",
+            out_fixture = out_png_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let e2e_log = dir.join("e2e-hook.log");
+    let e2e_hook = dir.join("e2e-hook.sh");
+    fs::write(
+        &e2e_hook,
+        format!(
+            "#!/bin/sh\n\
+             printf 'ARGS:%s|TOKEN:%s\\n' \"$*\" \"${{CANIX_LEASE_SLOT_TOKEN-}}\" >> {}\n\
+             if [ \"$1\" = \"acquire\" ]; then\n\
+               printf '{{\"ok\":true,\"slotAttemptId\":88,\"slotToken\":\"fedcba9876543210fedcba9876543210\"}}\\n'\n\
+             fi\n\
+             exit 0\n",
+            e2e_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&e2e_hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let runner_cfg = RunnerConfig {
+        registry_dir: reg_dir,
+        runner_lock_path: dir.join("runner.lock"),
+        runner_lock_wait: Duration::from_secs(2),
+        guard: GuardConfig {
+            meminfo_path: meminfo,
+            memory_psi_path: psi,
+            vram_floor_mib: Some(12000),
+            vram_override_mib: Some(15900),
+            lease_required: true,
+            lease_hook: vec![e2e_hook.to_string_lossy().into_owned()],
+            lease_timeout: Duration::from_secs(5),
+            ..GuardConfig::default()
+        },
+        comfy: None,
+        qwen: Some(QwenConfig {
+            python: PathBuf::from("python3"),
+            adapter_script: fake_adapter,
+            backend: "cuda".to_owned(),
+            denoiser_dir: dir.clone(),
+            snapshot_dir: dir.clone(),
+            lightning_dir: dir.clone(),
+            gpu_lock_path: gpu_lock,
+            gpu_lock_wait: Duration::from_secs(1),
+            cancel_grace: Duration::from_millis(200),
+            kill_drain_wait: Duration::from_secs(1),
+            vram_release_wait: Duration::from_millis(200),
+            cgroup_parent: None,
+            require_cgroup_containment: false,
+            extra_env: vec![],
+        }),
+    };
+    let req = RunRequest {
+        schema_version: 1,
+        job_id: "qwen-e2e-50".to_owned(),
+        profile_id: "vagrant.qwen-image-edit-2511-lightning-4".to_owned(),
+        revision: "v1".to_owned(),
+        manifest_digest: qwen_digest,
+        inputs: vec![LocalInput {
+            path: src_path,
+            sha256: sha256_hex(&src_png),
+        }],
+        parameters: ImageParameters {
+            prompt: "brighten scene".to_owned(),
+            seed: 5050,
+            steps: Some(4),
+            denoise: None,
+        },
+        output_path: dir.join("e2e-out.png"),
+        cancel_path: dir.join("cancel"),
+        journal_dir: dir.join("j-e2e"),
+        lease_id: Some("batch-e2e".to_owned()),
+        lease_generation: Some(4),
+    };
+    let (_tx, rx) = watch::channel(false);
+    let receipt = execute_request(&runner_cfg, &req, rx)
+        .await
+        .expect("e2e qwen run with lease hook succeeds");
+    assert_eq!(receipt.state, "rendered");
+
+    let e2e_lines: Vec<String> = fs::read_to_string(&e2e_log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let recheck_lines: Vec<&String> = e2e_lines
+        .iter()
+        .filter(|l| l.starts_with("ARGS:recheck "))
+        .collect();
+    assert!(
+        recheck_lines.len() >= 2,
+        "expected both pre-spawn and in-loop recheck calls: {e2e_lines:?}"
+    );
+    for line in &recheck_lines {
+        assert!(
+            line.contains("--attempt-id 88|TOKEN:fedcba9876543210fedcba9876543210"),
+            "every Qwen recheck must forward slot attempt-id and private env token: {line}"
+        );
+    }
+}

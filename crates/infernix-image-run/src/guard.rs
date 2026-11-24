@@ -565,12 +565,16 @@ pub struct LeaseContext {
 }
 
 enum HookOutcome {
-    Ok,
+    Ok { stdout: Vec<u8> },
     Denied(i32),
     Signalled,
     Timeout,
     ExecError(String),
 }
+
+/// Environment variable used to pass the acquire-minted per-slot attempt token
+/// to `recheck` without exposing it in `/proc/<pid>/cmdline`.
+const LEASE_SLOT_TOKEN_ENV: &str = "CANIX_LEASE_SLOT_TOKEN";
 
 /// Local acquire/recheck/release lease hook.
 ///
@@ -582,6 +586,8 @@ pub struct ActiveLease {
     timeout: Duration,
     ctx: LeaseContext,
     acquired: bool,
+    slot_attempt_id: Option<u64>,
+    slot_token: Option<String>,
 }
 
 impl ActiveLease {
@@ -604,6 +610,8 @@ impl ActiveLease {
                 timeout: cfg.lease_timeout,
                 ctx,
                 acquired: false,
+                slot_attempt_id: None,
+                slot_token: None,
             });
         }
 
@@ -612,10 +620,20 @@ impl ActiveLease {
             timeout: cfg.lease_timeout,
             ctx,
             acquired: false,
+            slot_attempt_id: None,
+            slot_token: None,
         };
-        match lease.invoke("acquire").await {
-            HookOutcome::Ok => {
+        match lease.invoke("acquire", None).await {
+            HookOutcome::Ok { stdout } => {
                 lease.acquired = true;
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&stdout) {
+                    lease.slot_attempt_id = val.get("slotAttemptId").and_then(|v| v.as_u64());
+                    lease.slot_token = val
+                        .get("slotToken")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                }
                 Ok(lease)
             }
             HookOutcome::Denied(code) => Err(RunnerError::resource_busy(format!(
@@ -629,7 +647,7 @@ impl ActiveLease {
                 // restoring competing GPU tenants before prompt settlement would violate fencing.
                 let cause = if !allow_ambiguous_release {
                     "lease acquire terminated ambiguously (timeout/signal) while prior engine ownership remained unsettled"
-                } else if matches!(lease.invoke("release").await, HookOutcome::Ok) {
+                } else if matches!(lease.invoke("release", None).await, HookOutcome::Ok { .. }) {
                     return Err(RunnerError::resource_busy(
                         "lease acquire terminated ambiguously; cleanup release succeeded",
                     ));
@@ -666,11 +684,15 @@ impl ActiveLease {
     }
 
     pub async fn recheck(&self) -> RunnerResult<()> {
+        self.recheck_with_cgroup(None).await
+    }
+
+    pub async fn recheck_with_cgroup(&self, cgroup: Option<&str>) -> RunnerResult<()> {
         if !self.acquired {
             return Ok(());
         }
-        match self.invoke("recheck").await {
-            HookOutcome::Ok => Ok(()),
+        match self.invoke("recheck", cgroup).await {
+            HookOutcome::Ok { .. } => Ok(()),
             HookOutcome::Denied(code) => Err(RunnerError::cancelled(format!(
                 "lease revoked or stale (exit {code})"
             ))),
@@ -702,6 +724,8 @@ impl ActiveLease {
             timeout: cfg.lease_timeout,
             ctx: ctx.clone(),
             acquired: true,
+            slot_attempt_id: None,
+            slot_token: None,
         };
         lease.release(quarantine_path).await
     }
@@ -713,8 +737,8 @@ impl ActiveLease {
         if !self.acquired {
             return Ok(());
         }
-        match self.invoke("release").await {
-            HookOutcome::Ok => {
+        match self.invoke("release", None).await {
+            HookOutcome::Ok { .. } => {
                 self.acquired = false;
                 Ok(())
             }
@@ -724,7 +748,7 @@ impl ActiveLease {
                     HookOutcome::Signalled => "killed by signal".to_owned(),
                     HookOutcome::Timeout => "timeout".to_owned(),
                     HookOutcome::ExecError(msg) => msg,
-                    HookOutcome::Ok => unreachable!(),
+                    HookOutcome::Ok { .. } => unreachable!(),
                 };
                 record_quarantine(
                     quarantine_path,
@@ -752,9 +776,9 @@ impl ActiveLease {
         }
     }
 
-    async fn invoke(&self, action: &str) -> HookOutcome {
+    async fn invoke(&self, action: &str, cgroup: Option<&str>) -> HookOutcome {
         let Some((prog, base_args)) = self.hook.split_first() else {
-            return HookOutcome::Ok;
+            return HookOutcome::Ok { stdout: Vec::new() };
         };
         let mut cmd = Command::new(prog);
         cmd.args(base_args)
@@ -769,6 +793,21 @@ impl ActiveLease {
         if let Some(generation) = self.ctx.lease_generation {
             cmd.arg("--generation").arg(generation.to_string());
         }
+        if action == "recheck" {
+            if let Some(cg) = cgroup {
+                cmd.arg("--cgroup").arg(cg);
+            }
+            if let Some(attempt_id) = self.slot_attempt_id {
+                cmd.arg("--attempt-id").arg(attempt_id.to_string());
+            }
+            if let Some(token) = &self.slot_token {
+                cmd.env(LEASE_SLOT_TOKEN_ENV, token);
+            } else {
+                cmd.env_remove(LEASE_SLOT_TOKEN_ENV);
+            }
+        } else {
+            cmd.env_remove(LEASE_SLOT_TOKEN_ENV);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -779,7 +818,7 @@ impl ActiveLease {
             Err(_) => return HookOutcome::Timeout,
         };
         match out.status.code() {
-            Some(0) => HookOutcome::Ok,
+            Some(0) => HookOutcome::Ok { stdout: out.stdout },
             Some(code) => HookOutcome::Denied(code),
             None => HookOutcome::Signalled,
         }

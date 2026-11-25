@@ -172,6 +172,7 @@ class AssembleTest(unittest.TestCase):
             ("list-limits", {**default_profile, "limits": ["bad"]}, "limits"),
             ("string-limits", {**default_profile, "limits": "bad"}, "limits"),
             ("empty-limits", {**default_profile, "limits": []}, "limits"),
+            ("null-limits", {**default_profile, "limits": None}, "limits"),
             ("missing-device", {k: v for k, v in default_profile.items() if k != "device"}, "device"),
             ("blank-device", {**default_profile, "device": " \t"}, "device"),
         ):

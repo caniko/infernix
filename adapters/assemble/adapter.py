@@ -424,8 +424,7 @@ def assemble(context):
     fps = integer(params.get("fps", 30), 1, 60, "fps")
     badge = text(params.get("badge"), "badge", 48)
     threads = str(integer(context.envelope.cpu_threads, 1, 64, "cpuThreads"))
-    limits = context.profile.get("limits")
-    limits = {} if limits is None else checked(limits, dict, "profile.limits")
+    limits = checked(context.profile.get("limits", {}), dict, "profile.limits")
     input_limit = 1000 * integer(
         limits.get("maxInputSeconds", DEFAULT_INPUT_SECONDS), 1, 3600, "maxInputSeconds",
     )

@@ -212,6 +212,27 @@ class AssembleTest(unittest.TestCase):
         red, _, blue = pixel(output, 1, 90, 160)
         self.assertGreater(blue, red + 150)
 
+        shots = [shot("red", 1, 1), shot("blue", 30, 1)]
+        cases = ((30, 0, 30, 30), (1, 0, 1, 1), (30, 591, 13, 30))
+        for fps, start, red_frames, blue_frames in cases:
+            with self.subTest(fps=fps, start_ms=start):
+                name = f"single-frame-{fps}-{start}"
+                rendered = result(submit({
+                    **manifest, "visual": shots_visual(shots),
+                    "cut": {"start_ms": start, "end_ms": 2000},
+                }, name, [*wavs, *shots], fps=fps))
+                output = root / name / rendered["artifacts"][0]["path"]
+                pixels = subprocess.check_output([
+                    "ffmpeg", "-v", "error", "-i", str(output),
+                    "-vf", "format=rgb24,crop=1:1:90:160", "-threads", "1",
+                    "-f", "rawvideo", "pipe:1",
+                ])
+                colors = "".join(
+                    "R" if r > b + 150 else "B" if b > r + 150 else "?"
+                    for r, b in zip(pixels[::3], pixels[2::3])
+                )
+                self.assertEqual(colors, "R" * red_frames + "B" * blue_frames)
+
         gap = result(submit({
             **manifest, "cut": {"start_ms": 1750, "end_ms": 1880},
             "visual": {"kind": "plain", "color": "#252525"},

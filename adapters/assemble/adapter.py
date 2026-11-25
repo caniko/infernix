@@ -13,6 +13,7 @@ import textwrap
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from functools import cache
 from itertools import pairwise
 from pathlib import Path
@@ -153,6 +154,26 @@ def wav_duration(context, path, limit):
     return integer(duration, 1, limit, "WAV duration in milliseconds")
 
 
+def shot_duration(context, path):
+    result, _ = command(context, [
+        FFPROBE, "-v", "error", "-protocol_whitelist", "file", "-f", "mov",
+        "-select_streams", "v:0", "-show_entries", "stream=duration_ts,time_base:format=duration",
+        "-of", "json", str(path),
+    ], code=14)
+    try:
+        probe = json.loads(result)
+        stream = probe["streams"][0]
+        if "duration_ts" in stream:
+            duration = stream["duration_ts"] * Fraction(stream["time_base"])
+        else:
+            duration = Fraction(probe["format"]["duration"])
+        if duration > 0:
+            return duration
+    except (IndexError, KeyError, ValueError, ZeroDivisionError):
+        pass
+    raise invalid("shot must have a positive video duration")
+
+
 @dataclass
 class Turn:
     path: Path
@@ -257,34 +278,38 @@ def active_windows(turns, start, end, fps):
     return windows
 
 
-def video_graph(work, visual, inputs, turns, speakers, start, end, width, height, fps, badge):
+def video_graph(context, work, visual, inputs, turns, speakers, start, end, width, height, fps, badge):
     kind = visual.get("kind")
     args, sources, filters = [], [], []
     if kind == "shots":
         shots = checked(visual.get("shots"), list, "visual.shots")
         integer(len(shots), 1, MAX_SHOTS, "shot count")
+        # Place shots by exact media duration, rounding only when setting frame PTS.
+        # Frame PTS alone give a lone frame no span. Allow 1 us of time-base rounding.
+        boundary = Fraction(-start * 1000 - 1)
         for index, shot in enumerate(shots):
             shot = checked(shot, dict, "shot")
             path = input_file(inputs, shot.get("shot_sha256"), "shot_sha256")
+            timestamp = round(boundary)
+            boundary += 1_000_000 * shot_duration(context, path)
             args += ["-threads", "1", "-protocol_whitelist", "file", "-f", "mov",
                      "-i", str(path)]
             sources.append(
-                f"[{len(turns) + index}:v:0]setpts=PTS-STARTPTS,"
+                f"[{len(turns) + index}:v:0]settb=AVTB,setpts=PTS-STARTPTS{timestamp:+d},"
+                f"trim=end_pts={round(boundary)},"
                 f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
                 f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',setsar=1,"
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                 f"format=yuv420p[shot{index}]"
             )
         labels = "".join(f"[shot{i}]" for i in range(len(shots)))
-        # Shift to the cut clock. Allow one microsecond of concat timestamp rounding.
-        sources.append(f"{labels}concat=n={len(shots)}:v=1:a=0,setpts=PTS-{start * 1000 + 1}[shots]")
-        # A frame at the exclusive end makes fps hold the last shot even for mixed
-        # source rates (where tpad has no input rate). The final trim drops this frame.
+        # A frame at the exclusive end makes fps hold the last shot. The final trim drops it.
         sources.append(
             f"color=black:s={width}x{height}:r=1:d=1,format=yuv420p,"
             f"settb=AVTB,setpts=PTS+{(end - start) * 1000}[pad]"
         )
-        filters.append(f"[shots][pad]interleave,fps={fps}:start_time=0:round=up")
+        filters.append(f"{labels}[pad]interleave=nb_inputs={len(shots) + 1},"
+                       f"fps={fps}:start_time=0:round=up")
     elif kind in ("plain", "tiles"):
         base = color(visual.get("color"), "visual.color") if kind == "plain" else "0x15191f"
         filters.append(f"color=c={base}:s={width}x{height}:r={fps}")
@@ -379,7 +404,8 @@ def assemble(context):
         work = Path(tmp)
         (work / "font.ttf").write_bytes(caption_font())
         video_args, video = video_graph(
-            work, visual, inputs["shot"], turns, speakers, start, end, width, height, fps, badge,
+            context, work, visual, inputs["shot"], turns, speakers, start, end, width, height,
+            fps, badge,
         )
         _, stderr = command(context, ffmpeg + args + [
             "-filter_complex", f"{dialogue},{LOUDNORM}:print_format=json[a]",

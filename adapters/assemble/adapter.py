@@ -164,12 +164,19 @@ def shot_duration(context, path):
         probe = json.loads(result)
         stream = probe["streams"][0]
         if "duration_ts" in stream:
-            duration = stream["duration_ts"] * Fraction(stream["time_base"])
+            ticks = stream["duration_ts"]
+            time_base = stream["time_base"]
+            if isinstance(ticks, bool) or not isinstance(ticks, int) or not isinstance(time_base, str):
+                raise ValueError("invalid stream duration")
+            duration = ticks * Fraction(time_base)
         else:
-            duration = Fraction(probe["format"]["duration"])
+            raw_duration = probe["format"]["duration"]
+            if not isinstance(raw_duration, str):
+                raise ValueError("invalid format duration")
+            duration = Fraction(raw_duration)
         if duration > 0:
             return duration
-    except (IndexError, KeyError, ValueError, ZeroDivisionError):
+    except (IndexError, KeyError, TypeError, ValueError, ZeroDivisionError):
         pass
     raise invalid("shot must have a positive video duration")
 
@@ -278,25 +285,38 @@ def active_windows(turns, start, end, fps):
     return windows
 
 
+def boundary_pts(seconds, fps):
+    """Microsecond timestamp whose fps(round=up) output frame matches exact duration."""
+    if seconds < 0:
+        return math.floor(seconds * 1_000_000)
+    frame = math.ceil(seconds * fps)
+    if frame == 0:
+        return 0
+    low = (frame - 1) * 1_000_000 // fps + 1
+    high = frame * 1_000_000 // fps
+    return min(max(round(seconds * 1_000_000), low), high)
+
+
 def video_graph(context, work, visual, inputs, turns, speakers, start, end, width, height, fps, badge):
     kind = visual.get("kind")
     args, sources, filters = [], [], []
     if kind == "shots":
         shots = checked(visual.get("shots"), list, "visual.shots")
         integer(len(shots), 1, MAX_SHOTS, "shot count")
-        # Place shots by exact media duration, rounding only when setting frame PTS.
-        # Frame PTS alone give a lone frame no span. Allow 1 us of time-base rounding.
-        boundary = Fraction(-start * 1000 - 1)
+        # Place shots by exact media duration, choosing microsecond PTS that preserve
+        # the exact output-frame boundary under fps(..., round=up).
+        boundary = Fraction(-start, 1000)
         for index, shot in enumerate(shots):
             shot = checked(shot, dict, "shot")
             path = input_file(inputs, shot.get("shot_sha256"), "shot_sha256")
-            timestamp = round(boundary)
-            boundary += 1_000_000 * shot_duration(context, path)
+            timestamp = boundary_pts(boundary, fps)
+            boundary += shot_duration(context, path)
+            end_timestamp = boundary_pts(boundary, fps)
             args += ["-threads", "1", "-protocol_whitelist", "file", "-f", "mov",
                      "-i", str(path)]
             sources.append(
                 f"[{len(turns) + index}:v:0]settb=AVTB,setpts=PTS-STARTPTS{timestamp:+d},"
-                f"trim=end_pts={round(boundary)},"
+                f"trim=end_pts={end_timestamp},"
                 f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
                 f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',setsar=1,"
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"

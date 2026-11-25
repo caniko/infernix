@@ -10,8 +10,12 @@ import unittest
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT.parent / "common" / "src")]
+import adapter
+from infernix_adapter.exits import AdapterError
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -250,3 +254,41 @@ class AssembleTest(unittest.TestCase):
         }, "silence", [silent_wav]))
         self.assertEqual(silent["validation"]["state"], "warn")
         self.assertLess(silent["validation"]["loudness"]["truePeakDbtp"], -40)
+
+        for name, rate, start, end, fps, expected in (
+            ("boundary-30fps", "500000/16667", 0, 100, 30, "RRB"),
+            ("boundary-cut-591", "1000000/591001", 591, 691, 30, "RBB"),
+            ("boundary-1fps", "1000000/1000001", 0, 2000, 1, "RR"),
+        ):
+            edge_path = root / f"{name}.mp4"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                f"color=red:s=180x320:r={rate}", "-frames:v", "1", "-c:v", "libx264",
+                "-threads", "1", "-video_track_timescale", "1000000", str(edge_path),
+            ], check=True)
+            edge_shots = [asset(f"{name}-red", "shot", "video/mp4", edge_path.read_bytes()), shots[1]]
+            rendered = result(submit({
+                **manifest, "visual": shots_visual(edge_shots),
+                "cut": {"start_ms": start, "end_ms": end},
+            }, name, [*wavs, *edge_shots], fps=fps))
+            output = root / name / rendered["artifacts"][0]["path"]
+            pixels = subprocess.check_output([
+                "ffmpeg", "-v", "error", "-i", str(output),
+                "-vf", "format=rgb24,crop=1:1:90:160", "-threads", "1",
+                "-f", "rawvideo", "pipe:1",
+            ])
+            colors = "".join(
+                "R" if r > b + 150 else "B" if b > r + 150 else "?"
+                for r, b in zip(pixels[::3], pixels[2::3])
+            )
+            self.assertEqual(colors, expected)
+
+    def test_shot_duration_rejects_non_integer_ticks(self):
+        for bad_ticks in (None, "N/A", True, 1.5):
+            payload = json.dumps({"streams": [{"duration_ts": bad_ticks, "time_base": "1/30"}]})
+            with (
+                mock.patch.object(adapter, "command", return_value=(payload, "")),
+                self.assertRaises(AdapterError) as raised,
+            ):
+                adapter.shot_duration(None, Path("bad.mp4"))
+            self.assertEqual(raised.exception.code, 14)

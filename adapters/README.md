@@ -707,9 +707,14 @@ dtype (the `bf16` in the profile is the text encoder's dtype, as upstream
 defaults it), which is why its allocator peak is only 1.15 GiB; the ~17 GiB the
 README quotes is the 8B text encoder.
 
-**kokoro-rhubarb.** Kip's speech, as two ledger jobs so the Board's audio approval sits
-between them.
-- `tts` runs Kokoro-82M (voice `af_bella`) on the GPU.
+**kokoro-rhubarb.** Speech synthesis and lip sync run as separate jobs so audio can be
+approved before generating mouth cues.
+- `tts` runs Kokoro-82M on the GPU with `params.text` and an optional `params.voice`
+  (default `af_bella`).
+  - Voice IDs must match `[a-z]{2}_[a-z0-9]+` and have a hash-pinned
+    `voices/<id>.pt` entry in the local profile's `checkpoint.files`.
+  - The first letter selects American (`a`) or British (`b`) English. Other
+    prefixes and undeclared voices are rejected before loading the model.
   - Its English G2P (Misaki) tags the text with the spaCy model `en_core_web_sm` 3.8.0 on the CPU.
   - The tagger is learned CPU inference, so the profile declares it as a helper with `onGpu: false`; the profile schema allows that exception for Kokoro alone.
   - The wheel is pinned by URL in `pyproject.toml` and by hash in `uv.lock`.

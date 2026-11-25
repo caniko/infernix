@@ -1,13 +1,14 @@
-#!/usr/bin/env python3
 """Kokoro speech and Rhubarb face jobs for the animation ledger."""
 
 import hashlib
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
 import wave
+from itertools import pairwise
 from pathlib import Path
 
 import infernix_adapter as adapter
@@ -15,20 +16,37 @@ from infernix_adapter import AdapterError, run
 
 
 def synthesize(context, text):
+    voice = context.params.get("voice", "af_bella")
+    if not isinstance(voice, str) or not re.fullmatch(r"[a-z]{2}_[a-z0-9]+", voice):
+        raise AdapterError(14, "params.voice must match [a-z]{2}_[a-z0-9]+")
+    lang_code = voice[0]
+    if lang_code not in ("a", "b"):
+        raise AdapterError(14, "params.voice must use an English prefix (a or b)")
+
+    voice_file = f"voices/{voice}.pt"
+    checkpoint = context.profile.get("checkpoint") or {}
+    files = checkpoint.get("files")
+    if not isinstance(files, list) or not any(
+        isinstance(entry, dict) and entry.get("path") == voice_file for entry in files
+    ):
+        raise AdapterError(14, f"params.voice {voice!r} is not declared in checkpoint.files")
+    if not checkpoint.get("localPath"):
+        raise AdapterError(14, "checkpoint.localPath is required for pinned Kokoro weights")
+    source, _ = adapter.pinned_source(context.profile)
+    root = Path(source)
+
     import spacy
 
     if not spacy.util.is_package("en_core_web_sm"):
         raise AdapterError(14, "en_core_web_sm is not installed; offline download is forbidden")
     from kokoro import KModel, KPipeline
 
-    source, _ = adapter.pinned_source(context.profile)
-    root = Path(source)
     model = KModel(config=str(root / "config.json"), model=str(root / "kokoro-v1_0.pth"))
     model = model.to(adapter.device_string()).eval()
     adapter.assert_on_gpu(model, label="kokoro")
-    pipe = KPipeline(lang_code="a", model=model)
+    pipe = KPipeline(lang_code=lang_code, model=model)
     result = []
-    for segment in pipe(text, voice=str(root / "voices/af_bella.pt")):
+    for segment in pipe(text, voice=str(root / voice_file)):
         context.check_cancel()
         if segment.audio is not None:
             result.extend(segment.audio.tolist())
@@ -56,10 +74,9 @@ def produce(context):
         if not samples:
             raise AdapterError(1, "Kokoro returned no audio")
         pcm = b"".join(struct.pack("<h", max(-32768, min(32767, int(float(x) * 32767)))) for x in samples)
-        with adapter.open_output(context.output_directory, "line.wav") as file:
-            with wave.open(file, "wb") as wav:
-                wav.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
-                wav.writeframes(pcm)
+        with adapter.open_output(context.output_directory, "line.wav") as file, wave.open(file, "wb") as wav:
+            wav.setparams((1, 2, 24000, 0, "NONE", "not compressed"))
+            wav.writeframes(pcm)
         return [context.artifact("audio", "line.wav", "audio/wav")]
     if context.operation != "face":
         raise AdapterError(14, "unsupported operation")
@@ -93,7 +110,7 @@ def produce(context):
     boundaries = sorted(events)
     times = [boundaries[0]]
     values = [events[boundaries[0]]]
-    for previous, boundary in zip(boundaries, boundaries[1:]):
+    for previous, boundary in pairwise(boundaries):
         before = boundary - min(0.001, (boundary - previous) / 2)
         if not previous < before < boundary:
             raise AdapterError(14, "Rhubarb cue boundaries are too close")
@@ -110,4 +127,11 @@ def produce(context):
 
 
 if __name__ == "__main__":
-    sys.exit(run(produce, package="kokoro"))
+    # Older cached TTS results did not validate or honor params.voice.
+    sys.exit(
+        run(
+            produce,
+            package="kokoro",
+            runtime=lambda envelope: {"voiceSelection": 1} if envelope.operation == "tts" else {},
+        )
+    )

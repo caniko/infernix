@@ -34,6 +34,10 @@ def synthesize(context, text):
         raise AdapterError(14, "checkpoint.localPath is required for pinned Kokoro weights")
     source, _ = adapter.pinned_source(context.profile)
     root = Path(source)
+    voice_path = str((root / voice_file).absolute())
+    # Kokoro treats commas as voice separators and can try to download fragments.
+    if "," in voice_path:
+        raise AdapterError(14, "Kokoro voice path must not contain a comma")
 
     import spacy
 
@@ -46,7 +50,7 @@ def synthesize(context, text):
     adapter.assert_on_gpu(model, label="kokoro")
     pipe = KPipeline(lang_code=lang_code, model=model)
     result = []
-    for segment in pipe(text, voice=str(root / voice_file)):
+    for segment in pipe(text, voice=voice_path):
         context.check_cancel()
         if segment.audio is not None:
             result.extend(segment.audio.tolist())
@@ -126,12 +130,23 @@ def produce(context):
     return [context.artifact("performance", "performance.json", "application/json")]
 
 
-if __name__ == "__main__":
+def runtime_versions(envelope):
+    if envelope.operation != "tts":
+        return {}
+    checkpoint = envelope.profile.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        raise AdapterError(14, "checkpoint must be an object")
+    files = checkpoint.get("files")
+    if not isinstance(files, list):
+        raise AdapterError(14, "checkpoint.files must be a list")
+    for entry in files:
+        if not isinstance(entry, dict) or not all(
+            isinstance(entry.get(key), str) and entry[key] for key in ("path", "sha256")
+        ):
+            raise AdapterError(14, "checkpoint.files entries need non-empty string path and sha256")
     # Older cached TTS results did not validate or honor params.voice.
-    sys.exit(
-        run(
-            produce,
-            package="kokoro",
-            runtime=lambda envelope: {"voiceSelection": 1} if envelope.operation == "tts" else {},
-        )
-    )
+    return {"voiceSelection": 1}
+
+
+if __name__ == "__main__":
+    sys.exit(run(produce, package="kokoro", runtime=runtime_versions))

@@ -1,16 +1,21 @@
 import hashlib
+import io
 import json
+import os
+import runpy
 import sys
 import tempfile
 import types
 import unittest
 import wave
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import adapter
 from infernix_adapter import AdapterError
+from infernix_adapter.cache import CACHE_DIR_ENV, verify
 from infernix_adapter.result import collect
 
 
@@ -121,6 +126,97 @@ class AdapterTests(unittest.TestCase):
             self.assertRaisesRegex(AdapterError, "voices/bf_sample.pt sha256"),
         ):
             adapter.produce(context)
+
+    def test_tts_rejects_comma_in_local_checkpoint_path(self):
+        self.root /= "checkpoint,local"
+        self.root.mkdir()
+        context = self.tts_context()
+        with (
+            patch.dict(sys.modules, {"spacy": None, "kokoro": None}),
+            self.assertRaisesRegex(AdapterError, "comma") as raised,
+        ):
+            adapter.produce(context)
+        self.assertEqual(14, raised.exception.code)
+
+    def run_tts(self, checkpoint, voice, *, legacy=False):
+        staging = Path(tempfile.mkdtemp(dir=self.root))
+        envelope = {
+            "protocolVersion": 2,
+            "workload": "animation",
+            "queue": "asset",
+            "jobId": "job-1",
+            "leaseToken": "lease-1",
+            "attempt": 1,
+            "inputFingerprint": "a" * 64,
+            "stagingDirectory": str(staging),
+            "outputDirectory": str(staging / "out"),
+            "cancelPath": str(staging / "CANCEL"),
+            "payload": {
+                "stage": "asset",
+                "operation": "tts",
+                "generationRequestId": "gen-1",
+                "profile": {"cpuPolicy": "permitted", "checkpoint": checkpoint},
+                "params": {"text": "Test sentence.", "voice": voice},
+            },
+        }
+        stdin = types.SimpleNamespace(buffer=io.BytesIO(json.dumps(envelope).encode()))
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch.dict(os.environ, {CACHE_DIR_ENV: str(self.root / "cache")}),
+            patch.object(sys, "stdin", stdin),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            if legacy:
+                with patch.object(adapter, "synthesize", return_value=[0.0]):
+                    code = adapter.run(adapter.produce, package="kokoro")
+            else:
+                with self.assertRaises(SystemExit) as raised:
+                    runpy.run_path(adapter.__file__, run_name="__main__")
+                code = raised.exception.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_tts_runner_rejects_malformed_checkpoint_before_fingerprinting(self):
+        for checkpoint, message in (
+            (["bad"], "checkpoint must be an object"),
+            ({"files": 7}, "checkpoint.files must be a list"),
+            ({"files": ["bad"]}, "checkpoint.files entries"),
+            ({"files": [{"path": 7, "sha256": False}]}, "checkpoint.files entries"),
+        ):
+            with self.subTest(checkpoint=checkpoint):
+                code, stdout, stderr = self.run_tts(checkpoint, "bf_sample")
+                self.assertEqual(14, code, stderr)
+                self.assertEqual("", stdout)
+                self.assertIn(message, stderr)
+                self.assertNotIn("Traceback", stderr)
+
+    def test_tts_runner_misses_legacy_cache_and_separates_voices(self):
+        checkpoint = self.tts_context().profile["checkpoint"]
+        code, stdout, stderr = self.run_tts(checkpoint, "bf_sample", legacy=True)
+        self.assertEqual(0, code, stderr)
+        legacy = json.loads(stdout)
+        self.assertIsNotNone(verify(self.root / "cache" / legacy["contentFingerprint"]))
+
+        def pipe(text, voice):
+            sample = {"af_bella.pt": 0.25, "bf_sample.pt": 0.5}[Path(voice).name]
+            return [types.SimpleNamespace(audio=Mock(tolist=lambda: [sample]))]
+
+        spacy = types.SimpleNamespace(util=types.SimpleNamespace(is_package=lambda _: True))
+        kokoro = types.SimpleNamespace(KModel=Mock(), KPipeline=Mock(return_value=pipe))
+        results = [legacy]
+        with (
+            patch.dict(sys.modules, {"spacy": spacy, "kokoro": kokoro}),
+            patch.object(adapter.adapter, "device_string", return_value="cuda:0"),
+            patch.object(adapter.adapter, "assert_on_gpu"),
+        ):
+            for voice in ("bf_sample", "af_bella"):
+                code, stdout, stderr = self.run_tts(checkpoint, voice)
+                self.assertEqual(0, code, stderr)
+                result = json.loads(stdout)
+                self.assertFalse(result["cacheHit"], voice)
+                results.append(result)
+        self.assertEqual(3, len({result["contentFingerprint"] for result in results}))
+        self.assertEqual(3, len({result["artifacts"][0]["sha256"] for result in results}))
 
     def test_wav_artifact_sha256(self):
         context = Context(self.root, "tts", {"text": "hello"})

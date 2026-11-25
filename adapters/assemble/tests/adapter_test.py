@@ -7,9 +7,12 @@ import sys
 import tempfile
 import threading
 import unittest
+import wave
+from fractions import Fraction
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,7 +86,7 @@ class AssembleTest(unittest.TestCase):
         token = root / "token"
         token.write_text("test")
 
-        def submit(doc, name, inputs=None, *, fps=30):
+        def submit(doc, name, inputs=None, *, fps=30, profile=None):
             edit = asset("manifest", "manifest", "application/json", json.dumps(doc).encode())
             stage = root / name
             envelope = {
@@ -94,7 +97,7 @@ class AssembleTest(unittest.TestCase):
                 "payload": {
                     "stage": "assemble", "operation": "assemble", "generationRequestId": "test",
                     "hubUrl": f"http://127.0.0.1:{port}",
-                    "profile": json.loads((ROOT / "profile.example.json").read_text()),
+                    "profile": profile if profile is not None else default_profile,
                     "inputs": [edit, *(wavs if inputs is None else inputs)],
                     "params": {"width": 180, "height": 320, "badge": "AI-generated", "fps": fps},
                 },
@@ -110,6 +113,7 @@ class AssembleTest(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             return json.loads(done.stdout)
 
+        default_profile = json.loads((ROOT / "profile.example.json").read_text())
         first = result(submit(manifest, "first"))
         self.assertFalse(first["cacheHit"])
         self.assertEqual(len(first["artifacts"]), 1)
@@ -164,6 +168,31 @@ class AssembleTest(unittest.TestCase):
         self.assertEqual(bad.returncode, 14, bad.stderr)
         self.assertIn("unknown wav_sha256", bad.stderr)
 
+        for name, profile, field in (
+            ("list-limits", {**default_profile, "limits": ["bad"]}, "limits"),
+            ("string-limits", {**default_profile, "limits": "bad"}, "limits"),
+            ("empty-limits", {**default_profile, "limits": []}, "limits"),
+            ("missing-device", {k: v for k, v in default_profile.items() if k != "device"}, "device"),
+            ("blank-device", {**default_profile, "device": " \t"}, "device"),
+        ):
+            with self.subTest(name=name):
+                rejected = submit(manifest, name, profile=profile)
+                self.assertEqual(rejected.returncode, 14, rejected.stderr)
+                self.assertIn(field, rejected.stderr)
+
+        with self.subTest(name="hot-mix"):
+            hot = asset("hot", "wav", "audio/wav", subprocess.check_output([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                "aevalsrc=sin(2*PI*1000*t):s=48000:d=2", "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
+            ]))
+            hot_turn = {**turns[0], "wav_sha256": hot["sha256"]}
+            hot_mix = result(submit({
+                **manifest, "turns": [hot_turn, {**hot_turn, "offset_ms": -2000}], "cut": {},
+            }, "hot-mix", [hot]))
+            loudness = hot_mix["validation"]["loudness"]
+            self.assertAlmostEqual(loudness["integratedLufs"], -14, delta=1)
+            self.assertLessEqual(loudness["truePeakDbtp"], -1)
+
         def shot(shade, rate, duration):
             path = root / "shot.mp4"
             subprocess.run([
@@ -176,6 +205,43 @@ class AssembleTest(unittest.TestCase):
 
         def shots_visual(shots):
             return {"kind": "shots", "shots": [{"shot_sha256": s["sha256"]} for s in shots]}
+
+        with self.subTest(name="moving-shot"):
+            path = root / "moving.mp4"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                "nullsrc=s=96x96:r=30,geq=lum='16+24*N':cb=128:cr=128",
+                "-frames:v", "9", "-c:v", "libx264", "-threads", "1", str(path),
+            ], check=True)
+            moving = asset("moving", "shot", "video/mp4", path.read_bytes())
+            # 14,399 samples end just before 300 ms: still exactly nine frames.
+            short_wav = asset("short", "wav", "audio/wav", subprocess.check_output([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                "sine=r=48000,atrim=end_sample=14399", "-f", "wav", "pipe:1",
+            ]))
+            rendered = result(submit({
+                **manifest, "visual": shots_visual([moving]), "cut": {},
+                "turns": [{**turns[0], "wav_sha256": short_wav["sha256"]}],
+            }, "moving", [short_wav, moving]))
+            output = root / "moving" / rendered["artifacts"][0]["path"]
+            samples = subprocess.check_output([
+                "ffmpeg", "-v", "error", "-i", str(output), "-an", "-vf", "crop=2:2:90:160",
+                "-threads", "1", "-f", "rawvideo", "pipe:1",
+            ])
+            self.assertEqual([round((y - 16) / 24) for y in samples[::6]], list(range(9)))
+
+        profile = {**default_profile, "limits": {"maxInputSeconds": 1}}
+        for name, over_budget in (
+            ("single-shot-budget", [shot("green", 30, 1.2)]),
+            ("total-shot-budget", [shot("red", 30, 0.6), shot("blue", 30, 0.6)]),
+        ):
+            with self.subTest(name=name):
+                rejected = submit({
+                    **manifest, "visual": shots_visual(over_budget), "cut": {"end_ms": 300},
+                    "turns": turns[:1],
+                }, name, [wavs[0], *over_budget], profile=profile)
+                self.assertEqual(rejected.returncode, 14, rejected.stderr)
+                self.assertIn("maxInputSeconds", rejected.stderr)
 
         shots = [shot("red", 30, 0.6), shot("blue", 25, 0.6)]
         visual = shots_visual(shots)
@@ -283,12 +349,36 @@ class AssembleTest(unittest.TestCase):
             )
             self.assertEqual(colors, expected)
 
-    def test_shot_duration_rejects_non_integer_ticks(self):
-        for bad_ticks in (None, "N/A", True, 1.5):
-            payload = json.dumps({"streams": [{"duration_ts": bad_ticks, "time_base": "1/30"}]})
-            with (
-                mock.patch.object(adapter, "command", return_value=(payload, "")),
-                self.assertRaises(AdapterError) as raised,
-            ):
-                adapter.shot_duration(None, Path("bad.mp4"))
-            self.assertEqual(raised.exception.code, 14)
+    def test_timeline_preserves_fractional_wav_durations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "samples.wav"
+            with wave.open(str(path), "wb") as wav:
+                wav.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+                wav.writeframes(bytes(2 * 4823))
+            digest = "a" * 64
+            context = SimpleNamespace(check_cancel=lambda: None)
+            turns, _ = adapter.timeline(context, {
+                "speakers": {"a": {"label": "Speaker A", "color": "#ffffff"}},
+                "turns": [{"wav_sha256": digest, "speaker_id": "a", "caption": "Test",
+                           "offset_ms": 0}] * 100,
+            }, {digest: path}, 11_000)
+            self.assertEqual(turns[-1].start, Fraction(99 * 4823, 48))
+            self.assertEqual(turns[-1].end, Fraction(100 * 4823, 48))
+            _, graph = adapter.dialogue_graph(turns, 0, turns[-1].end, "1")
+            self.assertIn("atrim=start_sample=0:end_sample=4823", graph)
+            self.assertIn("adelay=477477S[turn99]", graph)
+            self.assertTrue(graph.endswith("atrim=end_sample=482300"))
+
+    def test_shot_duration_rejects_invalid_ticks_or_time_base(self):
+        for ticks, time_base in (
+            *((value, "1/30") for value in (None, "N/A", True, 1.5, 0, -1)),
+            (1, "0"), (1, "-1/30"), (-1, "-1/30"),
+        ):
+            payload = json.dumps({"streams": [{"duration_ts": ticks, "time_base": time_base}]})
+            with self.subTest(ticks=ticks, time_base=time_base):
+                with (
+                    mock.patch.object(adapter, "command", return_value=(payload, "")),
+                    self.assertRaises(AdapterError) as raised,
+                ):
+                    adapter.shot_duration(None, Path("bad.mp4"))
+                self.assertEqual(raised.exception.code, 14)

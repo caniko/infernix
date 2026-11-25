@@ -531,13 +531,16 @@ and therefore the cache key.
 - `speakers` maps IDs to `{label, color}`. `visual` is `{kind: "plain", color}`,
   `{kind: "tiles", tiles: [{speaker_id}, ...]}` (one to four tiles, using the
   labels and colors from `speakers`), or `{kind: "shots", shots: [{shot_sha256}, ...]}`
-  (up to 16). Shots play in
-  order from timeline zero, ignore source audio, and hold the last frame if
-  shorter than the edit. Colors are `#rrggbb`.
+  (up to 16). Shots play in order from timeline zero, ignore source audio,
+  and hold the last frame if shorter than the edit. Both individual and
+  cumulative shot durations must fit `profile.limits.maxInputSeconds`. Colors
+  are `#rrggbb`.
 - `params.badge` is required; `width`, `height`, and `fps` default to
   1080×1920 at 30 fps. Outputs one fast-start H.264/AAC MP4 with a generated
-  room-tone bed added after two-pass dialogue loudness normalization. The decoded AAC
-  measurement is returned in `validation.loudness` (`integratedLufs` and
+  room-tone bed added after dialogue loudness normalization. If the measured
+  values are outside FFmpeg's two-pass range, the adapter uses single-pass
+  normalization. The decoded AAC measurement is returned in
+  `validation.loudness` (`integratedLufs` and
   `truePeakDbtp`); unmeasurable results, results outside −14 ±1 LUFS, or peaks
   above −1 dBTP warn. A cut with only room tone stays quiet rather than
   boosting the noise to the speech target.

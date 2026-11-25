@@ -12,7 +12,6 @@ import tempfile
 import textwrap
 from collections import defaultdict
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from functools import cache
 from itertools import pairwise
@@ -30,6 +29,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 MAX_TURNS = 128
 MAX_SHOTS = 16
+DEFAULT_INPUT_SECONDS = 600
 
 
 def manifest_input(envelope):
@@ -71,6 +71,8 @@ def runtime_versions(envelope):
     if (envelope.operation != "assemble" or profile.get("backend") != "cpu"
             or profile.get("cpuPolicy") != "permitted"):
         raise invalid("assemble requires a CPU-permitted profile and operation 'assemble'")
+    if not checked(profile.get("device"), str, "profile.device").strip():
+        raise invalid("profile.device must not be blank")
     manifest_input(envelope)
     try:
         return {
@@ -144,14 +146,27 @@ def command(context, args, *, cwd=None, code=1):
 def wav_duration(context, path, limit):
     result, _ = command(context, [
         FFPROBE, "-v", "error", "-protocol_whitelist", "file", "-f", "wav",
-        "-select_streams", "a:0", "-show_entries", "stream=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        "-select_streams", "a:0", "-show_entries", "stream=duration_ts,time_base",
+        "-of", "json", str(path),
     ], code=14)
     try:
-        duration = round(1000 * Decimal(result.strip()))
-    except (InvalidOperation, ValueError, OverflowError):
-        raise invalid("WAV must have a finite duration") from None
-    return integer(duration, 1, limit, "WAV duration in milliseconds")
+        duration = 1000 * stream_duration(json.loads(result)["streams"][0])
+    except (IndexError, KeyError, TypeError, ValueError, ZeroDivisionError):
+        raise invalid("WAV must have a positive audio duration") from None
+    if not 1 <= duration <= limit:
+        raise invalid(f"WAV duration in milliseconds must be between 1 and {limit}")
+    return duration
+
+
+def stream_duration(stream):
+    ticks = stream["duration_ts"]
+    time_base = stream["time_base"]
+    if type(ticks) is not int or ticks <= 0 or not isinstance(time_base, str):
+        raise ValueError("invalid stream duration")
+    base = Fraction(time_base)
+    if base <= 0:
+        raise ValueError("non-positive stream time base")
+    return ticks * base
 
 
 def shot_duration(context, path):
@@ -164,16 +179,11 @@ def shot_duration(context, path):
         probe = json.loads(result)
         stream = probe["streams"][0]
         if "duration_ts" in stream:
-            ticks = stream["duration_ts"]
-            time_base = stream["time_base"]
-            if isinstance(ticks, bool) or not isinstance(ticks, int) or not isinstance(time_base, str):
-                raise ValueError("invalid stream duration")
-            duration = ticks * Fraction(time_base)
-        else:
-            raw_duration = probe["format"]["duration"]
-            if not isinstance(raw_duration, str):
-                raise ValueError("invalid format duration")
-            duration = Fraction(raw_duration)
+            return stream_duration(stream)
+        raw_duration = probe["format"]["duration"]
+        if not isinstance(raw_duration, str):
+            raise TypeError("invalid format duration")
+        duration = Fraction(raw_duration)
         if duration > 0:
             return duration
     except (IndexError, KeyError, TypeError, ValueError, ZeroDivisionError):
@@ -184,8 +194,8 @@ def shot_duration(context, path):
 @dataclass
 class Turn:
     path: Path
-    start: int
-    end: int
+    start: Fraction  # Exact milliseconds.
+    end: Fraction
     speaker: str
     caption: str
 
@@ -222,18 +232,19 @@ def timeline(context, manifest, inputs, limit):
 
 def dialogue_graph(turns, start, end, threads):
     args, filters = [], []
+    start_sample, end_sample = samples_at(start), samples_at(end)
     for index, turn in enumerate(turns):
-        trim = (max(start - turn.start, 0), min(end, turn.end) - turn.start)
-        delay = max(turn.start - start, 0) * (RATE // 1000)
+        turn_start, turn_end = samples_at(turn.start), samples_at(turn.end)
+        first, last = max(start_sample - turn_start, 0), min(end_sample, turn_end) - turn_start
+        delay = max(turn_start - start_sample, 0)
         args += ["-threads", threads, "-protocol_whitelist", "file", "-f", "wav",
                  "-i", str(turn.path)]
-        first, last = (ms * (RATE // 1000) for ms in trim)
         filters.append(
             f"[{index}:a:0]aresample={RATE},aformat=channel_layouts=mono,"
             f"atrim=start_sample={first}:end_sample={last},asetpts=PTS-STARTPTS,"
             f"adelay={delay}S[turn{index}]"
         )
-    length = (end - start) * (RATE // 1000)
+    length = end_sample - start_sample
     if turns:
         labels = "".join(f"[turn{i}]" for i in range(len(turns)))
         mix = f"{labels}amix=inputs={len(turns)}:normalize=0,apad=whole_len={length}"
@@ -265,7 +276,11 @@ def drawtext(work, name, value, fontsize, shade, x, y, columns, enable="1"):
 
 def frame_at(milliseconds, fps):
     """First video frame at or after a timeline boundary."""
-    return (milliseconds * fps + 999) // 1000
+    return math.ceil(Fraction(milliseconds) * fps / 1000)
+
+
+def samples_at(milliseconds):
+    return round(milliseconds * (RATE // 1000))
 
 
 def active_windows(turns, start, end, fps):
@@ -285,38 +300,54 @@ def active_windows(turns, start, end, fps):
     return windows
 
 
-def boundary_pts(seconds, fps):
-    """Microsecond timestamp whose fps(round=up) output frame matches exact duration."""
+def boundary_pts(seconds, fps, tb):
+    """Timestamp whose fps(round=up) output frame matches the exact boundary."""
     if seconds < 0:
-        return math.floor(seconds * 1_000_000)
+        return math.floor(seconds * tb)
     frame = math.ceil(seconds * fps)
     if frame == 0:
         return 0
-    low = (frame - 1) * 1_000_000 // fps + 1
-    high = frame * 1_000_000 // fps
-    return min(max(round(seconds * 1_000_000), low), high)
+    ticks_per_frame = tb // fps
+    low = (frame - 1) * ticks_per_frame + 1
+    high = frame * ticks_per_frame
+    return min(max(round(seconds * tb), low), high)
 
 
-def video_graph(context, work, visual, inputs, turns, speakers, start, end, width, height, fps, badge):
+def video_graph(context, work, visual, inputs, turns, speakers, start, end, width, height, fps, badge,
+                *, input_limit=1000 * DEFAULT_INPUT_SECONDS):
     kind = visual.get("kind")
     args, sources, filters = [], [], []
     if kind == "shots":
         shots = checked(visual.get("shots"), list, "visual.shots")
         integer(len(shots), 1, MAX_SHOTS, "shot count")
-        # Place shots by exact media duration, choosing microsecond PTS that preserve
-        # the exact output-frame boundary under fps(..., round=up).
-        boundary = Fraction(-start, 1000)
-        for index, shot in enumerate(shots):
+        limit = Fraction(input_limit, 1000)
+        durations = []
+        total = Fraction(0)
+        for shot in shots:
             shot = checked(shot, dict, "shot")
             path = input_file(inputs, shot.get("shot_sha256"), "shot_sha256")
-            timestamp = boundary_pts(boundary, fps)
-            boundary += shot_duration(context, path)
-            end_timestamp = boundary_pts(boundary, fps)
+            duration = shot_duration(context, path)
+            if duration > limit:
+                raise invalid("shot duration exceeds maxInputSeconds")
+            total += duration
+            if total > limit:
+                raise invalid("total shot duration exceeds maxInputSeconds")
+            durations.append((path, duration))
+
+        tb = math.lcm(1_000_000, fps)
+        # interleave converts PTS to microseconds. Stretch them so each tick
+        # becomes one microsecond there, then undo the stretch before fps.
+        stretch = tb // 1_000_000
+        boundary = Fraction(-start, 1000)
+        for index, (path, duration) in enumerate(durations):
+            timestamp = boundary_pts(boundary, fps, tb)
+            boundary += duration
+            end_timestamp = boundary_pts(boundary, fps, tb)
             args += ["-threads", "1", "-protocol_whitelist", "file", "-f", "mov",
                      "-i", str(path)]
             sources.append(
-                f"[{len(turns) + index}:v:0]settb=AVTB,setpts=PTS-STARTPTS{timestamp:+d},"
-                f"trim=end_pts={end_timestamp},"
+                f"[{len(turns) + index}:v:0]setpts=PTS-STARTPTS,settb=1/{tb},"
+                f"setpts=PTS{timestamp:+d},trim=end_pts={end_timestamp},setpts=PTS*{stretch},"
                 f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
                 f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',setsar=1,"
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
@@ -324,12 +355,13 @@ def video_graph(context, work, visual, inputs, turns, speakers, start, end, widt
             )
         labels = "".join(f"[shot{i}]" for i in range(len(shots)))
         # A frame at the exclusive end makes fps hold the last shot. The final trim drops it.
+        pad = boundary_pts(Fraction(end - start, 1000), fps, tb)
         sources.append(
             f"color=black:s={width}x{height}:r=1:d=1,format=yuv420p,"
-            f"settb=AVTB,setpts=PTS+{(end - start) * 1000}[pad]"
+            f"settb=1/{tb},setpts=(PTS+{pad})*{stretch}[pad]"
         )
         filters.append(f"{labels}[pad]interleave=nb_inputs={len(shots) + 1},"
-                       f"fps={fps}:start_time=0:round=up")
+                       f"settb=1/{tb},setpts=PTS/{stretch},fps={fps}:start_time=0:round=up")
     elif kind in ("plain", "tiles"):
         base = color(visual.get("color"), "visual.color") if kind == "plain" else "0x15191f"
         filters.append(f"color=c={base}:s={width}x{height}:r={fps}")
@@ -392,8 +424,11 @@ def assemble(context):
     fps = integer(params.get("fps", 30), 1, 60, "fps")
     badge = text(params.get("badge"), "badge", 48)
     threads = str(integer(context.envelope.cpu_threads, 1, 64, "cpuThreads"))
-    limits = context.profile.get("limits") or {}
-    input_limit = 1000 * integer(limits.get("maxInputSeconds", 600), 1, 3600, "maxInputSeconds")
+    limits = context.profile.get("limits")
+    limits = {} if limits is None else checked(limits, dict, "profile.limits")
+    input_limit = 1000 * integer(
+        limits.get("maxInputSeconds", DEFAULT_INPUT_SECONDS), 1, 3600, "maxInputSeconds",
+    )
     output_limit = 1000 * integer(
         limits.get("maxOutputSeconds", 120), 1, 600, "maxOutputSeconds",
     )
@@ -413,8 +448,11 @@ def assemble(context):
     timeline_end = max(turn.end for turn in turns)
     cut = checked(manifest.get("cut", {}), dict, "cut")
     start = integer(cut.get("start_ms", 0), 0, timeline_end - 1, "cut.start_ms")
-    end = integer(cut.get("end_ms", timeline_end), start + 1, timeline_end, "cut.end_ms")
-    integer(end - start, 1, output_limit, "output duration in milliseconds")
+    end = timeline_end
+    if "end_ms" in cut:
+        end = integer(cut["end_ms"], start + 1, timeline_end, "cut.end_ms")
+    if not 1 <= end - start <= output_limit:
+        raise invalid(f"output duration in milliseconds must be between 1 and {output_limit}")
     turns = [turn for turn in turns if turn.start < end and turn.end > start]
     visual = checked(manifest.get("visual"), dict, "visual")
     args, dialogue = dialogue_graph(turns, start, end, threads)
@@ -425,7 +463,7 @@ def assemble(context):
         (work / "font.ttf").write_bytes(caption_font())
         video_args, video = video_graph(
             context, work, visual, inputs["shot"], turns, speakers, start, end, width, height,
-            fps, badge,
+            fps, badge, input_limit=input_limit,
         )
         _, stderr = command(context, ffmpeg + args + [
             "-filter_complex", f"{dialogue},{LOUDNORM}:print_format=json[a]",
@@ -434,10 +472,15 @@ def assemble(context):
         values = measure(stderr)
         normalization = ""
         if turns and all(map(math.isfinite, values)):
-            keys = ("measured_I", "measured_TP", "measured_LRA", "measured_thresh", "offset")
-            measured = ":".join(f"{key}={value}" for key, value in zip(keys, values))
-            normalization = f",{LOUDNORM}:{measured}:linear=true"
-        length = (end - start) * (RATE // 1000)
+            normalization = f",{LOUDNORM}"
+            options = (
+                ("measured_I", -99, 0), ("measured_TP", -99, 99), ("measured_LRA", 0, 99),
+                ("measured_thresh", -99, 0), ("offset", -99, 99),
+            )
+            if all(lo <= value <= hi for (_, lo, hi), value in zip(options, values)):
+                measured = ":".join(f"{key}={value}" for (key, _, _), value in zip(options, values))
+                normalization += f":{measured}:linear=true"
+        length = samples_at(end) - samples_at(start)
         audio = (
             f"{dialogue}{normalization},aresample={RATE}[dialogue];"
             f"anoisesrc=color=pink:amplitude=0.003162:sample_rate={RATE}:seed=42,"

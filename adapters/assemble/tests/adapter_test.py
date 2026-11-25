@@ -1,0 +1,184 @@
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class QuietHandler(SimpleHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+
+class AssembleTest(unittest.TestCase):
+    def test_worker_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with ThreadingHTTPServer(
+                ("127.0.0.1", 0), partial(QuietHandler, directory=directory)
+            ) as hub:
+                thread = threading.Thread(target=hub.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    self.round_trip(root, hub.server_address[1])
+                finally:
+                    hub.shutdown()
+                    thread.join()
+
+    def round_trip(self, root, port):
+        def asset(name, role, mime, data):
+            path = root / "v1" / "assets" / name / "content"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            return {
+                "assetId": name, "role": role, "mime": mime,
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+
+        wavs = []
+        for frequency in (440, 550, 660):
+            wav = subprocess.check_output([
+                "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                f"sine=frequency={frequency}:sample_rate=48000:duration=1",
+                "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
+            ])
+            wavs.append(asset(f"input-{frequency}", "wav", "audio/wav", wav))
+
+        turns = [
+            {
+                "wav_sha256": wav["sha256"], "speaker_id": speaker, "caption": caption,
+                "offset_ms": offset,
+            }
+            for wav, speaker, caption, offset in zip(
+                wavs, ("spk_a", "spk_b", "spk_a"),
+                ("Open the window.", "It's 50% open.", "Close it later."), (0, -250, 150),
+            )
+        ]
+        speakers = {
+            "spk_a": {"label": "Speaker A", "color": "#ffd070"},
+            "spk_b": {"label": "Speaker B", "color": "#70e0ff"},
+        }
+        manifest = {
+            "turns": turns,
+            "cut": {"start_ms": 100, "end_ms": 2800},
+            "speakers": speakers,
+            "visual": {
+                "kind": "tiles",
+                "tiles": [{"speaker_id": key, **value} for key, value in speakers.items()],
+            },
+        }
+        token = root / "token"
+        token.write_text("test")
+
+        def submit(doc, name, inputs=None):
+            edit = asset("manifest", "manifest", "application/json", json.dumps(doc).encode())
+            stage = root / name
+            envelope = {
+                "protocolVersion": 2, "workload": "animation", "queue": "assemble",
+                "jobId": name, "leaseToken": "test", "attempt": 1, "inputFingerprint": "test",
+                "stagingDirectory": str(stage), "outputDirectory": str(stage / "out"),
+                "cancelPath": str(stage / "cancel"),
+                "payload": {
+                    "stage": "assemble", "operation": "assemble", "generationRequestId": "test",
+                    "hubUrl": f"http://127.0.0.1:{port}",
+                    "profile": json.loads((ROOT / "profile.example.json").read_text()),
+                    "inputs": [edit, *(wavs if inputs is None else inputs)],
+                    "params": {"width": 180, "height": 320, "badge": "AI-generated"},
+                },
+            }
+            return subprocess.run(
+                [sys.executable, str(ROOT / "adapter.py")],
+                input=json.dumps(envelope), text=True, capture_output=True, timeout=30, check=False,
+                env=dict(os.environ, INFERNIX_HUB_TOKEN_FILE=str(token),
+                         INFERNIX_ADAPTER_CACHE_DIR=str(root / "cache")),
+            )
+
+        def result(done):
+            self.assertEqual(done.returncode, 0, done.stderr)
+            return json.loads(done.stdout)
+
+        first = result(submit(manifest, "first"))
+        self.assertFalse(first["cacheHit"])
+        self.assertEqual(len(first["artifacts"]), 1)
+        output = root / "first" / first["artifacts"][0]["path"]
+        probe = json.loads(subprocess.check_output([
+            "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(output),
+        ]))
+        video, audio = probe["streams"]
+        self.assertEqual((video["width"], video["height"]), (180, 320))
+        self.assertEqual((video["codec_name"], video["pix_fmt"]), ("h264", "yuv420p"))
+        self.assertEqual(video["r_frame_rate"], "30/1")
+        self.assertEqual(audio["codec_name"], "aac")
+        self.assertAlmostEqual(float(probe["format"]["duration"]), 2.7, delta=0.04)
+        measurement = first["validation"]["loudness"]
+        decoded = subprocess.run([
+            "ffmpeg", "-nostats", "-i", str(output), "-map", "0:a:0",
+            "-af", "ebur128=framelog=verbose", "-f", "null", "-",
+        ], check=True, capture_output=True, text=True)
+        integrated = float(re.findall(r"I:\s+(-?\d+\.\d+)\s+LUFS", decoded.stderr)[-1])
+        self.assertAlmostEqual(integrated, -14, delta=1)
+        self.assertAlmostEqual(measurement["integratedLufs"], integrated, delta=0.15)
+        self.assertLessEqual(measurement["truePeakDbtp"], -1)
+        self.assertLess(output.read_bytes().index(b"moov"), output.read_bytes().index(b"mdat"))
+
+        def pixel(path, seconds, x, y):
+            return subprocess.check_output([
+                "ffmpeg", "-v", "error", "-ss", str(seconds), "-i", str(path), "-an",
+                "-vf", f"format=rgb24,crop=1:1:{x}:{y}", "-frames:v", "1", "-threads", "1",
+                "-f", "rawvideo", "pipe:1",
+            ])
+
+        # Inside the overlap, only the later speaker's tile has a white border.
+        self.assertGreater(min(pixel(output, 0.3, 12, 41)), 180)
+        self.assertLess(min(pixel(output, 0.8, 12, 41)), 180)
+        self.assertGreater(min(pixel(output, 0.8, 102, 41)), 180)
+
+        again = result(submit(manifest, "again", list(reversed(wavs))))
+        swapped = result(submit({**manifest, "turns": [turns[2], turns[1], turns[0]]}, "swapped"))
+        self.assertTrue(again["cacheHit"])
+        self.assertEqual(first["contentFingerprint"], again["contentFingerprint"])
+        self.assertEqual(first["validation"], again["validation"])
+        self.assertFalse(swapped["cacheHit"])
+        self.assertNotEqual(first["contentFingerprint"], swapped["contentFingerprint"])
+
+        unknown = {**turns[0], "wav_sha256": "0" * 64}
+        bad = submit({**manifest, "turns": [unknown]}, "bad")
+        self.assertEqual(bad.returncode, 14, bad.stderr)
+        self.assertIn("unknown wav_sha256", bad.stderr)
+
+        shots = []
+        for shade in ("red", "blue"):
+            path = root / "shot.mp4"
+            subprocess.run([
+                "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                f"color={shade}:s=96x64:r=30:d=0.6", "-c:v", "libx264", "-threads", "1",
+                "-metadata", "title=Input only", "-metadata:s:v", "handler_name=Input handler",
+                str(path),
+            ], check=True)
+            shots.append(asset(f"shot-{shade}", "shot", "video/mp4", path.read_bytes()))
+        visual = {"kind": "shots", "shots": [{"shot_sha256": shot["sha256"]} for shot in shots]}
+        rendered = result(submit({**manifest, "visual": visual}, "rendered", [*wavs, *shots]))
+        output = root / "rendered" / rendered["artifacts"][0]["path"]
+        red, _, blue = pixel(output, 0.2, 90, 160)
+        self.assertGreater(red, blue + 150)
+        red, _, blue = pixel(output, 2.6, 90, 160)
+        self.assertGreater(blue, red + 150)
+        data = output.read_bytes()
+        self.assertNotIn(b"Input only", data)
+        self.assertNotIn(b"Input handler", data)
+
+        gap = result(submit({
+            **manifest, "cut": {"start_ms": 1750, "end_ms": 1880},
+            "visual": {"kind": "plain", "color": "#252525"},
+        }, "gap"))
+        self.assertEqual(gap["validation"]["state"], "warn")
+        self.assertLess(gap["validation"]["loudness"]["truePeakDbtp"], -40)

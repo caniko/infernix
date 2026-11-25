@@ -1,0 +1,20 @@
+{
+  "id": "assemble-cpu",
+  "model": "ffmpeg",
+  "operation": "assemble",
+  "state": "implemented",
+  "blockedReason": null,
+  "checkpoint": null,
+  "helpers": [],
+  "backend": "cpu",
+  "device": "cpu:local",
+  "precision": "fp32",
+  "cpuPolicy": "permitted",
+  "cpuThreads": 4,
+  "peakVramGib": null,
+  "limits": {
+    "maxInputSeconds": 600,
+    "maxOutputSeconds": 120
+  },
+  "evidence": []
+}

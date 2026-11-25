@@ -1,19 +1,20 @@
-# Animation GPU adapters (G2)
+# Animation worker adapters (G2)
 
 Python adapters for the infernix animation worker. Each adapter reads one
-worker envelope v2 on stdin, does one GPU operation, and prints exactly one
+worker envelope v2 on stdin, does one operation, and prints exactly one
 result object on stdout. The contract is frozen in
 [`docs/src/planning/2026-11-13-animation-interfaces.md`](../../../canix/docs/src/planning/2026-11-13-animation-interfaces.md)
 (canix repo): sections 2 (envelope, exit codes), 4 (device gate and GPU guards),
 5 (model profile) and 6 (content fingerprint).
 
-No CPU inference. Every adapter asserts the GPU before it loads anything, holds
-the per-device gate for the job, and fails typed when the runtime does not match
-the profile.
+No CPU fallback for GPU inference. GPU adapters assert the GPU before loading,
+hold the per-device gate for the job, and return a typed error when the runtime
+does not match the profile.
 
 | Directory | Operation | Worker | State |
 | --- | --- | --- | --- |
 | `common/` | — (shared runtime) | both | tested |
+| `assemble/` | `assemble` | CPU | tested |
 | `qwen3-tts/` | `tts` | atlas (ROCm), murph (XPU) | hardware-tested (ROCm) |
 | `flux2-klein/` | `image` | atlas (ROCm) | hardware-tested |
 | `sam2/` | `mask` | atlas (ROCm), murph (XPU) | hardware-tested (ROCm) |
@@ -26,9 +27,10 @@ the profile.
 standalone local image runner, not a worker-envelope v2 adapter. It is not
 registered with the workload fabric.
 
-`profile.example.json` in each directory is a section-5 profile. The examples
-carry the pinned checkpoint revision and the measured or expected device. A
-resolved profile must also name the provisioned weights:
+`profile.example.json` describes the adapter's model and execution profile.
+For adapters that load weights, the examples carry the pinned checkpoint
+revision and the measured or expected device. A resolved profile must also
+name the provisioned weights:
 
 ```json
 "checkpoint": {
@@ -189,8 +191,8 @@ client, duplicated-descriptor dedupe, fd reuse by another client, regressing
 counters, engine capacity and overlapping engines, the final snapshot in
 `stop()`, and the allocator peak merge.
 
-Per-adapter suites (each needs that worker's venv: `numpy`, `torch`, `pillow`,
-and for TripoSG `trimesh`/`pymeshlab`):
+Per-adapter suites use the adapter's own environment. The `assemble` tests
+require FFmpeg and fontconfig; the GPU suites use their worker's model libraries:
 
 ```sh
 cd adapters/<adapter>
@@ -496,6 +498,47 @@ declared files are missing or differ fails closed with exit 14 and names the
 checkpoint rather than loading unverified weights.
 
 ### Per-adapter notes
+
+**assemble.** CPU-only FFmpeg edit assembly (`ffmpeg`, `ffprobe`, and
+`fc-match` with an installed sans-serif font; FFmpeg must include `drawtext`,
+`loudnorm`, `libx264`, and AAC). Run `uv sync --locked` in `adapters/assemble`
+and register the `assemble-cpu` profile on a worker, for example:
+
+```toml
+[[adapters]]
+workload = "animation"
+queues = ["assemble"]
+profiles = ["assemble-cpu"]
+artifacts = true
+command = "/path/to/venv/bin/python"
+args = ["/path/to/adapters/assemble/adapter.py"]
+```
+
+Submit with the `profile:assemble-cpu` requirement, `payload.operation` set to
+`assemble`, and [`profile.example.json`](assemble/profile.example.json) in
+`payload.profile`. In `payload.inputs`, declare the exact edit JSON bytes
+(`role: manifest`, `mime: application/json`), each WAV (`role: wav`), and any
+rendered MP4s (`role: shot`) by asset ID and SHA-256. Turn order lives in the
+manifest, not the envelope input list; swapping turns changes the manifest hash
+and therefore the cache key.
+
+- `turns` is an ordered array of `{wav_sha256, speaker_id, caption, offset_ms}`.
+  Each offset is relative to the previous turn's end; the first is relative
+  to timeline zero. Negative offsets mix the overlapping audio; the later active
+  turn wins the caption and highlight. `cut` optionally sets `start_ms` and/or
+  `end_ms` on the uncut timeline.
+- `speakers` maps IDs to `{label, color}`. `visual` is `{kind: "plain", color}`,
+  `{kind: "tiles", tiles: [{speaker_id, label, color}, ...]}` (one to four
+  tiles), or `{kind: "shots", shots: [{shot_sha256}, ...]}` (up to 16). Shots play in
+  order from timeline zero, ignore source audio, and hold the last frame if
+  shorter than the edit. Colors are `#rrggbb`.
+- `params.badge` is required; `width`, `height`, and `fps` default to
+  1080×1920 at 30 fps. Outputs one fast-start H.264/AAC MP4 with a generated
+  room-tone bed and two-pass loudness normalization. The decoded AAC
+  measurement is returned in `validation.loudness` (`integratedLufs` and
+  `truePeakDbtp`); unmeasurable results, results outside −14 ±1 LUFS, or peaks
+  above −1 dBTP warn. A cut with only room tone stays quiet rather than
+  boosting the noise to the speech target.
 
 **qwen3-tts.** `attn_implementation="sdpa"` is hard-coded (FlashAttention-2 is
 CUDA-only). `device_map` is the index `assert_gpu` selected (`cuda:<n>` on

@@ -51,7 +51,6 @@ def manifest_input(envelope):
             manifest = item
     if manifest is None or manifest.mime != "application/json":
         raise invalid("declare one application/json input with role 'manifest'")
-    return manifest
 
 
 @cache
@@ -71,15 +70,15 @@ def runtime_versions(envelope):
     if (envelope.operation != "assemble" or profile.get("backend") != "cpu"
             or profile.get("cpuPolicy") != "permitted"):
         raise invalid("assemble requires a CPU-permitted profile and operation 'assemble'")
-    manifest = manifest_input(envelope)
+    manifest_input(envelope)
     try:
         return {
             "ffmpeg": subprocess.check_output([FFMPEG, "-version"], text=True, timeout=10),
             "ffprobe": subprocess.check_output([FFPROBE, "-version"], text=True, timeout=10),
             "fontSha256": hashlib.sha256(caption_font()).hexdigest(),
             "adapterSha256": sha256_file(__file__),
-            # Also bind the role selection: the shared key deliberately sorts input hashes.
-            "manifestSha256": manifest.sha256,
+            # The shared input hashes are order-independent and do not include roles.
+            "inputRoles": sorted((item.role, item.sha256) for item in envelope.inputs),
         }
     except (OSError, subprocess.SubprocessError) as error:
         raise AdapterError(13, f"could not identify the media runtime: {error}") from error
@@ -193,7 +192,7 @@ def timeline(context, manifest, inputs, limit):
     return turns, speakers
 
 
-def audio_graph(turns, start, end, threads):
+def dialogue_graph(turns, start, end, threads):
     args, filters = [], []
     for index, turn in enumerate(turns):
         trim = (max(start - turn.start, 0), min(end, turn.end) - turn.start)
@@ -207,12 +206,12 @@ def audio_graph(turns, start, end, threads):
             f"adelay={delay}S[turn{index}]"
         )
     length = (end - start) * (RATE // 1000)
-    filters.append(
-        f"anoisesrc=color=pink:amplitude=0.003162:sample_rate={RATE}:seed=42,"
-        f"highpass=f=80,lowpass=f=2800,atrim=end_sample={length}[room]"
-    )
-    labels = "".join(f"[turn{i}]" for i in range(len(turns)))
-    filters.append(f"[room]{labels}amix=inputs={len(turns) + 1}:duration=first:normalize=0")
+    if turns:
+        labels = "".join(f"[turn{i}]" for i in range(len(turns)))
+        mix = f"{labels}amix=inputs={len(turns)}:normalize=0,apad=whole_len={length}"
+    else:
+        mix = f"anullsrc=r={RATE}:cl=mono"
+    filters.append(f"{mix},atrim=end_sample={length}")
     return args, ";".join(filters)
 
 
@@ -270,18 +269,22 @@ def video_graph(work, visual, inputs, turns, speakers, start, end, width, height
             args += ["-threads", "1", "-protocol_whitelist", "file", "-f", "mov",
                      "-i", str(path)]
             sources.append(
-                f"[{len(turns) + index}:v:0]setpts=PTS-STARTPTS,fps={fps},"
+                f"[{len(turns) + index}:v:0]setpts=PTS-STARTPTS,"
                 f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
                 f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',setsar=1,"
                 f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
                 f"format=yuv420p[shot{index}]"
             )
         labels = "".join(f"[shot{i}]" for i in range(len(shots)))
-        filters.append(
-            f"{labels}concat=n={len(shots)}:v=1:a=0,fps={fps},"
-            f"tpad=stop_mode=clone:stop_duration={end / 1000:.3f},"
-            f"trim=start={start / 1000:.3f},setpts=PTS-STARTPTS"
+        # Shift to the cut clock. Allow one microsecond of concat timestamp rounding.
+        sources.append(f"{labels}concat=n={len(shots)}:v=1:a=0,setpts=PTS-{start * 1000 + 1}[shots]")
+        # A frame at the exclusive end makes fps hold the last shot even for mixed
+        # source rates (where tpad has no input rate). The final trim drops this frame.
+        sources.append(
+            f"color=black:s={width}x{height}:r=1:d=1,format=yuv420p,"
+            f"settb=AVTB,setpts=PTS+{(end - start) * 1000}[pad]"
         )
+        filters.append(f"[shots][pad]interleave,fps={fps}:start_time=0:round=up")
     elif kind in ("plain", "tiles"):
         base = color(visual.get("color"), "visual.color") if kind == "plain" else "0x15191f"
         filters.append(f"color=c={base}:s={width}x{height}:r={fps}")
@@ -304,7 +307,8 @@ def video_graph(work, visual, inputs, turns, speakers, start, end, width, height
             w, h = width // 2 - 2 * margin, height // 3 - 2 * margin
             x, y = index % 2 * (width // 2) + margin, index // 2 * (height // 3) + height // 8
             box = f"drawbox=x={x}:y={y}:w={w}:h={h}"
-            filters.append(f"{box}:color={color(tile.get('color'), 'tile color')}:t=fill")
+            label, shade = speakers[speaker]
+            filters.append(f"{box}:color={shade}:t=fill")
             active = [expr for i, spans in windows.items() if turns[i].speaker == speaker
                       for expr in spans]
             if active:
@@ -312,7 +316,7 @@ def video_graph(work, visual, inputs, turns, speakers, start, end, width, height
                     f"{box}:color=white:t={max(2, margin // 4)}:enable='{'+'.join(active)}'"
                 )
             filters.append(drawtext(
-                work, f"tile-{index}.txt", text(tile.get("label"), "tile label", 48),
+                work, f"tile-{index}.txt", label,
                 fontsize, "white", x + margin, y + margin, max(8, w // fontsize),
             ))
         if {turn.speaker for turn in turns} - seen:
@@ -356,8 +360,11 @@ def assemble(context):
         manifest = checked(json.loads(raw), dict, "manifest")
     except (ValueError, RecursionError) as error:
         raise invalid("manifest must be valid JSON") from error
-    inputs = {item.sha256: path for item, path in context.inputs if item.role != "manifest"}
-    turns, speakers = timeline(context, manifest, inputs, input_limit)
+    inputs = defaultdict(dict)
+    for item, path in context.inputs:
+        if item.role != "manifest":
+            inputs[item.role][item.sha256] = path
+    turns, speakers = timeline(context, manifest, inputs["wav"], input_limit)
     timeline_end = max(turn.end for turn in turns)
     cut = checked(manifest.get("cut", {}), dict, "cut")
     start = integer(cut.get("start_ms", 0), 0, timeline_end - 1, "cut.start_ms")
@@ -365,17 +372,17 @@ def assemble(context):
     integer(end - start, 1, output_limit, "output duration in milliseconds")
     turns = [turn for turn in turns if turn.start < end and turn.end > start]
     visual = checked(manifest.get("visual"), dict, "visual")
-    args, audio = audio_graph(turns, start, end, threads)
+    args, dialogue = dialogue_graph(turns, start, end, threads)
     ffmpeg = [FFMPEG, "-nostdin", "-hide_banner", "-nostats", "-filter_threads", threads,
               "-filter_complex_threads", threads]
     with tempfile.TemporaryDirectory(prefix="assemble-", dir=context.staging_directory) as tmp:
         work = Path(tmp)
         (work / "font.ttf").write_bytes(caption_font())
         video_args, video = video_graph(
-            work, visual, inputs, turns, speakers, start, end, width, height, fps, badge,
+            work, visual, inputs["shot"], turns, speakers, start, end, width, height, fps, badge,
         )
         _, stderr = command(context, ffmpeg + args + [
-            "-filter_complex", f"{audio},{LOUDNORM}:print_format=json[a]",
+            "-filter_complex", f"{dialogue},{LOUDNORM}:print_format=json[a]",
             "-map", "[a]", "-f", "null", "-",
         ])
         values = measure(stderr)
@@ -384,13 +391,21 @@ def assemble(context):
             keys = ("measured_I", "measured_TP", "measured_LRA", "measured_thresh", "offset")
             measured = ":".join(f"{key}={value}" for key, value in zip(keys, values))
             normalization = f",{LOUDNORM}:{measured}:linear=true"
-        # A gap-only or unmeasurably short cut must not amplify the room tone.
+        length = (end - start) * (RATE // 1000)
+        audio = (
+            f"{dialogue}{normalization},aresample={RATE}[dialogue];"
+            f"anoisesrc=color=pink:amplitude=0.003162:sample_rate={RATE}:seed=42,"
+            f"highpass=f=80,lowpass=f=2800,atrim=end_sample={length}[room];"
+            "[room][dialogue]amix=inputs=2:duration=first:normalize=0"
+        )
         output = work / "assembled.mp4"
         command(context, ffmpeg + args + video_args + [
-            "-filter_complex", f"{audio}{normalization},aresample={RATE}[a];{video}[v]",
+            "-filter_complex", f"{audio}[a];{video}[v]",
             "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264", "-threads:v", threads, "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-empty_hdlr_name", "1",
+            "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
+            "-metadata:s:v", "encoder=",
             "-map_metadata", "-1", "-map_metadata:s", "-1", "-map_chapters", "-1", str(output),
         ], cwd=work)
         _, stderr = command(context, ffmpeg + [

@@ -73,13 +73,13 @@ class AssembleTest(unittest.TestCase):
             "speakers": speakers,
             "visual": {
                 "kind": "tiles",
-                "tiles": [{"speaker_id": key, **value} for key, value in speakers.items()],
+                "tiles": [{"speaker_id": key} for key in speakers],
             },
         }
         token = root / "token"
         token.write_text("test")
 
-        def submit(doc, name, inputs=None):
+        def submit(doc, name, inputs=None, *, fps=30):
             edit = asset("manifest", "manifest", "application/json", json.dumps(doc).encode())
             stage = root / name
             envelope = {
@@ -92,7 +92,7 @@ class AssembleTest(unittest.TestCase):
                     "hubUrl": f"http://127.0.0.1:{port}",
                     "profile": json.loads((ROOT / "profile.example.json").read_text()),
                     "inputs": [edit, *(wavs if inputs is None else inputs)],
-                    "params": {"width": 180, "height": 320, "badge": "AI-generated"},
+                    "params": {"width": 180, "height": 320, "badge": "AI-generated", "fps": fps},
                 },
             }
             return subprocess.run(
@@ -150,22 +150,31 @@ class AssembleTest(unittest.TestCase):
         self.assertFalse(swapped["cacheHit"])
         self.assertNotEqual(first["contentFingerprint"], swapped["contentFingerprint"])
 
+        # Same digests and manifest, different roles: the cache must not mask an invalid edit.
+        bad_role = submit(manifest, "bad-role", [{**wavs[0], "role": "shot"}, *wavs[1:]])
+        self.assertEqual(bad_role.returncode, 14, bad_role.stderr)
+        self.assertIn("unknown wav_sha256", bad_role.stderr)
+
         unknown = {**turns[0], "wav_sha256": "0" * 64}
         bad = submit({**manifest, "turns": [unknown]}, "bad")
         self.assertEqual(bad.returncode, 14, bad.stderr)
         self.assertIn("unknown wav_sha256", bad.stderr)
 
-        shots = []
-        for shade in ("red", "blue"):
+        def shot(shade, rate, duration):
             path = root / "shot.mp4"
             subprocess.run([
                 "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
-                f"color={shade}:s=96x64:r=30:d=0.6", "-c:v", "libx264", "-threads", "1",
+                f"color={shade}:s=96x64:r={rate}:d={duration}", "-c:v", "libx264", "-threads", "1",
                 "-metadata", "title=Input only", "-metadata:s:v", "handler_name=Input handler",
                 str(path),
             ], check=True)
-            shots.append(asset(f"shot-{shade}", "shot", "video/mp4", path.read_bytes()))
-        visual = {"kind": "shots", "shots": [{"shot_sha256": shot["sha256"]} for shot in shots]}
+            return asset(f"shot-{shade}", "shot", "video/mp4", path.read_bytes())
+
+        def shots_visual(shots):
+            return {"kind": "shots", "shots": [{"shot_sha256": s["sha256"]} for s in shots]}
+
+        shots = [shot("red", 30, 0.6), shot("blue", 25, 0.6)]
+        visual = shots_visual(shots)
         rendered = result(submit({**manifest, "visual": visual}, "rendered", [*wavs, *shots]))
         output = root / "rendered" / rendered["artifacts"][0]["path"]
         red, _, blue = pixel(output, 0.2, 90, 160)
@@ -175,6 +184,33 @@ class AssembleTest(unittest.TestCase):
         data = output.read_bytes()
         self.assertNotIn(b"Input only", data)
         self.assertNotIn(b"Input handler", data)
+        probe = json.loads(subprocess.check_output([
+            "ffprobe", "-v", "error", "-show_streams", "-show_format", "-show_chapters",
+            "-of", "json", str(output),
+        ]))
+        for section in [probe["format"], *probe["streams"]]:
+            self.assertFalse({"encoder", "handler_name"} & section.get("tags", {}).keys())
+        self.assertEqual(probe["chapters"], [])
+
+        cut = result(submit({
+            **manifest, "visual": visual, "cut": {"start_ms": 591, "end_ms": 1201},
+        }, "cut", [*wavs, *shots]))
+        output = root / "cut" / cut["artifacts"][0]["path"]
+        red, _, blue = pixel(output, 0, 90, 160)
+        self.assertGreater(red, blue + 150)
+        red, _, blue = pixel(output, 0.03, 90, 160)
+        self.assertGreater(blue, red + 150)
+
+        # Both shots are shorter than a single output frame at 1 fps.
+        shots = [shot("red", 30, 0.2), shot("blue", 25, 0.2)]
+        short = result(submit(
+            {**manifest, "visual": shots_visual(shots)}, "short", [*wavs, *shots], fps=1,
+        ))
+        output = root / "short" / short["artifacts"][0]["path"]
+        red, _, blue = pixel(output, 0, 90, 160)
+        self.assertGreater(red, blue + 150)
+        red, _, blue = pixel(output, 1, 90, 160)
+        self.assertGreater(blue, red + 150)
 
         gap = result(submit({
             **manifest, "cut": {"start_ms": 1750, "end_ms": 1880},
@@ -182,3 +218,14 @@ class AssembleTest(unittest.TestCase):
         }, "gap"))
         self.assertEqual(gap["validation"]["state"], "warn")
         self.assertLess(gap["validation"]["loudness"]["truePeakDbtp"], -40)
+
+        silent_wav = asset("silence", "wav", "audio/wav", subprocess.check_output([
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=2",
+            "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
+        ]))
+        silent = result(submit({
+            **manifest, "cut": {},
+            "turns": [{**turns[0], "wav_sha256": silent_wav["sha256"]}],
+        }, "silence", [silent_wav]))
+        self.assertEqual(silent["validation"]["state"], "warn")
+        self.assertLess(silent["validation"]["loudness"]["truePeakDbtp"], -40)

@@ -499,9 +499,10 @@ checkpoint rather than loading unverified weights.
 
 ### Per-adapter notes
 
-**assemble.** CPU-only FFmpeg edit assembly (`ffmpeg`, `ffprobe`, and
+**assemble.** CPU-only edit assembly (FFmpeg 8 or later, `ffprobe`, and
 `fc-match` with an installed sans-serif font; FFmpeg must include `drawtext`,
-`loudnorm`, `libx264`, and AAC). Run `uv sync --locked` in `adapters/assemble`
+`loudnorm`, `libx264`, AAC, and the MP4 muxer's `empty_hdlr_name` option).
+Run `uv sync --locked` in `adapters/assemble`
 and register the `assemble-cpu` profile on a worker, for example:
 
 ```toml
@@ -528,13 +529,14 @@ and therefore the cache key.
   turn wins the caption and highlight. `cut` optionally sets `start_ms` and/or
   `end_ms` on the uncut timeline.
 - `speakers` maps IDs to `{label, color}`. `visual` is `{kind: "plain", color}`,
-  `{kind: "tiles", tiles: [{speaker_id, label, color}, ...]}` (one to four
-  tiles), or `{kind: "shots", shots: [{shot_sha256}, ...]}` (up to 16). Shots play in
+  `{kind: "tiles", tiles: [{speaker_id}, ...]}` (one to four tiles, using the
+  labels and colors from `speakers`), or `{kind: "shots", shots: [{shot_sha256}, ...]}`
+  (up to 16). Shots play in
   order from timeline zero, ignore source audio, and hold the last frame if
   shorter than the edit. Colors are `#rrggbb`.
 - `params.badge` is required; `width`, `height`, and `fps` default to
   1080×1920 at 30 fps. Outputs one fast-start H.264/AAC MP4 with a generated
-  room-tone bed and two-pass loudness normalization. The decoded AAC
+  room-tone bed added after two-pass dialogue loudness normalization. The decoded AAC
   measurement is returned in `validation.loudness` (`integratedLufs` and
   `truePeakDbtp`); unmeasurable results, results outside −14 ±1 LUFS, or peaks
   above −1 dBTP warn. A cut with only room tone stays quiet rather than

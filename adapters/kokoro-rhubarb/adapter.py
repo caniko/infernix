@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import wave
+from contextlib import nullcontext
 from itertools import pairwise
 from pathlib import Path
 
@@ -49,11 +50,19 @@ def synthesize(context, text):
     model = model.to(adapter.device_string()).eval()
     adapter.assert_on_gpu(model, label="kokoro")
     pipe = KPipeline(lang_code=lang_code, model=model)
+    # On ROCm, MIOpen's RNN path invokes HIPRTC on MIOpenDropoutHIP.cpp, which
+    # requires system rocrand/C++ headers absent in hermetic environments;
+    # disabling cuDNN/MIOpen routes LSTM ops through PyTorch's native HIP kernels.
+    torch_mod = sys.modules.get("torch")
+    hip = getattr(getattr(torch_mod, "version", None), "hip", None)
+    cudnn = getattr(getattr(torch_mod, "backends", None), "cudnn", None)
+    rnn_context = cudnn.flags(enabled=False) if hip and cudnn is not None else nullcontext()
     result = []
-    for segment in pipe(text, voice=voice_path):
-        context.check_cancel()
-        if segment.audio is not None:
-            result.extend(segment.audio.tolist())
+    with rnn_context:
+        for segment in pipe(text, voice=voice_path):
+            context.check_cancel()
+            if segment.audio is not None:
+                result.extend(segment.audio.tolist())
     return result
 
 

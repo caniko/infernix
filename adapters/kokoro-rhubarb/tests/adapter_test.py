@@ -77,16 +77,32 @@ class AdapterTests(unittest.TestCase):
         context.profile["checkpoint"]["files"] = files
         return context
 
-    def assert_tts_voice(self, expected_voice, lang_code, **params):
+    def assert_tts_voice(self, expected_voice, lang_code, *, hip=None, **params):
         context = self.tts_context(**params)
         spacy = types.SimpleNamespace(util=types.SimpleNamespace(is_package=lambda _: True))
+        entered = []
+
+        class Flags:
+            def __init__(self, enabled):
+                self.enabled = enabled
+
+            def __enter__(self):
+                entered.append(("enter", self.enabled))
+
+            def __exit__(self, *_):
+                entered.append(("exit", self.enabled))
+
+        torch_mod = types.SimpleNamespace(
+            version=types.SimpleNamespace(hip=hip),
+            backends=types.SimpleNamespace(cudnn=types.SimpleNamespace(flags=lambda enabled: Flags(enabled))),
+        )
         model = Mock()
         pipe = Mock(return_value=[types.SimpleNamespace(audio=Mock(tolist=lambda: [0.25]))])
         kokoro = types.SimpleNamespace(
             KModel=Mock(return_value=model), KPipeline=Mock(return_value=pipe)
         )
         with (
-            patch.dict(sys.modules, {"spacy": spacy, "kokoro": kokoro}),
+            patch.dict(sys.modules, {"spacy": spacy, "torch": torch_mod, "kokoro": kokoro}),
             patch.object(adapter.adapter, "device_string", return_value="cuda:0"),
             patch.object(adapter.adapter, "assert_on_gpu"),
         ):
@@ -97,12 +113,19 @@ class AdapterTests(unittest.TestCase):
         pipe.assert_called_once_with(
             context.params["text"], voice=str(self.root / "voices" / f"{expected_voice}.pt")
         )
+        return entered
 
     def test_tts_defaults_to_af_bella(self):
-        self.assert_tts_voice("af_bella", "a")
+        self.assertEqual(self.assert_tts_voice("af_bella", "a"), [])
 
     def test_tts_uses_declared_british_voice(self):
-        self.assert_tts_voice("bf_sample", "b", voice="bf_sample")
+        self.assertEqual(self.assert_tts_voice("bf_sample", "b", voice="bf_sample"), [])
+
+    def test_tts_disables_miopen_on_rocm(self):
+        self.assertEqual(
+            self.assert_tts_voice("bf_sample", "b", hip="7.2", voice="bf_sample"),
+            [("enter", False), ("exit", False)],
+        )
 
     def test_tts_rejects_invalid_voices_before_model_load(self):
         context = self.tts_context()

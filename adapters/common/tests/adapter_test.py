@@ -1615,6 +1615,52 @@ class HubTests(Harness):
         self.assertEqual(self.execute(lambda ctx: [], document), 14)
 
 
+class UnloadStub(BaseHTTPRequestHandler):
+    methods = ()
+    get_status = 200
+    post_status = 200
+
+    def do_GET(self):  # noqa: N802 - http.server API
+        type(self).methods = (*type(self).methods, ("GET", self.path))
+        self.send_response(self.get_status)
+        self.end_headers()
+
+    def do_POST(self):  # noqa: N802 - http.server API
+        type(self).methods = (*type(self).methods, ("POST", self.path))
+        self.send_response(self.post_status)
+        self.end_headers()
+
+    def log_message(self, *args):
+        return
+
+
+class UnloadTenantsTests(unittest.TestCase):
+    def setUp(self):
+        UnloadStub.methods = ()
+        UnloadStub.get_status = 200
+        UnloadStub.post_status = 200
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), UnloadStub)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def test_uses_get_unload(self):
+        gpu.unload_tenants({"tenants": {"llamaSwapUrl": self.url}})
+        self.assertEqual(UnloadStub.methods, (("GET", "/unload"),))
+
+    def test_falls_back_to_post_only_on_405(self):
+        UnloadStub.get_status = 405
+        gpu.unload_tenants({"tenants": {"llamaSwapUrl": f"{self.url}/"}})
+        self.assertEqual(UnloadStub.methods, (("GET", "/unload"), ("POST", "/unload")))
+
+    def test_does_not_retry_post_on_other_http_errors(self):
+        UnloadStub.get_status = 500
+        gpu.unload_tenants({"tenants": {"llamaSwapUrl": self.url}})
+        self.assertEqual(UnloadStub.methods, (("GET", "/unload"),))
+
+
 class FakeTensor:
     def __init__(self, device, index=None):
         self.device = types.SimpleNamespace(type=device, index=index)

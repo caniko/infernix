@@ -8,6 +8,7 @@ import fcntl
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
@@ -151,9 +152,21 @@ def unload_tenants(profile):
     url = ((profile.get("tenants") or {}).get("llamaSwapUrl") or "").rstrip("/")
     if not url:
         return
-    request = urllib.request.Request(f"{url}/unload", method="POST", data=b"")
+    # llama-swap serves GET /unload (POST returns 405); fall back to POST only on 405.
     try:
-        urllib.request.urlopen(request, timeout=5).read()
+        urllib.request.urlopen(
+            urllib.request.Request(f"{url}/unload", method="GET"), timeout=5
+        ).read()
+    except urllib.error.HTTPError as error:
+        if error.code != 405:
+            return
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"{url}/unload", method="POST", data=b""),
+                timeout=5,
+            ).read()
+        except Exception:
+            return
     except Exception:
         return
 

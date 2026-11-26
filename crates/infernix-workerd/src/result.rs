@@ -311,7 +311,7 @@ fn check_telemetry(telemetry: &Value) -> std::result::Result<(), ValidationError
         return Err(ValidationError::InvalidTelemetry);
     }
     match object.get("backend").and_then(Value::as_str) {
-        Some("rocm" | "cuda") => {}
+        Some("rocm" | "cuda" | "cpu") => {}
         _ => return Err(ValidationError::InvalidTelemetry),
     }
     Ok(())
@@ -533,6 +533,33 @@ mod tests {
         let validated = validate_result(document.to_string().as_bytes(), &staging).unwrap();
         assert_eq!(validated.artifacts.len(), 1);
         assert_eq!(validated.value["extra"], true);
+    }
+
+    #[test]
+    fn accepts_assemble_cpu_result() {
+        let (staging, mut document) = staging_fixture();
+        std::fs::write(staging.join("out/assembled.mp4"), b"video").unwrap();
+        document["artifacts"][0] = json!({
+            "source": "video",
+            "path": "out/assembled.mp4",
+            "sha256": sha256_bytes(b"video"),
+            "mime": "video/mp4",
+            "size": 5
+        });
+        document["telemetry"] = json!({
+            "peakVramBytes": 0,
+            "gpuSeconds": 0.0,
+            "cpuSeconds": 0.5,
+            "peakRssBytes": 1024,
+            "maxTempC": null,
+            "maxPowerW": null,
+            "device": "cpu:local",
+            "backend": "cpu"
+        });
+        document["validation"]["loudness"] = json!({"integratedLufs": -14.0, "truePeakDbtp": -1.2});
+        let validated = validate_result(document.to_string().as_bytes(), &staging).unwrap();
+        assert_eq!(validated.artifacts[0].source, "video");
+        assert_eq!(retained_artifacts(&document, &staging).unwrap().len(), 1);
     }
 
     #[test]

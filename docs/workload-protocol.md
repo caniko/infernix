@@ -127,13 +127,16 @@ and `validation` (`state` one of `ok|warn|fail`, `findings` array) are
 required; extra keys are tolerated. `telemetry` must carry `peakVramBytes`
 (u64), `gpuSeconds` (number ≥ 0), `cpuSeconds` (number ≥ 0), `peakRssBytes`
 (u64), `maxTempC` (number or null), `maxPowerW` (number or null), `device`
-(non-empty string) and `backend` (`rocm` or `cuda`). The worker rejects a result
-that is missing a field, has the wrong type, whose artifact is missing, is a
-symlink, escapes staging, or mismatches its declared size or sha256, and fails
-the job with `invalid_result:<code>`.
+(non-empty string) and `backend` (`rocm`, `cuda`, or `cpu`). The worker rejects
+a result that is missing a field, has the wrong type, whose artifact is missing,
+is a symlink, escapes staging, or mismatches its declared size or sha256, and
+fails the job with `invalid_result:<code>`.
 
 `telemetry` is stored verbatim in the job result, so the hub reads resource
 numbers from the ledger manifest and not from worker logs.
+The shared Python runtime counts user and system CPU time during the run for
+the adapter and its reaped subprocesses. Its `peakRssBytes` is the largest
+per-process resident-memory peak, not the combined memory of the process tree.
 
 ## Exit codes
 

@@ -1,6 +1,6 @@
 """GPU telemetry sampler: peak VRAM, power, temperature, busy seconds."""
 
-import os
+import resource
 import subprocess
 import threading
 import time
@@ -291,16 +291,14 @@ class Sampler:
 
 
 def cpu_seconds():
-    """User + system CPU seconds consumed by this process."""
-    usage = os.times()
-    return round(usage.user + usage.system, 3)
+    """Cumulative user and system CPU seconds for this process and reaped children."""
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return own.ru_utime + own.ru_stime + children.ru_utime + children.ru_stime
 
 
 def peak_rss_bytes():
-    try:
-        for line in Path("/proc/self/status").read_text().splitlines():
-            if line.startswith("VmHWM:"):
-                return int(line.split()[1]) * 1024
-    except OSError:
-        pass
-    return 0
+    """Largest process high-water mark, not the sum of concurrent RSS."""
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return max(own.ru_maxrss, children.ru_maxrss) * 1024  # Linux reports KiB.

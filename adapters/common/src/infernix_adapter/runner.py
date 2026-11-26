@@ -15,9 +15,9 @@ from . import cache, gpu, hub, result, telemetry
 from .cancel import CancelWatcher
 from .envelope import parse
 from .exits import (
-    AdapterError,
     ERROR,
     OOM,
+    AdapterError,
 )
 from .fingerprint import content_fingerprint
 from .result import collect
@@ -201,6 +201,7 @@ def run(
     sampler = None
     reserved = None
     try:
+        cpu_start = telemetry.cpu_seconds()
         reserved = _ReservedStdout()
         envelope = parse(stdin.read())
         use_cache = use_cache(envelope) if callable(use_cache) else use_cache
@@ -242,7 +243,7 @@ def run(
                     artifacts,
                     fingerprint,
                     True,
-                    _telemetry(envelope, sampler=None),
+                    _telemetry(envelope, None, cpu_start),
                     cache.stored_validation(manifest),
                 )
                 result.emit(document, stream=reserved.restore())
@@ -273,7 +274,7 @@ def run(
             [item for item in (_artifact_record(a) for a in artifacts)],
             fingerprint,
             False,
-            _telemetry(envelope, sampler),
+            _telemetry(envelope, sampler, cpu_start),
             context.validation,
         )
         result.emit(document, stream=reserved.restore())
@@ -281,7 +282,7 @@ def run(
     except AdapterError as error:
         _report(error)
         return error.code
-    except BaseException as error:  # noqa: BLE001 - mapped to a typed exit
+    except BaseException as error:
         if error.__class__.__name__ in ("SystemExit", "KeyboardInterrupt"):
             raise
         if isinstance(error, GeneratorExit):
@@ -338,12 +339,12 @@ class _sampler:
         return False
 
 
-def _telemetry(envelope, sampler):
+def _telemetry(envelope, sampler, cpu_start):
     summary = sampler.summary() if sampler is not None else {}
     return {
         "peakVramBytes": summary.get("peakVramBytes", 0),
         "gpuSeconds": summary.get("gpuSeconds", 0.0),
-        "cpuSeconds": telemetry.cpu_seconds(),
+        "cpuSeconds": round(telemetry.cpu_seconds() - cpu_start, 3),
         "peakRssBytes": telemetry.peak_rss_bytes(),
         "maxTempC": summary.get("maxTempC", 0),
         "maxPowerW": summary.get("maxPowerW", 0),

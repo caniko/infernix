@@ -144,6 +144,12 @@
         extraCheckInputs = [pkgs.python3];
       };
 
+    mkGpuAdmissionPackageWithCrane = pkgs:
+      mkCargoPackageWithCrane {
+        inherit pkgs;
+        packageName = "infernix-gpu-admission";
+      };
+
     mkLbPackage = system:
       mkLbPackageWithCrane (import nixpkgs {
         inherit system;
@@ -161,10 +167,18 @@
         inherit system;
         overlays = [rust-overlay.overlays.default];
       });
+
+    mkGpuAdmissionPackage = system:
+      mkGpuAdmissionPackageWithCrane (import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      });
   in {
     lib = {
       modelLocks = true;
       inherit mkLbPackageForPkgs;
+      mkComfyuiMemoryGuard = import ./lib/comfyui-memory-guard.nix;
+      animationPrefetchScript = ./lib/animation-prefetch.sh;
       modelCatalog = import ./lib/model-catalog.nix {inherit (nixpkgs) lib;};
       colibriPackaging = import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;};
       openpencilSupport = true;
@@ -269,6 +283,7 @@
       infernix-lb = mkLbPackage system;
       infernix-workerd = mkWorkerdPackage system;
       infernix-image-run = mkImageRunPackage system;
+      infernix-gpu-admission = mkGpuAdmissionPackage system;
       visualRubricPackage =
         if
           builtins.hasAttr "packages" visual-rubric
@@ -288,13 +303,14 @@
         else null;
     in
       {
-        inherit infernix-image-run infernix-lb infernix-workerd;
+        inherit infernix-gpu-admission infernix-image-run infernix-lb infernix-workerd;
         # TODO(animation G2): package the Python adapters while G2 owns
         # `adapters/**`. Each adapter becomes one package here and one entry in
         # the workload-fabric `adapters` option; do not guess their layout.
         codex-acp = pkgs.callPackage ./packages/codex-acp.nix {};
         codex-provider = pkgs.callPackage ./packages/codex-provider.nix {};
         ponytail = pkgs.callPackage ./packages/ponytail.nix {};
+        rhubarb-lip-sync = pkgs.callPackage ./packages/rhubarb-lip-sync {};
         model-fetch = pkgs.callPackage ./packages/model-fetch {};
         headroom = import ./packages/headroom {
           inherit pkgs;
@@ -347,6 +363,7 @@
           infernix-lb
           infernix-workerd
           infernix-image-run
+          infernix-gpu-admission
           codex-acp
           headroom
           ponytail
@@ -436,6 +453,37 @@
           }
         ];
       };
+      animationWorkerSample =
+        (nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.default
+            {
+              system.stateVersion = "24.11";
+              networking.hostName = "animation-worker";
+              services.infernix.imageRunner.enable = true;
+              services.infernix.animationWorker = {
+                enable = true;
+                enableGpuAdmission = false;
+                runMigrations = true;
+                device = "fixture-gpu";
+                modelRoot = "/var/lib/animation-models";
+                databaseHost = "db.example.test";
+                databasePasswordFile = "/run/keys/animation-db";
+              };
+            }
+          ];
+        }).config;
+      animationWorkerCheck = let
+        services = animationWorkerSample.systemd.services;
+        migrate = "infernix-workload-migrate.service";
+        databaseEnv = "infernix-workload-database-env.service";
+        dependsOn = service: unit: builtins.elem unit service.requires && builtins.elem unit service.after;
+      in
+        dependsOn services.infernix-workerd migrate
+        && dependsOn services.infernix-workload-migrate databaseEnv
+        && builtins.elem "d /var/lib/animation-models 0710 infernix-worker infernix-image-handoff -" animationWorkerSample.systemd.tmpfiles.rules
+        && builtins.elem "d /var/lib/animation-models/.venvs 0710 infernix-worker infernix-image-handoff -" animationWorkerSample.systemd.tmpfiles.rules;
       workloadFabricSample = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -1663,6 +1711,22 @@
         nixosModule = self.nixosModules.default;
       };
 
+      runtime-modules = import ./tests/runtime-modules.nix {
+        inherit pkgs nixpkgs self;
+        nixosModule = self.nixosModules.default;
+      };
+
+      rhubarb-lip-sync-eval = let
+        pkg = self.packages.${system}.rhubarb-lip-sync;
+      in
+        assert pkg.pname == "rhubarb-lip-sync";
+        assert pkg.version == "1.14.0";
+        assert pkg.meta.mainProgram == "rhubarb";
+        assert builtins.isString pkg.drvPath;
+          pkgs.runCommand "infernix-rhubarb-lip-sync-eval-check" {} ''
+            touch "$out"
+          '';
+
       harness-agents = assert import ./tests/agents.nix {
         inherit pkgs;
         homeManager = home-manager;
@@ -1724,6 +1788,7 @@
       '';
 
       workload-fabric = pkgs.runCommand "infernix-workload-fabric-check" {} ''
+        ${assert animationWorkerCheck; ""}
         test "${workloadFabricSample.config.services.infernix.workloadFabric.workerId}" = "atlas"
         case ${pkgs.lib.escapeShellArg (toString workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig.ExecStart)} in
           *"/bin/infernix-workerd --config"*" worker") ;;

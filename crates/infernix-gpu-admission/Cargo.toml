@@ -1,0 +1,21 @@
+[package]
+name = "infernix-gpu-admission"
+description = "GPU admission probe and worker gate for shared desktop hosts"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "infernix-gpu-admission"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }

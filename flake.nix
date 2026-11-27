@@ -178,6 +178,7 @@
       modelLocks = true;
       inherit mkLbPackageForPkgs;
       mkComfyuiMemoryGuard = import ./lib/comfyui-memory-guard.nix;
+      animationPrefetchScript = ./lib/animation-prefetch.sh;
       modelCatalog = import ./lib/model-catalog.nix {inherit (nixpkgs) lib;};
       colibriPackaging = import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;};
       openpencilSupport = true;
@@ -1676,6 +1677,11 @@
 
       model-fetch = import ./tests/model-fetch {
         inherit pkgs nixpkgs;
+        nixosModule = self.nixosModules.default;
+      };
+
+      runtime-modules = import ./tests/runtime-modules.nix {
+        inherit pkgs nixpkgs self;
         nixosModule = self.nixosModules.default;
       };
 

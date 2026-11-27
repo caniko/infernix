@@ -1,5 +1,6 @@
 {
   imports = [
+    ./animation-worker.nix
     ./cloud-router.nix
     ./colibri.nix
     ./comfyui.nix

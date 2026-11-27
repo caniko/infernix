@@ -165,6 +165,7 @@
     lib = {
       modelLocks = true;
       inherit mkLbPackageForPkgs;
+      mkComfyuiMemoryGuard = import ./lib/comfyui-memory-guard.nix;
       modelCatalog = import ./lib/model-catalog.nix {inherit (nixpkgs) lib;};
       colibriPackaging = import ./lib/colibri-packaging.nix {inherit (nixpkgs) lib;};
       openpencilSupport = true;

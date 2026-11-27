@@ -10,6 +10,7 @@
   gpuCfg = config.services.infernix.gpu;
   gpuLib = import ../../lib/gpu.nix {inherit lib;};
   gpuGate = import ../../lib/gpu-gate.nix {inherit lib pkgs;};
+  mkMemoryGuard = import ../../lib/comfyui-memory-guard.nix;
   # Default off: hosts without the workload fabric keep today's command line.
   gpuGateCfg = lib.attrByPath ["services" "infernix" "gpuGate"] {
     enable = false;
@@ -130,6 +131,69 @@ in {
       };
     };
 
+    memoryGuard = {
+      enable = mkEnableOption "host memory and optional GPU admission watchdog for ComfyUI";
+
+      admitGiB = mkOption {
+        type = types.int;
+        default = 46;
+        description = "Minimum host MemAvailable (GiB) required before ComfyUI is admitted.";
+      };
+
+      admitPsi = mkOption {
+        type = types.number;
+        default = 5;
+        description = "Maximum full memory PSI avg10 (%) allowed during admission.";
+      };
+
+      tripGiB = mkOption {
+        type = types.int;
+        default = 16;
+        description = "Host MemAvailable (GiB) floor below which the watchdog trips and fences ComfyUI.";
+      };
+
+      tripPsi = mkOption {
+        type = types.number;
+        default = 10;
+        description = "Full memory PSI avg10 (%) ceiling above which the watchdog trips.";
+      };
+
+      emergencyGiB = mkOption {
+        type = types.int;
+        default = 6;
+        description = "Hard emergency host MemAvailable (GiB) floor checked in both admission and watchdog phases.";
+      };
+
+      watchdogSec = mkOption {
+        type = types.str;
+        default = "3s";
+        description = "systemd WatchdogSec for comfyui-memory-guard.service.";
+      };
+
+      timeoutStartSec = mkOption {
+        type = types.either types.int types.str;
+        default = "10s";
+        description = "systemd TimeoutStartSec for comfyui-memory-guard.service.";
+      };
+
+      admissionCommand = mkOption {
+        type = types.listOf types.str;
+        default = [];
+        example = ["/run/current-system/sw/bin/flock" "--nonblock" "--shared" "/run/infernix-gpu-gate/gpu0.lock"];
+        description = ''
+          Optional argv executed after the initial memory check and before
+          signalling readiness (for example a non-blocking GPU gate lock plus
+          `services.infernix.gpuAdmission.checkCommand`).
+        '';
+      };
+
+      supplementaryGroups = mkOption {
+        type = types.listOf types.str;
+        default = ["render"];
+        description = "Supplementary Unix groups for comfyui-memory-guard.service.";
+      };
+    };
+
     proxy = {
       listenStreams = mkOption {
         type = types.listOf types.str;
@@ -179,6 +243,10 @@ in {
     serviceEnvironment =
       (gpuOverrides.Environment or [])
       ++ lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment;
+    memoryGuardScript = mkMemoryGuard {
+      inherit pkgs;
+      inherit (cfg.memoryGuard) admitGiB admitPsi tripGiB tripPsi emergencyGiB;
+    };
   in {
     assertions = [
       {
@@ -262,9 +330,39 @@ in {
       };
     };
 
+    systemd.services.comfyui-memory-guard = mkIf cfg.memoryGuard.enable {
+      description = "Host memory and GPU admission watchdog for ComfyUI";
+      restartIfChanged = false;
+      unitConfig = {
+        StopWhenUnneeded = true;
+        # A refused admission is a normal outcome under pressure; it must not
+        # trip the start limit and lock ComfyUI out until root resets it.
+        StartLimitIntervalSec = 0;
+      };
+      serviceConfig = {
+        Type = "notify";
+        NotifyAccess = "all";
+        ExecStart = lib.escapeShellArgs ([
+            (toString memoryGuardScript)
+            "/proc/meminfo"
+            "/proc/pressure/memory"
+            "${config.systemd.package}/bin/systemd-notify"
+          ]
+          ++ cfg.memoryGuard.admissionCommand);
+        TimeoutStartSec = cfg.memoryGuard.timeoutStartSec;
+        WatchdogSec = cfg.memoryGuard.watchdogSec;
+        DynamicUser = true;
+        SupplementaryGroups = cfg.memoryGuard.supplementaryGroups;
+        NoNewPrivileges = true;
+      };
+    };
+
     systemd.services.comfyui = {
       description = "ComfyUI diffusion model interface";
-      after = ["network-online.target"];
+      bindsTo = lib.optional cfg.memoryGuard.enable "comfyui-memory-guard.service";
+      after =
+        ["network-online.target"]
+        ++ lib.optional cfg.memoryGuard.enable "comfyui-memory-guard.service";
       wants = ["network-online.target"];
 
       serviceConfig =

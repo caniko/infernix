@@ -295,6 +295,7 @@
         codex-acp = pkgs.callPackage ./packages/codex-acp.nix {};
         codex-provider = pkgs.callPackage ./packages/codex-provider.nix {};
         ponytail = pkgs.callPackage ./packages/ponytail.nix {};
+        rhubarb-lip-sync = pkgs.callPackage ./packages/rhubarb-lip-sync {};
         model-fetch = pkgs.callPackage ./packages/model-fetch {};
         headroom = import ./packages/headroom {
           inherit pkgs;
@@ -1662,6 +1663,17 @@
         inherit pkgs nixpkgs;
         nixosModule = self.nixosModules.default;
       };
+
+      rhubarb-lip-sync-eval = let
+        pkg = self.packages.${system}.rhubarb-lip-sync;
+      in
+        assert pkg.pname == "rhubarb-lip-sync";
+        assert pkg.version == "1.14.0";
+        assert pkg.meta.mainProgram == "rhubarb";
+        assert builtins.isString pkg.drvPath;
+          pkgs.runCommand "infernix-rhubarb-lip-sync-eval-check" {} ''
+            touch "$out"
+          '';
 
       harness-agents = assert import ./tests/agents.nix {
         inherit pkgs;

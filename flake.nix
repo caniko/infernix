@@ -453,6 +453,37 @@
           }
         ];
       };
+      animationWorkerSample =
+        (nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.default
+            {
+              system.stateVersion = "24.11";
+              networking.hostName = "animation-worker";
+              services.infernix.imageRunner.enable = true;
+              services.infernix.animationWorker = {
+                enable = true;
+                enableGpuAdmission = false;
+                runMigrations = true;
+                device = "fixture-gpu";
+                modelRoot = "/var/lib/animation-models";
+                databaseHost = "db.example.test";
+                databasePasswordFile = "/run/keys/animation-db";
+              };
+            }
+          ];
+        }).config;
+      animationWorkerCheck = let
+        services = animationWorkerSample.systemd.services;
+        migrate = "infernix-workload-migrate.service";
+        databaseEnv = "infernix-workload-database-env.service";
+        dependsOn = service: unit: builtins.elem unit service.requires && builtins.elem unit service.after;
+      in
+        dependsOn services.infernix-workerd migrate
+        && dependsOn services.infernix-workload-migrate databaseEnv
+        && builtins.elem "d /var/lib/animation-models 0710 infernix-worker infernix-image-handoff -" animationWorkerSample.systemd.tmpfiles.rules
+        && builtins.elem "d /var/lib/animation-models/.venvs 0710 infernix-worker infernix-image-handoff -" animationWorkerSample.systemd.tmpfiles.rules;
       workloadFabricSample = nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -1757,6 +1788,7 @@
       '';
 
       workload-fabric = pkgs.runCommand "infernix-workload-fabric-check" {} ''
+        ${assert animationWorkerCheck; ""}
         test "${workloadFabricSample.config.services.infernix.workloadFabric.workerId}" = "atlas"
         case ${pkgs.lib.escapeShellArg (toString workloadFabricSample.config.systemd.services.infernix-workerd.serviceConfig.ExecStart)} in
           *"/bin/infernix-workerd --config"*" worker") ;;

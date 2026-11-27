@@ -18,6 +18,9 @@
     else toString cfg.databaseUrlFile;
   python = cfg.pythonPackage;
   pythonBin = "${python}/bin/python${python.pythonVersion}";
+  imageHandoff = config.services.infernix.imageRunner.enable;
+  databaseEnvUnits = lib.optional assembleDatabaseEnv "infernix-workload-database-env.service";
+  migrationUnits = lib.optional cfg.runMigrations "infernix-workload-migrate.service";
 
   provision = pkgs.writeShellApplication {
     name = "infernix-animation-provision";
@@ -62,6 +65,7 @@
         UV_PROJECT_ENVIRONMENT="$model_root/.venvs/$name" \
           uv sync --frozen --python ${lib.escapeShellArg pythonBin} \
           --project "$project"
+        chmod 0750 "$model_root/.venvs/$name"
         printf '%s\n' "$want" > "$marker"
       }
 
@@ -123,16 +127,27 @@
       set -eu
       install -d -m 0750 -o infernix-worker -g infernix-worker /run/infernix-workload
       umask 077
-      {
-        printf 'INFERNIX_WORKLOAD_DATABASE_URL=host=%s port=%s user=%s dbname=%s sslmode=%s password=' \
-          ${lib.escapeShellArg cfg.databaseHost} \
-          ${lib.escapeShellArg (toString cfg.databasePort)} \
-          ${lib.escapeShellArg cfg.databaseUser} \
-          ${lib.escapeShellArg cfg.databaseName} \
-          ${lib.escapeShellArg cfg.databaseSslMode}
-        cat ${lib.escapeShellArg (toString cfg.databasePasswordFile)}
-        printf '\n'
-      } > ${lib.escapeShellArg generatedDatabaseEnvFile}
+
+      # Quote each keyword value for PostgreSQL, then quote the entire DSN
+      # for systemd EnvironmentFile (not shell) parsing.
+      pg_quote() {
+        local value=$1
+        value=''${value//\\/\\\\}
+        value=''${value//\'/\\\'}
+        printf "'%s'" "$value"
+      }
+      password=$(cat ${lib.escapeShellArg (toString cfg.databasePasswordFile)} && printf '.')
+      password=''${password%.}
+      password=''${password%$'\n'}
+      dsn="host=$(pg_quote ${lib.escapeShellArg cfg.databaseHost})"
+      dsn+=" port=${toString cfg.databasePort}"
+      dsn+=" user=$(pg_quote ${lib.escapeShellArg cfg.databaseUser})"
+      dsn+=" dbname=$(pg_quote ${lib.escapeShellArg cfg.databaseName})"
+      dsn+=" sslmode=$(pg_quote ${lib.escapeShellArg cfg.databaseSslMode})"
+      dsn+=" password=$(pg_quote "$password")"
+      dsn=''${dsn//\\/\\\\}
+      dsn=''${dsn//\"/\\\"}
+      printf 'INFERNIX_WORKLOAD_DATABASE_URL="%s"\n' "$dsn" > ${lib.escapeShellArg generatedDatabaseEnvFile}
       chown infernix-worker:infernix-worker ${lib.escapeShellArg generatedDatabaseEnvFile}
       chmod 0600 ${lib.escapeShellArg generatedDatabaseEnvFile}
     '';
@@ -142,8 +157,7 @@
   # succeeded-but-undelivered jobs so it can finish their uploads.
   janitorSql = pkgs.writeText "infernix-staging-janitor.sql" ''
     SELECT id FROM infernix_workload_jobs
-     WHERE lease_owner = :'worker'
-       AND updated_at < now() - interval '${toString cfg.stagingJanitor.retentionDays} days'
+      WHERE updated_at < now() - interval '${toString cfg.stagingJanitor.retentionDays} days'
        AND (state IN ('failed', 'cancelled')
             OR (state = 'succeeded' AND delivered_at IS NOT NULL));
   '';
@@ -154,14 +168,17 @@
     text = ''
       set -eu
       staging=${lib.escapeShellArg "${cfg.modelRoot}/staging"}
-      psql "$INFERNIX_WORKLOAD_DATABASE_URL" -tA \
-        -v worker=${lib.escapeShellArg cfg.workerName} -f ${janitorSql} |
+      psql "$INFERNIX_WORKLOAD_DATABASE_URL" -X -tA -v ON_ERROR_STOP=1 -f ${janitorSql} |
         while IFS= read -r id; do
           printf '%s' "$id" | grep -Eq '^[A-Za-z0-9_-]+$' || {
             echo "janitor: refusing job id '$id'" >&2
             continue
           }
-          rm -rf -- "''${staging:?}/$id"
+          # Terminal transitions clear the lease; only remove staging present
+          # on this host.
+          job_dir="''${staging:?}/$id"
+          [ -d "$job_dir" ] && [ ! -L "$job_dir" ] || continue
+          rm -rf -- "$job_dir"
           echo "janitor: removed staging for $id"
         done
     '';
@@ -220,13 +237,6 @@ in {
       default = pkgs.postgresql_18;
       defaultText = lib.literalExpression "pkgs.postgresql_18";
       description = "PostgreSQL client package used by the staging janitor.";
-    };
-
-    workerName = lib.mkOption {
-      type = lib.types.str;
-      default = config.networking.hostName;
-      defaultText = lib.literalExpression "config.networking.hostName";
-      description = "Worker lease owner name queried by the staging janitor.";
     };
 
     memoryMax = lib.mkOption {
@@ -307,7 +317,7 @@ in {
     databasePasswordFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
-      description = "Path to a root-readable file containing the PostgreSQL password when `databaseUrlFile` is unset.";
+      description = "Path to a root-readable file containing the PostgreSQL password (with an optional final newline) when `databaseUrlFile` is unset.";
     };
 
     hubTokenFile = lib.mkOption {
@@ -431,7 +441,13 @@ in {
       };
 
     # Remote workers are not the table owner, so they must not run migrations.
-    systemd.services.infernix-workload-migrate.enable = lib.mkIf (!cfg.runMigrations) (lib.mkForce false);
+    systemd.services.infernix-workload-migrate = lib.mkMerge [
+      (lib.mkIf (!cfg.runMigrations) {enable = lib.mkForce false;})
+      (lib.mkIf (cfg.runMigrations && assembleDatabaseEnv) {
+        requires = databaseEnvUnits;
+        after = databaseEnvUnits;
+      })
+    ];
 
     # systemd reads EnvironmentFile before any ExecStartPre, so the DSN must
     # come from a unit ordered before both consumers. A tmpfs wipe on boot is
@@ -449,13 +465,14 @@ in {
     };
 
     systemd.services.infernix-workerd = {
-      requires = lib.mkForce (lib.optional assembleDatabaseEnv "infernix-workload-database-env.service");
+      requires = lib.mkForce (databaseEnvUnits ++ migrationUnits);
       after = lib.mkForce (
         [
           "network-online.target"
           "infernix-animation-provision.service"
         ]
-        ++ lib.optional assembleDatabaseEnv "infernix-workload-database-env.service"
+        ++ databaseEnvUnits
+        ++ migrationUnits
       );
       # Keep animation workers independent of dark image-runner/Qwen provisioning.
       wants = lib.mkForce [
@@ -474,6 +491,7 @@ in {
         RemainAfterExit = true;
         User = "infernix-worker";
         Group = "infernix-worker";
+        UMask = "0027";
         ExecStart = lib.getExe provision;
         StateDirectory = "infernix-workload";
         Restart = "on-failure";
@@ -509,11 +527,12 @@ in {
 
     systemd.services.infernix-staging-janitor = lib.mkIf cfg.stagingJanitor.enable {
       description = "Delete delivered or failed animation staging older than ${toString cfg.stagingJanitor.retentionDays} days";
-      requires = lib.optional assembleDatabaseEnv "infernix-workload-database-env.service";
+      requires = databaseEnvUnits ++ migrationUnits;
       wants = ["network-online.target"];
       after =
         ["network-online.target"]
-        ++ lib.optional assembleDatabaseEnv "infernix-workload-database-env.service";
+        ++ databaseEnvUnits
+        ++ migrationUnits;
       serviceConfig = {
         Type = "oneshot";
         User = "infernix-worker";
@@ -537,18 +556,25 @@ in {
       };
     };
 
-    systemd.tmpfiles.rules =
-      ["d ${cfg.modelRoot} 0750 infernix-worker infernix-worker -"]
+    systemd.tmpfiles.rules = let
+      ancestorAccess =
+        if imageHandoff
+        then "0710 infernix-worker infernix-image-handoff"
+        else "0750 infernix-worker infernix-worker";
+    in
+      [
+        "d ${cfg.modelRoot} ${ancestorAccess} -"
+        "d ${cfg.modelRoot}/.venvs ${ancestorAccess} -"
+      ]
       ++ map (directory: "d ${cfg.modelRoot}/${directory} 0750 infernix-worker infernix-worker -")
       [
         ".hf"
         ".provisioned"
         ".uv-cache"
-        ".venvs"
         "code"
         "frames"
         "weights"
       ]
-      ++ lib.optional config.services.infernix.imageRunner.enable "z ${cfg.modelRoot}/staging 2770 infernix-worker infernix-image-handoff -";
+      ++ lib.optionals imageHandoff (map (name: "z ${cfg.modelRoot}/.venvs/${name} 0750 infernix-worker infernix-worker -") (lib.attrNames cfg.adapters));
   };
 }

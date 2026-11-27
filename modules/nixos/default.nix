@@ -4,6 +4,7 @@
     ./colibri.nix
     ./comfyui.nix
     ./fleet.nix
+    ./gpu-admission.nix
     ./hermes-agent.nix
     ./hermes-dashboard.nix
     ./hermes-webui.nix

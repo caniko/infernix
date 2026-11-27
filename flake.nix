@@ -144,6 +144,12 @@
         extraCheckInputs = [pkgs.python3];
       };
 
+    mkGpuAdmissionPackageWithCrane = pkgs:
+      mkCargoPackageWithCrane {
+        inherit pkgs;
+        packageName = "infernix-gpu-admission";
+      };
+
     mkLbPackage = system:
       mkLbPackageWithCrane (import nixpkgs {
         inherit system;
@@ -158,6 +164,12 @@
 
     mkImageRunPackage = system:
       mkImageRunPackageWithCrane (import nixpkgs {
+        inherit system;
+        overlays = [rust-overlay.overlays.default];
+      });
+
+    mkGpuAdmissionPackage = system:
+      mkGpuAdmissionPackageWithCrane (import nixpkgs {
         inherit system;
         overlays = [rust-overlay.overlays.default];
       });
@@ -270,6 +282,7 @@
       infernix-lb = mkLbPackage system;
       infernix-workerd = mkWorkerdPackage system;
       infernix-image-run = mkImageRunPackage system;
+      infernix-gpu-admission = mkGpuAdmissionPackage system;
       visualRubricPackage =
         if
           builtins.hasAttr "packages" visual-rubric
@@ -289,7 +302,7 @@
         else null;
     in
       {
-        inherit infernix-image-run infernix-lb infernix-workerd;
+        inherit infernix-gpu-admission infernix-image-run infernix-lb infernix-workerd;
         # TODO(animation G2): package the Python adapters while G2 owns
         # `adapters/**`. Each adapter becomes one package here and one entry in
         # the workload-fabric `adapters` option; do not guess their layout.
@@ -349,6 +362,7 @@
           infernix-lb
           infernix-workerd
           infernix-image-run
+          infernix-gpu-admission
           codex-acp
           headroom
           ponytail

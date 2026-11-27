@@ -793,6 +793,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "infernix-gpu-admission"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "infernix-image-run"
 version = "0.1.0"
 dependencies = [

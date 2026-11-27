@@ -6,6 +6,18 @@
   nixosModule,
 }: let
   inherit (pkgs) lib;
+  modelFetch = pkgs.callPackage ../../packages/model-fetch {};
+  lockPath = "/var/lib/shared-models.doty-lock";
+  anchor = "f ${lockPath} 0644 root root - -";
+  job = {
+    description = "fixture";
+    repo = "example/model";
+    rev = "0123456789abcdef0123456789abcdef01234567";
+    files = [{name = "sub/model.gguf";}];
+    totalBytes = 5;
+    kind = "gguf-file";
+    destDir = "/var/lib/models";
+  };
   inherit
     (nixpkgs.lib.nixosSystem {
       inherit (pkgs.stdenv.hostPlatform) system;
@@ -25,14 +37,10 @@
               onDemand = true;
             };
           };
-          services.infernix.modelFetch.jobs.fixture = {
-            description = "fixture";
-            repo = "example/model";
-            rev = "0123456789abcdef0123456789abcdef01234567";
-            files = [{name = "sub/model.gguf";}];
-            totalBytes = 5;
-            kind = "gguf-file";
-            destDir = "/var/lib/models";
+          services.infernix.modelFetch.jobs = {
+            fixture = job;
+            shared = job // {inherit lockPath;};
+            shared-other = job // {inherit lockPath;};
           };
         }
       ];
@@ -41,7 +49,12 @@
     ;
   units = config.systemd.services;
   fetch = units.model-fetch-fixture.serviceConfig.ExecStart;
+  fetchCommand = "${modelFetch}/bin/model-fetch";
 in
+  assert lib.hasInfix "-model-lock.py --exclusive /var/lib/models.doty-lock -- /nix/store/" fetch;
+  assert lib.hasInfix "-model-lock.py --exclusive ${lockPath} -- /nix/store/" units.model-fetch-shared.serviceConfig.ExecStart;
+  assert builtins.elem "f /var/lib/models.doty-lock 0644 root root - -" config.systemd.tmpfiles.rules;
+  assert builtins.filter (rule: rule == anchor) config.systemd.tmpfiles.rules == [anchor];
   assert lib.hasInfix "/bin/model-fetch /nix/store/" fetch;
   assert !(units.model-fetch-fixture ? wantedBy) || units.model-fetch-fixture.wantedBy == [];
   assert config.systemd.sockets.comfyui-proxy.listenStreams == ["10.0.0.5:8190"];
@@ -49,6 +62,6 @@ in
   assert units.comfyui.unitConfig.StopWhenUnneeded;
   assert lib.hasInfix "/system_stats" units.comfyui.serviceConfig.ExecStartPost;
     pkgs.runCommand "infernix-model-fetch-check" {nativeBuildInputs = [pkgs.jq];} ''
-      bash ${./fixtures.sh} ${lib.escapeShellArg (lib.head (lib.splitString " " fetch))} ${./.}
+      bash ${./fixtures.sh} ${lib.escapeShellArg fetchCommand} ${./.}
       touch "$out"
     ''

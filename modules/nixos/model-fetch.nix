@@ -14,6 +14,7 @@
 }: let
   inherit (lib) mkOption types;
   modelFetch = pkgs.callPackage ../../packages/model-fetch {};
+  modelLock = import ../../lib/model-lock.nix {inherit lib pkgs;};
   jobType = types.submodule ({config, ...}: {
     options = {
       description = mkOption {
@@ -113,6 +114,7 @@ in {
   };
 
   config = {
+    systemd.tmpfiles.rules = lib.unique (lib.mapAttrsToList (_: job: modelLock.anchor job.lockPath) cfg.jobs);
     systemd.services = lib.mapAttrs' (name: job:
       lib.nameValuePair "model-fetch-${name}" {
         description = "Fetch pinned model snapshot (${job.description})";
@@ -120,7 +122,7 @@ in {
         wants = ["network-online.target"];
         serviceConfig = {
           Type = "oneshot";
-          ExecStart = "${modelFetch}/bin/model-fetch ${jobJson name job}";
+          ExecStart = lib.escapeShellArgs (modelLock.command false job.lockPath ++ ["${modelFetch}/bin/model-fetch" "${jobJson name job}"]);
           # Multi-GB downloads: no start timeout (failure modes are the
           # script's own loud errors, not the watchdog).
           TimeoutStartSec = "infinity";

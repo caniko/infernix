@@ -1,19 +1,20 @@
 {
   "packages": {
     "codex-acp": {
-      "version": "1.1.4",
-      "tag": "v1.1.4",
-      "url": "https://github.com/agentclientprotocol/codex-acp/archive/v1.1.4.tar.gz",
-      "hash": "sha256-oBg/i4ewa6dF7d/lK0JaNOCBrgXTdsltLB+xvwXAV7E=",
+      "version": "2.12.1",
+      "tag": "v2.12.1",
+      "url": "https://github.com/agentclientprotocol/codex-acp/archive/v2.12.1.tar.gz",
+      "hash": "sha256-OYCGisRbt4c/yoAdtcpWurXI+2AFl1fbQb797aL35bk=",
       "unpack": true,
       "fod_attr": ".#packages.x86_64-linux.codex-acp.npmDeps",
-      "fod_hash": "sha256-r1c2Z2TbcU0X6mUdF5jpu3ldLnK+Yd+r0qQzjRHJ0mw="
+      "fod_hash": "sha256-imgPiqYVWNl9K12U3VRnnwLSRq5PeTyrbtOq4F1mL/0="
     },
     "ponytail": {
-      "version": "4.8.4-unstable-2026-07-22",
-      "rev": "16f29800fd2681bdf24f3eb4ccffe38be3baec6b",
-      "url": "https://github.com/DietrichGebert/ponytail/archive/16f29800fd2681bdf24f3eb4ccffe38be3baec6b.tar.gz",
-      "hash": "sha256-Y7d4s7uqjH6IbEXhqAiQ+yaxr6iiGcv2X64LuMtG1T8=",
+      "version": "5.3.3",
+      "rev": "7801d061243d7b753bad0e0b3c057cd250b11755",
+      "tag": "v5.3.3",
+      "url": "https://github.com/DietrichGebert/ponytail/archive/7801d061243d7b753bad0e0b3c057cd250b11755.tar.gz",
+      "hash": "sha256-CY0EifTY0UVc6/FPGVJjEfYEf/8QLsINQmoYYKZYh98=",
       "unpack": true
     }
   }

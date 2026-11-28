@@ -1,16 +1,16 @@
-{ fetchFromGitHub
+{ fetchzip
 , lib
 , stdenvNoCC
 }:
+let
+  pin = (builtins.fromJSON (builtins.readFile ../pins.lock.json)).packages.ponytail;
+in
 stdenvNoCC.mkDerivation {
   pname = "ponytail";
-  version = "4.8.4-unstable-2026-07-22";
+  inherit (pin) version;
 
-  src = fetchFromGitHub {
-    owner = "DietrichGebert";
-    repo = "ponytail";
-    rev = "16f29800fd2681bdf24f3eb4ccffe38be3baec6b";
-    hash = "sha256-Y7d4s7uqjH6IbEXhqAiQ+yaxr6iiGcv2X64LuMtG1T8=";
+  src = fetchzip {
+    inherit (pin) url hash;
   };
 
   dontConfigure = true;

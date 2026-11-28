@@ -1605,7 +1605,9 @@
         touch "$out"
       '';
 
-      ponytail-harness-registration = pkgs.runCommand "infernix-ponytail-harness-registration-check" {} ''
+      ponytail-harness-registration = let
+        version = nixpkgs.lib.head (nixpkgs.lib.splitString "-" self.packages.${system}.ponytail.version);
+      in pkgs.runCommand "infernix-ponytail-harness-registration-check" {} ''
         ${ponytailActivation}
         expected='${builtins.toJSON ponytailHarnesses}'
         actual='${builtins.toJSON ponytailSample.config.services.infernix.ponytail.registeredHarnesses}'
@@ -1669,8 +1671,8 @@
         test -L "$TMPDIR/ponytail-home/.openclaw/skills/ponytail"
         test -L "$TMPDIR/ponytail-home/.codex/plugins/ponytail"
         test -L "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/local"
-        test -d "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4"
-        test -f "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/4.8.4/.codex-plugin/plugin.json"
+        test -d "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/${version}"
+        test -f "$TMPDIR/ponytail-home/.codex/plugins/cache/ponytail/ponytail/${version}/.codex-plugin/plugin.json"
         test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/.codex-plugin/plugin.json"
         test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/skills/ponytail/SKILL.md"
         test -f "$TMPDIR/ponytail-home/.codex/plugins/ponytail/hooks/claude-codex-hooks.json"

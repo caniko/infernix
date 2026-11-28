@@ -7,8 +7,9 @@
 }: let
   inherit (lib) mkEnableOption mkOption types;
   cfg = config.services.infernix.ponytail;
-  ponytailRevision = "16f29800fd2681bdf24f3eb4ccffe38be3baec6b";
-  ponytailVersion = "4.8.4";
+  pin = (builtins.fromJSON (builtins.readFile ../../pins.lock.json)).packages.ponytail;
+  ponytailRevision = pin.rev;
+  ponytailVersion = lib.head (lib.splitString "-" pin.version);
   defaultHarnesses = [
     "agents"
     "aider"

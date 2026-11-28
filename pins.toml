@@ -1,0 +1,15 @@
+[flake.holds]
+harbor-py = "Keep the Harbor Python packaging revision used by Headroom."
+harbor-rs = "Keep the Harbor Rust toolchain and CI revision paired with the qualified Simit update."
+hermes-agent = "Keep the temporary fork revision until NousResearch/hermes-agent#75946 lands."
+
+[packages.codex-acp]
+source = { type = "github-release", repo = "agentclientprotocol/codex-acp", tag_prefix = "v" }
+url = "https://github.com/agentclientprotocol/codex-acp/archive/{tag}.tar.gz"
+unpack = true
+fod_attr = ".#packages.x86_64-linux.codex-acp.npmDeps"
+
+[packages.ponytail]
+source = { type = "github-tag", repo = "DietrichGebert/ponytail", tag_prefix = "v" }
+url = "https://github.com/DietrichGebert/ponytail/archive/{rev}.tar.gz"
+unpack = true

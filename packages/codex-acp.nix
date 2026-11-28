@@ -1,16 +1,14 @@
-{ lib, pkgs }:
-pkgs.buildNpmPackage rec {
+{lib, pkgs}: let
+  pin = (builtins.fromJSON (builtins.readFile ../pins.lock.json)).packages.codex-acp;
+in pkgs.buildNpmPackage {
   pname = "codex-acp";
-  version = "1.1.4";
+  inherit (pin) version;
 
-  src = pkgs.fetchFromGitHub {
-    owner = "agentclientprotocol";
-    repo = "codex-acp";
-    rev = "v${version}";
-    hash = "sha256-oBg/i4ewa6dF7d/lK0JaNOCBrgXTdsltLB+xvwXAV7E=";
+  src = pkgs.fetchzip {
+    inherit (pin) url hash;
   };
 
-  npmDepsHash = "sha256-r1c2Z2TbcU0X6mUdF5jpu3ldLnK+Yd+r0qQzjRHJ0mw=";
+  npmDepsHash = pin.fod_hash;
 
   nativeBuildInputs = [pkgs.makeWrapper];
 

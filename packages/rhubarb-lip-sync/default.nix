@@ -11,6 +11,7 @@ in
   stdenv.mkDerivation {
     pname = "rhubarb-lip-sync";
     inherit version;
+    # pin-hold: Keep this release paired with the tested build and resource layout below.
     src = fetchFromGitHub {
       owner = "DanielSWolf";
       repo = "rhubarb-lip-sync";
